@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any, Iterator
 
 from pydantic import BaseModel
 
@@ -69,6 +71,23 @@ _ENTITY_LISTS: list[tuple[str, type[BaseModel], str]] = [
 
 # Fields that are cross-references and should not be stored as scalar properties.
 _REF_FIELD_NAMES: set[str] = {field for (_, field) in _REFERENCE_FIELDS}
+
+# Name of the list-valued node property that records property conflicts in-graph.
+_CONFLICTS_PROP = "conflicts"
+
+
+class MergeMode(str, Enum):
+    """How to reconcile property values when MERGE matches an existing node.
+
+    - OVERWRITE: last-write-wins (the original behaviour). ``SET n.k = $v``
+      unconditionally overwrites prior values.
+    - CONFLICT:  first-writer-wins. Existing non-null values are preserved;
+      incoming values that disagree are recorded in ``n.conflicts`` (and in
+      an out-of-graph JSONL log) for human review.
+    """
+
+    OVERWRITE = "overwrite"
+    CONFLICT = "conflict"
 
 
 def _serialize_value(value: Any) -> Any:
@@ -145,23 +164,175 @@ def _relationship_merges(
     return statements
 
 
+def _iter_entities(
+    graph: FactoryPlanningGraph,
+) -> Iterator[tuple[BaseModel, str]]:
+    """Yield ``(entity, label)`` for every entity in the extraction graph."""
+    for field_name, _cls, label in _ENTITY_LISTS:
+        for entity in getattr(graph, field_name, []) or []:
+            yield entity, label
+
+
 def extraction_to_cypher(
     graph: FactoryPlanningGraph,
 ) -> list[tuple[str, dict[str, Any]]]:
     """Convert a full extraction to a list of Cypher MERGE statements.
 
     First creates/updates all nodes, then creates relationships.
+    Equivalent to ``extraction_to_cypher_with_mode(graph, MergeMode.OVERWRITE)``.
     """
     statements: list[tuple[str, dict[str, Any]]] = []
 
-    for field_name, _cls, label in _ENTITY_LISTS:
-        entities = getattr(graph, field_name, [])
-        for entity in entities:
-            statements.append(model_to_cypher_merge(entity, label))
+    for entity, label in _iter_entities(graph):
+        statements.append(model_to_cypher_merge(entity, label))
 
-    for field_name, _cls, label in _ENTITY_LISTS:
-        entities = getattr(graph, field_name, [])
-        for entity in entities:
-            statements.extend(_relationship_merges(entity, label))
+    for entity, label in _iter_entities(graph):
+        statements.extend(_relationship_merges(entity, label))
 
     return statements
+
+
+# ---------------------------------------------------------------------------
+# Conflict-detecting merge mode
+# ---------------------------------------------------------------------------
+
+def _now_iso() -> str:
+    """Current UTC timestamp in ISO-8601 (second precision)."""
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _scalar_fields(entity: BaseModel) -> dict[str, Any]:
+    """Return non-None, non-reference scalar fields of ``entity``."""
+    data = entity.model_dump(exclude_none=True)
+    data.pop("name", None)
+    return {k: v for k, v in data.items() if k not in _REF_FIELD_NAMES}
+
+
+def model_to_cypher_fetch(entity: BaseModel, label: str) -> tuple[str, dict[str, Any]]:
+    """Build a read-only MATCH that returns the existing node's scalar props.
+
+    Used by the conflict merge mode to discover prior values before deciding
+    whether to write or record a conflict.
+    """
+    name = entity.model_dump()["name"]
+    query = f"MATCH (n:{label} {{name: $name}}) RETURN n"
+    return query, {"name": name}
+
+
+def build_conflict_merge(
+    entity: BaseModel,
+    label: str,
+    existing_props: dict[str, Any],
+    *,
+    source: str | None = None,
+    chunk_index: int | None = None,
+) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+    """Convert one Pydantic entity to a conflict-aware MERGE + SET statement.
+
+    Policy: first-writer-wins.
+
+    - For each scalar field on ``entity``:
+        * If the existing node does not have the property (or it is null),
+          the incoming value is written via ``SET``.
+        * If the existing value equals the incoming value, nothing happens.
+        * If the existing value differs and is non-null, the incoming value
+          is **not** written; instead a conflict record is appended to
+          ``n.conflicts`` (a JSON-serialised list property).
+
+    Returns ``(cypher_query, parameters, conflicts)`` where ``conflicts`` is
+    the list of newly-detected conflict dicts (also embedded in the query so
+    they land in-graph in the same round-trip).
+    """
+    data = entity.model_dump(exclude_none=True)
+    name = data.pop("name")
+    params: dict[str, Any] = {"name": name}
+    set_parts: list[str] = []
+    conflicts: list[dict[str, Any]] = []
+    conflict_params: dict[str, Any] = {}
+
+    for key, incoming in _scalar_fields(entity).items():
+        existing = existing_props.get(key)
+        if existing is None:
+            # No prior value — write it.
+            param_key = f"p_{key}"
+            params[param_key] = _serialize_value(incoming)
+            set_parts.append(f"n.{key} = ${param_key}")
+            continue
+
+        incoming_ser = _serialize_value(incoming)
+        if existing == incoming_ser:
+            # Agreement — no-op.
+            continue
+
+        # Conflict: keep existing, record incoming.
+        conflict = {
+            "property": key,
+            "existing_value": existing,
+            "incoming_value": incoming_ser,
+            "source": source,
+            "chunk_index": chunk_index,
+            "detected_at": _now_iso(),
+        }
+        conflicts.append(conflict)
+        c_key = f"c_{key}"
+        conflict_params[c_key] = json.dumps(conflict)
+        set_parts.append(
+            f"n.{_CONFLICTS_PROP} = "
+            f"coalesce(n.{_CONFLICTS_PROP}, \"[]\") + [${c_key}]"
+        )
+
+    query = f"MERGE (n:{label} {{name: $name}})"
+    if set_parts:
+        query += " SET " + ", ".join(set_parts)
+
+    params.update(conflict_params)
+    return query, params, conflicts
+
+
+def extraction_to_cypher_with_mode(
+    graph: FactoryPlanningGraph,
+    mode: MergeMode,
+    *,
+    source: str | None = None,
+    chunk_index: int | None = None,
+) -> tuple[
+    list[tuple[str, dict[str, Any]]],
+    list[tuple[str, dict[str, Any], BaseModel, str]],
+]:
+    """Convert an extraction to Cypher statements under ``mode``.
+
+    Returns ``(relationship_statements, node_entries)``:
+
+    - ``relationship_statements`` — MERGE statements for cross-reference
+      relationships (identical in both modes; v1 does not detect conflicts on
+      edges).
+    - ``node_entries`` — one ``(fetch_query, fetch_params, entity, label)``
+      tuple per entity node, in the conflict mode; empty in overwrite mode.
+
+    ``source`` and ``chunk_index`` are stored on each conflict record for
+    provenance. They are accepted here for symmetry but are normally applied
+    per-entity in :func:`build_conflict_merge`.
+
+    Callers in overwrite mode should ignore the second return value and run
+    the overwrite node MERGEs via :func:`extraction_to_cypher` (or
+    :func:`model_to_cypher_merge` directly).
+
+    In conflict mode, the caller is expected to:
+
+    1. For each entry, run ``fetch_query`` to obtain the existing node props.
+    2. Call :func:`build_conflict_merge` with those props to produce the
+       write statement + detected conflicts.
+    3. Run the write statement, append conflicts to the JSONL log.
+    4. Finally run all ``relationship_statements``.
+    """
+    rel_statements: list[tuple[str, dict[str, Any]]] = []
+    for entity, label in _iter_entities(graph):
+        rel_statements.extend(_relationship_merges(entity, label))
+
+    node_entries: list[tuple[str, dict[str, Any], BaseModel, str]] = []
+    if mode is MergeMode.CONFLICT:
+        for entity, label in _iter_entities(graph):
+            fetch_q, fetch_p = model_to_cypher_fetch(entity, label)
+            node_entries.append((fetch_q, fetch_p, entity, label))
+
+    return rel_statements, node_entries

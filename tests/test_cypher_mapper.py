@@ -5,7 +5,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from knowledge.cypher_mapper import extraction_to_cypher, model_to_cypher_merge
+from knowledge.cypher_mapper import (
+    MergeMode,
+    build_conflict_merge,
+    extraction_to_cypher,
+    extraction_to_cypher_with_mode,
+    model_to_cypher_fetch,
+    model_to_cypher_merge,
+)
 from knowledge.graph_models.factory_graph_model import (
     FactoryPlanningGraph,
     Resource,
@@ -101,3 +108,60 @@ def test_extraction_to_cypher_empty_graph():
     graph = FactoryPlanningGraph()
     statements = extraction_to_cypher(graph)
     assert statements == []
+
+
+# --------------------------------------------------------------------------
+# Merge mode + conflict-detection helpers
+# --------------------------------------------------------------------------
+def test_merge_mode_values():
+    assert MergeMode.OVERWRITE.value == "overwrite"
+    assert MergeMode.CONFLICT.value == "conflict"
+
+
+def test_model_to_cypher_merge_overwrite_mode_unchanged():
+    # The default (overwrite) path must produce the same output as before.
+    r = Resource(name="AKL-01", resource_type="AS/RS", capacity=500)
+    query, params = model_to_cypher_merge(r, "Resource")
+    assert "MERGE (n:Resource {name: $name})" in query
+    assert "SET" in query
+    assert "n.capacity = $p_capacity" in query
+    assert params["p_capacity"] == 500
+
+
+def test_extraction_to_cypher_default_mode_is_overwrite():
+    graph = FactoryPlanningGraph(
+        resources=[Resource(name="M-1", resource_type="machine")],
+    )
+    # overwrite path: plain list of (query, params)
+    statements = extraction_to_cypher(graph)
+    assert isinstance(statements, list)
+    assert any("MERGE (n:Resource {name: $name})" in q for q, _ in statements)
+
+
+def test_extraction_to_cypher_with_mode_overwrite_returns_no_node_entries():
+    graph = FactoryPlanningGraph(
+        resources=[Resource(name="M-1", resource_type="machine")],
+    )
+    rels, nodes = extraction_to_cypher_with_mode(graph, MergeMode.OVERWRITE)
+    assert nodes == []
+    assert isinstance(rels, list)
+
+
+def test_extraction_to_cypher_with_mode_conflict_returns_node_entries():
+    graph = FactoryPlanningGraph(
+        resources=[Resource(name="M-1", resource_type="machine")],
+    )
+    rels, nodes = extraction_to_cypher_with_mode(graph, MergeMode.CONFLICT)
+    assert len(nodes) == 1
+    fetch_q, fetch_p, entity, label = nodes[0]
+    assert label == "Resource"
+    assert "MATCH (n:Resource {name: $name}) RETURN n" in fetch_q
+    assert fetch_p == {"name": "M-1"}
+    assert entity.name == "M-1"
+
+
+def test_model_to_cypher_fetch_returns_read_only_match():
+    r = Resource(name="AKL-01", resource_type="AS/RS")
+    query, params = model_to_cypher_fetch(r, "Resource")
+    assert query == "MATCH (n:Resource {name: $name}) RETURN n"
+    assert params == {"name": "AKL-01"}

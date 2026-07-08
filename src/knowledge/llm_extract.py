@@ -63,6 +63,7 @@ async def extract_from_chunk(
     Returns a validated Pydantic model instance, or None on failure.
     """
     model = llm_model or os.getenv("LLM_MODEL", _DEFAULT_LLM_MODEL)
+    api_base = api_base or os.getenv("OLLAMA_BASE_URL")
     messages = build_extraction_prompt(chunk, schema_class)
 
     kwargs: dict = {
@@ -113,15 +114,18 @@ async def extract_from_chunks(
     llm_model: str | None = None,
     api_base: str | None = None,
     concurrency: int = 4,
-) -> list[BaseModel]:
+) -> list[tuple[BaseModel, str, int]]:
     """Extract from all chunks with bounded concurrency.
 
-    Returns a list of successfully parsed extraction results.
+    Returns a list of ``(extraction, source, chunk_index)`` tuples — one per
+    successfully parsed chunk — preserving the provenance needed by the
+    conflict-detecting merge mode. ``source`` is the originating file name
+    and ``chunk_index`` is the positional index within that file.
     """
     semaphore = asyncio.Semaphore(concurrency)
-    results: list[BaseModel] = []
+    results: list[tuple[BaseModel, str, int]] = []
 
-    async def _extract_one(chunk_info: dict) -> BaseModel | None:
+    async def _extract_one(chunk_info: dict) -> tuple[BaseModel, str, int] | None:
         async with semaphore:
             source = chunk_info["source"]
             idx = chunk_info["chunk_index"]
@@ -134,7 +138,8 @@ async def extract_from_chunks(
             )
             if result:
                 print(f"    Done {source} chunk {idx}")
-            return result
+                return (result, source, idx)
+            return None
 
     tasks = [_extract_one(c) for c in chunks]
     for coro in asyncio.as_completed(tasks):
