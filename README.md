@@ -1,0 +1,374 @@
+# fp-extract-falkordb
+
+Factory-planning knowledge graph extraction pipeline. Ingests domain documents, extracts structured entities via an LLM into a Pydantic graph model, and writes them to **FalkorDB** as Cypher `MERGE` statements with built-in entity deduplication.
+
+Supports two merge modes:
+
+| Mode | Behavior | Flag |
+|---|---|---|
+| `overwrite` (default) | Last-write-wins. Re-ingestion silently replaces prior property values. | `--merge-mode overwrite` |
+| `conflict` | First-writer-wins. Existing non-null values are preserved; disagreements are isolated as **conflicts** (in-graph `conflicts` list + append-only JSONL audit log) for human review. | `--merge-mode conflict` |
+
+---
+
+## Quick start
+
+```bash
+# 1. Start FalkorDB
+docker-compose up -d
+
+# 2. Configure
+cp .env.example .env   # edit as needed
+
+# 3. Ingest documents (conflict mode)
+python scripts/ingest.py --ingest --data-dir ./data --merge-mode conflict
+
+# 4. Search (graph mode: raw Cypher or NL -> Cypher)
+python scripts/ingest.py --search
+
+# 5. Inspect conflicts
+python scripts/ingest.py --search
+# > MATCH (n) WHERE n.conflicts IS NOT NULL RETURN n.name, labels(n), n.conflicts
+```
+
+Visualization: FalkorDB's built-in web UI at `http://localhost:3000`.
+
+---
+
+## Dataflow: documents to finished graph
+
+The pipeline runs in seven stages. Each stage names the module and function that implements it, the data shape it produces, and (where relevant) the exact Cypher it generates.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  ./data/                                                                │
+│  DOC1_Lastenheft_Fragment_v1-2.md                                       │
+│  DOC3_Maschinenparameter_Tabelle.md                                     │
+│  DOC8_Schichtplan_Personalbedarfsplanung.md                             │
+│  ... (txt, md, pdf, docx, csv, json, html, py)                          │
+└───────────────────────────┬─────────────────────────────────────────────┘
+                            │
+                            │  Stage 1 — discover + read + chunk
+                            │  chunking.load_and_chunk()
+                            │  scripts/ingest.py:52-58
+                            ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  CHUNKS                                                                 │
+│  list[dict] where each dict = {                                         │
+│    "source":       "DOC3_Maschinenparameter_Tabelle.md",   ← provenance │
+│    "chunk_index":  2,                                      ← provenance │
+│    "text":         "AKL-01: capacity=500, AS/RS, zone-A..."             │
+│  }                                                                      │
+│                                                                         │
+│  chunking.chunk_text(): paragraph-aware split on "\n\n", pack to        │
+│  chunk_size=4000 chars, carry overlap=200 chars forward.                │
+└───────────────────────────┬─────────────────────────────────────────────┘
+                            │
+                            │  Stage 2 — LLM extraction (provenance-preserving)
+                            │  llm_extract.extract_from_chunks()
+                            │  scripts/ingest.py:60-69
+                            ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  EXTRACTIONS WITH PROVENANCE                                            │
+│  list[tuple[FactoryPlanningGraph, str, int]]                            │
+│                                                                         │
+│  Per chunk:                                                             │
+│    • build_extraction_prompt() injects the Pydantic JSON schema + text  │
+│    • litellm.acompletion(model=LLM_MODEL, temperature=0.0)              │
+│    • strip markdown fences → model_validate_json → json_repair fallback │
+│    • retries up to 3× with exponential backoff                          │
+│    • provenance (source, chunk_index) ATTACHED to the result tuple      │
+│                                                                         │
+│  FactoryPlanningGraph holds 15 typed entity lists:                      │
+│    resources, transport_vehicles, trailers, transport_segments,         │
+│    transport_routes, traffic_rules, products, production_programs,      │
+│    order_logic, shift_models, worker_pools, control_strategies,         │
+│    layout_elements, kpis, stochastic_parameters                         │
+└───────────────────────────┬─────────────────────────────────────────────┘
+                            │
+                            │  Stage 3 — backend construction + mode selection
+                            │  FalkorDBBackend(merge_mode=..., conflicts_log_path=...)
+                            │  scripts/ingest.py:137-141
+                            ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  FalkorDBBackend                                                        │
+│                                                                         │
+│  merge_mode resolution:                                                 │
+│    explicit MergeMode arg  >  string arg  >  MERGE_MODE env  >  OVERWRITE│
+│                                                                         │
+│  conflicts_log_path resolution:                                         │
+│    explicit arg  >  CONFLICTS_LOG env  >  ./data/conflicts.jsonl        │
+│                                                                         │
+│  MergeMode (cypher_mapper.py):                                          │
+│    OVERWRITE = "overwrite"   last-write-wins (original behavior)        │
+│    CONFLICT  = "conflict"    first-writer-wins + conflict isolation     │
+└───────────────────────────┬─────────────────────────────────────────────┘
+                            │
+                            │  Stage 4 — write to FalkorDB
+                            │  backend.write_extraction(graph, source=, chunk_index=)
+                            │  scripts/ingest.py:71-79
+                            ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  write_extraction branches on merge_mode                                │
+└───────────────────────────┬─────────────────────────────────────────────┘
+                            │
+              ┌─────────────┴──────────────┐
+              │                            │
+              ▼                            ▼
+┌──────────────────────────┐  ┌──────────────────────────────────────────┐
+│  OVERWRITE PATH          │  │  CONFLICT PATH                            │
+│  (unchanged from v0)     │  │  (new)                                    │
+│                          │  │                                          │
+│  extraction_to_cypher()  │  │  extraction_to_cypher_with_mode(          │
+│  cypher_mapper.py:176    │  │    graph, MergeMode.CONFLICT,             │
+│                          │  │    source=, chunk_index=)                 │
+│  Flat list of MERGEs:    │  │  cypher_mapper.py:292                     │
+│  ┌─────────────────────┐ │  │                                          │
+│  │ Pass 1: nodes       │ │  │  Returns (rel_statements, node_entries): │
+│  │ MERGE (n:Label      │ │  │                                          │
+│  │   {name: $name})    │ │  │  ┌─────────────────────────────────────┐ │
+│  │ SET n.k = $p_k, ... │ │  │  │ Pass 1 — per entity (fetch + write) │ │
+│  └─────────────────────┘ │  │  │                                     │ │
+│  ┌─────────────────────┐ │  │  │ 4a. FETCH existing node             │ │
+│  │ Pass 2: rels        │ │  │  │   model_to_cypher_fetch()           │ │
+│  │ MATCH (a:Label      │ │  │  │   cypher_mapper.py:211              │ │
+│  │   {name:$src})      │ │  │  │   ┌─────────────────────────────┐   │ │
+│  │ MERGE (b:Tgt        │ │  │  │   │ MATCH (n:Resource            │   │ │
+│  │   {name:$tgt})      │ │  │  │   │   {name: $name}) RETURN n   │   │ │
+│  │ MERGE (a)-[r:TYPE]  │ │  │  │   └─────────────────────────────┘   │ │
+│  │   ->(b)             │ │  │  │   _fetch_node_props() returns       │ │
+│  └─────────────────────┘ │  │  │   dict of existing props, or {}     │ │
+│                          │  │  │   if node doesn't exist yet         │ │
+│  All SETs overwrite      │  │  │                                     │ │
+│  unconditionally.        │  │  │ 4b. COMPARE + BUILD WRITE           │ │
+│  No conflicts detected.  │  │  │   build_conflict_merge(             │ │
+│  Returns (count, []).    │  │  │     entity, label, existing_props,  │ │
+│                          │  │  │     source=, chunk_index=)          │ │
+│                          │  │  │   cypher_mapper.py:222              │ │
+│                          │  │  │                                     │ │
+│                          │  │  │   For each scalar field (non-None,  │ │
+│                          │  │  │   non-reference):                   │ │
+│                          │  │  │   ┌───────────────────────────────┐ │ │
+│                          │  │  │   │ existing is None?             │ │ │
+│                          │  │  │   │   → SET n.k = $p_k  (WRITE)   │ │ │
+│                          │  │  │   │ existing == incoming?         │ │ │
+│                          │  │  │   │   → no-op        (AGREE)      │ │ │
+│                          │  │  │   │ existing != incoming & non-null?│ │
+│                          │  │  │   │   → CONFLICT: keep existing,  │ │ │
+│                          │  │  │   │     append record to conflicts│ │ │
+│                          │  │  │   └───────────────────────────────┘ │ │
+│                          │  │  │                                     │ │
+│                          │  │  │  Conflict record shape:             │ │
+│                          │  │  │  {                                   │ │
+│                          │  │  │    "property":        "capacity",   │ │
+│                          │  │  │    "existing_value":   500,         │ │
+│                          │  │  │    "incoming_value":   600,         │ │
+│                          │  │  │    "source":           "DOC3....md",│ │
+│                          │  │  │    "chunk_index":      2,           │ │
+│                          │  │  │    "detected_at":      ISO-8601 UTC │ │
+│                          │  │  │  }                                   │ │
+│                          │  │  │                                     │ │
+│                          │  │  │  Generated Cypher (conflict case):  │ │
+│                          │  │  │  ┌───────────────────────────────┐  │ │
+│                          │  │  │  │ MERGE (n:Resource             │  │ │
+│                          │  │  │  │   {name: $name})              │  │ │
+│                          │  │  │  │ SET n.conflicts =             │  │ │
+│                          │  │  │  │   coalesce(n.conflicts, "[]") │  │ │
+│                          │  │  │  │   + [$c_capacity]             │  │ │
+│                          │  │  │  └───────────────────────────────┘  │ │
+│                          │  │  │  (existing capacity is NOT touched) │ │
+│                          │  │  │                                     │ │
+│                          │  │  │ 4c. EXECUTE write                   │ │
+│                          │  │  │   self._graph.query(write_q, ...)   │ │
+│                          │  │  │   collect conflicts into all_conflicts│
+│                          │  │  └─────────────────────────────────────┘ │
+│                          │  │                                          │
+│                          │  │  ┌─────────────────────────────────────┐ │
+│                          │  │  │ Pass 2 — relationships (both modes) │ │
+│                          │  │  │ _relationship_merges()              │ │
+│                          │  │  │ cypher_mapper.py:131                │ │
+│                          │  │  │                                     │ │
+│                          │  │  │ For each reference field on entity: │ │
+│                          │  │  │ ┌─────────────────────────────────┐ │ │
+│                          │  │  │ │ MATCH (a:Label {name:$src_name})│ │ │
+│                          │  │  │ │ MERGE (b:TgtLabel               │ │ │
+│                          │  │  │ │   {name:$tgt_name})             │ │ │
+│                          │  │  │ │ MERGE (a)-[r:REL_TYPE]->(b)     │ │ │
+│                          │  │  │ └─────────────────────────────────┘ │ │
+│                          │  │  │                                     │ │
+│                          │  │  │ stop_sequence gets {seq: i} on edge │ │
+│                          │  │  │ v1: NO conflict detection on edges  │ │
+│                          │  │  └─────────────────────────────────────┘ │
+│                          │  │                                          │
+│                          │  │  4d. JSONL APPEND                       │
+│                          │  │  _append_conflicts_log()                │
+│                          │  │  falkordb_backend.py:170                │
+│                          │  │  if all_conflicts:                      │
+│                          │  │    append 1 json.dumps(conflict) line  │
+│                          │  │    per conflict to conflicts.jsonl      │
+│                          │  │                                          │
+│                          │  │  Returns (statements_run, all_conflicts)│
+│                          │  └──────────────────────────────────────────┘
+└──────────────────────────┘  └──────────────────────────────────────────┘
+                            │
+                            │  Stage 5 — post-write summary
+                            │  scripts/ingest.py:81-86
+                            ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  CONSOLE OUTPUT                                                         │
+│                                                                         │
+│  [+] Writing to FalkorDB...                                             │
+│      42 Cypher statements executed                                      │
+│      17 node(s) in graph 'factory_planning'                             │
+│      merge mode: conflict                                               │
+│      3 property conflict(s) logged to data/conflicts.jsonl             │
+└───────────────────────────┬─────────────────────────────────────────────┘
+                            │
+                            │  Stage 6 — conflict persistence (hybrid)
+                            ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  TWO COMPLEMENTARY CONFLICT STORES                                      │
+│                                                                         │
+│  ┌────────────────────────────────┐  ┌────────────────────────────────┐ │
+│  │ IN-GRAPH: n.conflicts          │  │ ON-DISK: conflicts.jsonl       │ │
+│  │ (current per-entity state)     │  │ (append-only audit history)    │ │
+│  │                                │  │                                │ │
+│  │ • JSON-serialized list on each │  │ • one JSON object per line     │ │
+│  │   conflicted node              │  │ • full provenance per record   │ │
+│  │ • queryable via Cypher:        │  │ • survives --reset (reset()    │ │
+│  │   MATCH (n) WHERE              │  │   only touches the graph)      │ │
+│  │   n.conflicts IS NOT NULL      │  │ • git-diffable                 │ │
+│  │   RETURN n.name, n.conflicts   │  │ • consumable by external tools │ │
+│  │ • mutable via clear_conflicts()│  │ • never truncated              │ │
+│  │   → SET n.conflicts = null     │  │                                │ │
+│  └────────────────────────────────┘  └────────────────────────────────┘ │
+│                                                                         │
+│  Backend helpers (falkordb_backend.py):                                 │
+│    get_conflicts(label=None)  → parsed [{name, labels, conflicts}]      │
+│    clear_conflicts(label=, name=) → nulls n.conflicts, returns count    │
+└───────────────────────────┬─────────────────────────────────────────────┘
+                            │
+                            │  Stage 7 — surface to human / search
+                            ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  THREE ACCESS PATHS (all already wired)                                 │
+│                                                                         │
+│  1. Cypher REPL  — python scripts/ingest.py --search                    │
+│     > MATCH (n) WHERE n.conflicts IS NOT NULL                           │
+│         RETURN n.name, labels(n), n.conflicts                           │
+│                                                                         │
+│  2. Programmatic — backend.get_conflicts(label="Resource")              │
+│                                                                         │
+│  3. File review  — cat data/conflicts.jsonl | jq                        │
+│     each line: {property, existing_value, incoming_value,               │
+│                 source, chunk_index, detected_at}                       │
+│                                                                         │
+│  After adjudication: backend.clear_conflicts(name="M-100")              │
+│  (JSONL record remains as history)                                      │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Entity & relationship catalog
+
+The `FactoryPlanningGraph` schema (`src/knowledge/graph_models/factory_graph_model.py`) defines 15 entity types. Cross-reference fields become relationships via `_REFERENCE_FIELDS` (`cypher_mapper.py:33-51`):
+
+| Source label | Reference field | Relationship type | Target label |
+|---|---|---|---|
+| Resource | `shift_model` | `HAS_SHIFT_MODEL` | ShiftModel |
+| Resource | `assigned_products` | `PROCESSES` | Product |
+| TransportSegment | `from_node` | `FROM` | Resource |
+| TransportSegment | `to_node` | `TO` | Resource |
+| TransportRoute | `stop_sequence` | `STOPS_AT` | Resource |
+| TransportRoute | `waiting_positions` | `HAS_WAITING_POSITION` | Resource |
+| TransportRoute | `served_demand_points` | `SERVES` | Resource |
+| TrafficRule | `affected_segments` | `AFFECTS_SEGMENT` | TransportSegment |
+| Product | `bom_children` | `HAS_CHILD` | Product |
+| OrderLogic | `associated_product` | `FOR_PRODUCT` | Product |
+| OrderLogic | `associated_resource` | `TARGETS` | Resource |
+| ShiftModel | `applicable_zones` | `APPLIES_TO_ZONE` | LayoutElement |
+| WorkerPool | `assigned_resources` | `OPERATES` | Resource |
+| ControlStrategy | `affected_resources` | `GOVERNS` | Resource |
+| ControlStrategy | `affected_products` | `AFFECTS` | Product |
+| StochasticParameter | `associated_entity` | `DESCRIBES` | Resource |
+| KPI | `scope` | `SCOPED_TO` | Resource |
+
+Reference fields are **never** stored as scalar node properties and **never** produce property conflicts — they are only translated to relationship MERGEs.
+
+---
+
+## Conflict record schema
+
+Every conflict (both in-graph and JSONL) is a JSON object with these fields:
+
+```json
+{
+  "property":        "capacity",
+  "existing_value":  500,
+  "incoming_value":  600,
+  "source":          "DOC3_Maschinenparameter_Tabelle.md",
+  "chunk_index":     2,
+  "detected_at":     "2026-07-08T14:22:01Z"
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `property` | str | The scalar field name that conflicted |
+| `existing_value` | any | The value already stored on the node (preserved) |
+| `incoming_value` | any | The value the new extraction tried to write (rejected) |
+| `source` | str \| null | Originating document filename |
+| `chunk_index` | int \| null | Positional chunk index within `source` |
+| `detected_at` | str | ISO-8601 UTC timestamp of detection |
+
+---
+
+## Module map
+
+| Module | Responsibility |
+|---|---|
+| `scripts/ingest.py` | CLI entry point, pipeline orchestration, search REPL launch |
+| `src/knowledge/chunking.py` | Document discovery, reading, paragraph-aware chunking |
+| `src/knowledge/llm_extract.py` | LLM-based structured extraction, provenance attachment |
+| `src/knowledge/graph_models/factory_graph_model.py` | Pydantic entity + root extraction schema |
+| `src/knowledge/cypher_mapper.py` | Pydantic → Cypher MERGE generation, `MergeMode`, conflict detection |
+| `src/knowledge/falkordb_backend.py` | FalkorDB connection, write, conflict logging, search helpers |
+| `src/knowledge/search.py` | Graph / fulltext / vector search REPL |
+
+---
+
+## Configuration reference
+
+| CLI flag | Env var | Default | Description |
+|---|---|---|---|
+| `--data-dir` | `DATA_DIR` | `./data` | Source document directory |
+| `--graph-name` | `FALKORDB_GRAPH` | `factory_planning` | FalkorDB graph name |
+| `--chunk-size` | — | `4000` | Chunk size in characters |
+| `--concurrency` | — | `4` | Max parallel LLM calls |
+| `--llm-model` | `LLM_MODEL` | `ollama/qwen3.5:122b-a10b` | litellm model string |
+| `--api-base` | `OLLAMA_BASE_URL` | — | LLM provider base URL |
+| `--merge-mode` | `MERGE_MODE` | `overwrite` | `overwrite` or `conflict` |
+| `--conflicts-log` | `CONFLICTS_LOG` | `./data/conflicts.jsonl` | JSONL conflict log path |
+| `--search` | — | — | Launch search REPL |
+| `--fulltext` | — | — | Fulltext search mode (requires `--search`) |
+| `--vector` | — | — | Vector search mode (requires `--search`) |
+| `--reset` | — | — | Delete all graph data (preserves JSONL log) |
+
+---
+
+## v1 scope boundaries
+
+- **Relationship property conflicts** — edges use find-or-create `MERGE` in both modes; no conflict detection on edge properties (e.g. `seq` on `STOPS_AT`).
+- **Auto-resolution** — no heuristic picks a winner; humans adjudicate via `clear_conflicts`.
+- **Conflict log rotation** — the JSONL grows unbounded by design (audit trail).
+
+---
+
+## Running the tests
+
+```bash
+pytest -q
+```
+
+55 tests covering chunking, Cypher mapping (both modes), conflict detection, conflict logging, backend query helpers, and CLI flag plumbing.
