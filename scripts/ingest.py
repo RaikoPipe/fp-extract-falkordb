@@ -71,12 +71,14 @@ async def do_ingest(
     print("\n[+] Writing to FalkorDB...")
     total_statements = 0
     total_conflicts = 0
+    total_reconciliations = 0
     for graph, source, chunk_index in extractions:
-        statements, conflicts = backend.write_extraction(
+        statements, conflicts, reconciliations = await backend.write_extraction(
             graph, source=source, chunk_index=chunk_index
         )
         total_statements += statements
         total_conflicts += len(conflicts)
+        total_reconciliations += len(reconciliations)
 
     node_count = backend.node_count()
     print(f"    {total_statements} Cypher statements executed")
@@ -84,6 +86,8 @@ async def do_ingest(
     print(f"    merge mode: {backend.merge_mode.value}")
     if backend.merge_mode.value == "conflict":
         print(f"    {total_conflicts} property conflict(s) logged to {backend.conflicts_log_path}")
+    if backend.recon_enabled:
+        print(f"    {total_reconciliations} reconciliation(s) logged to {backend.reconciliations_log_path}")
 
 
 async def do_search(
@@ -131,6 +135,12 @@ async def run(
     search_vector: bool,
     merge_mode: str | None,
     conflicts_log: str | None,
+    recon_enabled: bool | None,
+    recon_posthoc: bool,
+    recon_cosine_cutoff: float | None,
+    recon_confidence_threshold: float | None,
+    recon_top_k: int | None,
+    reconciliations_log: str | None,
 ) -> None:
     from knowledge.falkordb_backend import FalkorDBBackend
 
@@ -138,6 +148,13 @@ async def run(
         graph_name=graph_name,
         merge_mode=merge_mode,
         conflicts_log_path=conflicts_log,
+        recon_enabled=recon_enabled,
+        reconciliations_log_path=reconciliations_log,
+        recon_cosine_cutoff=recon_cosine_cutoff,
+        recon_confidence_threshold=recon_confidence_threshold,
+        recon_top_k=recon_top_k,
+        llm_model=llm_model,
+        api_base=api_base,
     )
 
     if do_reset or do_delete:
@@ -151,6 +168,11 @@ async def run(
             print("    Create the directory and add your documents to it.")
             return
         await do_ingest(backend, data_dir, chunk_size, concurrency, llm_model, api_base)
+
+    if recon_posthoc:
+        print("\n[+] Post-hoc reconciliation of plain-name Resources...")
+        records = await backend.reconcile_posthoc()
+        print(f"    {len(records)} reconciliation(s) logged to {backend.reconciliations_log_path}")
 
     if do_search_flag:
         await do_search(
@@ -233,6 +255,80 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--recon",
+        action="store_true",
+        default=None,
+        dest="recon_enabled",
+        help=(
+            "Enable similarity-based reconciliation for plain-name Resource "
+            "nodes during ingestion. When a new resource with name_has_index="
+            "false does not match an existing node by name, it is tested for "
+            "similarity against indexed Resource nodes. Also readable from "
+            "the RECON_ENABLE env var."
+        ),
+    )
+    parser.add_argument(
+        "--no-recon",
+        action="store_false",
+        default=None,
+        dest="recon_enabled",
+        help="Disable reconciliation (default unless RECON_ENABLE is set).",
+    )
+    parser.add_argument(
+        "--recon-posthoc",
+        action="store_true",
+        dest="recon_posthoc",
+        help=(
+            "Run a post-hoc reconciliation pass over existing plain-name "
+            "Resource nodes (name_has_index=false) that do not yet have a "
+            "POSSIBLE_DUPLICATE_OF link. Useful for reconciling plain names "
+            "ingested before their indexed counterpart arrived."
+        ),
+    )
+    parser.add_argument(
+        "--recon-cosine-cutoff",
+        type=float,
+        default=None,
+        dest="recon_cosine_cutoff",
+        help=(
+            "Minimum cosine similarity (0-1) for a candidate to pass the "
+            "first-stage filter (default: 0.70). Also readable from "
+            "the RECON_COSINE_CUTOFF env var."
+        ),
+    )
+    parser.add_argument(
+        "--recon-confidence-threshold",
+        type=float,
+        default=None,
+        dest="recon_confidence_threshold",
+        help=(
+            "Minimum LLM pairwise confidence (0-1) above which a plain-name "
+            "node is linked to its best-matching indexed node (default: 0.90). "
+            "Also readable from the RECON_CONFIDENCE_THRESHOLD env var."
+        ),
+    )
+    parser.add_argument(
+        "--recon-top-k",
+        type=int,
+        default=None,
+        dest="recon_top_k",
+        help=(
+            "Number of top cosine-similar candidates to keep before the LLM "
+            "pairwise comparison (default: 10). Also readable from the "
+            "RECON_TOP_K env var."
+        ),
+    )
+    parser.add_argument(
+        "--reconciliations-log",
+        default=None,
+        dest="reconciliations_log",
+        help=(
+            "Path to the append-only JSONL reconciliation log (default: "
+            "./data/reconciliations.jsonl). Also readable from the "
+            "RECONCILIATIONS_LOG env var. The log survives --reset."
+        ),
+    )
+    parser.add_argument(
         "--ingest",
         action="store_true",
         help="Run full pipeline: read -> chunk -> extract -> write to FalkorDB.",
@@ -283,7 +379,7 @@ def main() -> None:
         print("[!] --fulltext and --vector are mutually exclusive; using --vector.")
         args.fulltext = False
 
-    if not any([args.reset, args.delete, args.ingest, args.search]):
+    if not any([args.reset, args.delete, args.ingest, args.search, args.recon_posthoc]):
         parser.print_help()
         return
 
@@ -303,6 +399,12 @@ def main() -> None:
             search_vector=args.vector,
             merge_mode=args.merge_mode,
             conflicts_log=args.conflicts_log,
+            recon_enabled=args.recon_enabled,
+            recon_posthoc=args.recon_posthoc,
+            recon_cosine_cutoff=args.recon_cosine_cutoff,
+            recon_confidence_threshold=args.recon_confidence_threshold,
+            recon_top_k=args.recon_top_k,
+            reconciliations_log=args.reconciliations_log,
         )
     )
 

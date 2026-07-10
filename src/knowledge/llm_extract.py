@@ -25,6 +25,18 @@ Rules:
 - Never extract personal names, contact information, or employee identifiers.
 - If a field's value is not mentioned in the text, omit it (do not guess).
 - Return valid JSON matching the schema. No markdown fences, no commentary.
+
+Resource-specific rules:
+- Every resource MUST have a semantically rich description that captures its \
+function, location, role in the production flow, and distinguishing \
+characteristics. Even for sparse mentions, synthesize a concise description \
+from the available context. When re-encountering a known resource, extend \
+the description with newly discovered context while preserving prior \
+information.
+- Set name_has_index to true when the name includes a clear index, ID, or \
+code that distinguishes this resource (e.g. 'AKL-01', 'Workstation-3A', \
+'AGV-02'). Set it to false when the name is a plain or generic word with no \
+distinguishing index (e.g. 'Machine', 'Buffer', 'Conveyor').
 """
 
 

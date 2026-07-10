@@ -9,6 +9,8 @@ Supports two merge modes:
 | `overwrite` (default) | Last-write-wins. Re-ingestion silently replaces prior property values. | `--merge-mode overwrite` |
 | `conflict` | First-writer-wins. Existing non-null values are preserved; disagreements are isolated as **conflicts** (in-graph `conflicts` list + append-only JSONL audit log) for human review. | `--merge-mode conflict` |
 
+An optional **similarity-based reconciliation** step catches plain-name resource nodes (e.g. "Machine") that refer to the same physical entity as an indexed resource (e.g. "AKL-01"). Enabled with `--recon`; details below.
+
 ---
 
 ## Quick start
@@ -332,8 +334,9 @@ Every conflict (both in-graph and JSONL) is a JSON object with these fields:
 | `src/knowledge/chunking.py` | Document discovery, reading, paragraph-aware chunking |
 | `src/knowledge/llm_extract.py` | LLM-based structured extraction, provenance attachment |
 | `src/knowledge/graph_models/factory_graph_model.py` | Pydantic entity + root extraction schema |
-| `src/knowledge/cypher_mapper.py` | Pydantic → Cypher MERGE generation, `MergeMode`, conflict detection |
-| `src/knowledge/falkordb_backend.py` | FalkorDB connection, write, conflict logging, search helpers |
+| `src/knowledge/cypher_mapper.py` | Pydantic → Cypher MERGE generation, `MergeMode`, conflict detection, reconciliation link Cypher |
+| `src/knowledge/reconciliation.py` | Similarity-based reconciliation engine: embedding, cosine search, LLM pairwise confidence, description coalescing |
+| `src/knowledge/falkordb_backend.py` | FalkorDB connection, write, conflict + reconciliation logging, search helpers |
 | `src/knowledge/search.py` | Graph / fulltext / vector search REPL |
 
 ---
@@ -350,18 +353,122 @@ Every conflict (both in-graph and JSONL) is a JSON object with these fields:
 | `--api-base` | `OLLAMA_BASE_URL` | — | LLM provider base URL |
 | `--merge-mode` | `MERGE_MODE` | `overwrite` | `overwrite` or `conflict` |
 | `--conflicts-log` | `CONFLICTS_LOG` | `./data/conflicts.jsonl` | JSONL conflict log path |
+| `--recon` / `--no-recon` | `RECON_ENABLE` | `false` | Enable similarity reconciliation for plain-name Resources |
+| `--recon-posthoc` | — | — | Post-hoc reconciliation pass over existing plain-name nodes |
+| `--recon-cosine-cutoff` | `RECON_COSINE_CUTOFF` | `0.70` | Minimum cosine similarity for candidates |
+| `--recon-confidence-threshold` | `RECON_CONFIDENCE_THRESHOLD` | `0.90` | Minimum LLM confidence to link a duplicate |
+| `--recon-top-k` | `RECON_TOP_K` | `10` | Top-k cosine candidates before LLM pairwise |
+| `--reconciliations-log` | `RECONCILIATIONS_LOG` | `./data/reconciliations.jsonl` | JSONL reconciliation log path |
 | `--search` | — | — | Launch search REPL |
 | `--fulltext` | — | — | Fulltext search mode (requires `--search`) |
 | `--vector` | — | — | Vector search mode (requires `--search`) |
-| `--reset` | — | — | Delete all graph data (preserves JSONL log) |
+| `--reset` | — | — | Delete all graph data (preserves JSONL logs) |
+
+---
+
+## Similarity-based reconciliation
+
+Plain-name resource nodes (e.g. "Machine", "Buffer") that lack a distinguishing index can slip past the exact-name deduplication and create silent duplicates. The reconciliation step catches these by testing each new plain-name Resource against all indexed Resource nodes (`name_has_index=true`) using a two-stage pipeline:
+
+### Prerequisites
+
+1. **`description` (required)** — Every Resource carries a semantically rich description. On name-match merge, the description is **coalesced** via an LLM call (old + new → merged) and the node is **re-embedded** so cosine search stays accurate as descriptions evolve. This happens in both merge modes.
+2. **`name_has_index (required, bool)** — `true` when the name includes a clear index/ID (e.g. `AKL-01`, `Workstation-3A`), `false` for plain names. Only indexed nodes serve as similarity candidates.
+
+### Reconciliation pipeline (per new plain-name Resource with no name match)
+
+```
+                         ┌──────────────────────────────────────┐
+    new Resource         │  Stage 1 — EMBED                     │
+    (name_has_index=false)│  embed_description(description)     │
+                         └──────────────────┬───────────────────┘
+                                              │
+                         ┌──────────────────▼───────────────────┐
+                         │  Stage 2 — COSINE SEARCH              │
+                         │  vector_search(top_k, label=Resource) │
+                         │  filter: name_has_index=true           │
+                         │  filter: cosine >= 0.70 (cutoff)      │
+                         │  filter: name != self                  │
+                         └──────────────────┬───────────────────┘
+                                              │
+                    ┌─────────────────────────┴──────────────────┐
+                    │ no candidates?      candidates?             │
+                    ▼                         ▼                   │
+            INSERT UNIQUE         ┌────────────────────────────┐  │
+            (no link, no log)      │  Stage 3 — LLM PAIRWISE    │  │
+                                  │  for each candidate:        │  │
+                                  │    llm_pairwise_confidence(  │  │
+                                  │      new, candidate)        │  │
+                                  │  resource_type as strong     │  │
+                                  │  tie-breaker signal          │  │
+                                  └────────────┬───────────────┘  │
+                                               │                  │
+                                  ┌────────────▼───────────────┐  │
+                                  │  pick highest confidence   │  │
+                                  └────────────┬───────────────┘  │
+                                   ┌───────────┴────────────┐     │
+                                   │ conf < 0.90?  conf >= 0.90?│
+                                   ▼              ▼           │     │
+                           INSERT UNIQUE   INSERT DISTINCT NODE│
+                           (no link)       + POSSIBLE_DUPLICATE_OF│
+                                           edge (plain→indexed)   │
+                                           + alias on indexed node │
+                                           + canonical_name on plain│
+                                           + reconciliations.jsonl │
+```
+
+### Post-hoc reconciliation (`--recon-posthoc`)
+
+Plain-name nodes ingested *before* their indexed counterpart arrived can be reconciled later:
+
+```bash
+python scripts/ingest.py --recon-posthoc
+```
+
+Scans all `Resource` nodes with `name_has_index=false` that do not yet have an outgoing `POSSIBLE_DUPLICATE_OF`, embeds each, and runs the same pipeline. Can be run repeatedly as the graph grows.
+
+### Reconciliation record schema
+
+Every reconciliation (in-graph edge + JSONL) carries:
+
+```json
+{
+  "new_name":          "Machine",
+  "matched_name":      "AKL-01",
+  "matched_label":     "Resource",
+  "cosine_similarity": 0.8523,
+  "llm_confidence":    0.9300,
+  "source":            "DOC3_Maschinenparameter_Tabelle.md",
+  "chunk_index":       2,
+  "detected_at":       "2026-07-10T14:22:01Z"
+}
+```
+
+### In-graph artifacts
+
+| Artifact | Location | Description |
+|---|---|---|
+| `POSSIBLE_DUPLICATE_OF` edge | `(plain)-[:POSSIBLE_DUPLICATE_OF]->(indexed)` | Carries `cosine_similarity`, `llm_confidence`, `detected_at`, `source`, `chunk_index` as edge properties |
+| `aliases` list | on the indexed node | JSON-encoded list of plain names linked to this indexed node |
+| `canonical_name` | on the plain node | The indexed node's name, for lookups from the plain side |
+
+### Backend helpers
+
+```python
+backend.get_reconciliations(label="Resource")   # list POSSIBLE_DUPLICATE_OF edges
+backend.clear_reconciliations(plain_name="...")  # delete edge + remove alias/canonical
+backend.reconcile_posthoc()                      # run post-hoc pass (async)
+```
 
 ---
 
 ## v1 scope boundaries
 
+- **Reconciliation applies to Resources only** — other entity types are not reconciled.
+- **No auto-merge of duplicates** — the plain node is kept as a distinct node with a `POSSIBLE_DUPLICATE_OF` link; humans adjudicate via `clear_reconciliations`.
 - **Relationship property conflicts** — edges use find-or-create `MERGE` in both modes; no conflict detection on edge properties (e.g. `seq` on `STOPS_AT`).
-- **Auto-resolution** — no heuristic picks a winner; humans adjudicate via `clear_conflicts`.
-- **Conflict log rotation** — the JSONL grows unbounded by design (audit trail).
+- **Auto-resolution** — no heuristic picks a winner for property conflicts; humans adjudicate via `clear_conflicts`.
+- **Conflict/reconciliation log rotation** — the JSONL files grow unbounded by design (audit trail).
 
 ---
 
@@ -371,4 +478,4 @@ Every conflict (both in-graph and JSONL) is a JSON object with these fields:
 pytest -q
 ```
 
-55 tests covering chunking, Cypher mapping (both modes), conflict detection, conflict logging, backend query helpers, and CLI flag plumbing.
+87 tests covering chunking, Cypher mapping (both modes), conflict detection, conflict logging, reconciliation decisions, reconciliation logging, backend query helpers, and CLI flag plumbing.

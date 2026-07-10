@@ -20,6 +20,23 @@ class Resource(BaseModel):
     name: str = Field(
         description="Unique identifier or label of the resource (e.g. 'AKL-01', 'Workstation-3A')."
     )
+    name_has_index: bool = Field(
+        description=(
+            "True when the name includes a clear index, ID, or code that distinguishes "
+            "this resource from others of the same type (e.g. 'AKL-01', 'Workstation-3A', "
+            "'AGV-02'). False when the name is a plain/generic word with no distinguishing "
+            "index (e.g. 'Machine', 'Buffer', 'Conveyor')."
+        )
+    )
+    description: str = Field(
+        description=(
+            "Semantically rich description of this resource: its function, location, "
+            "role in the production flow, and any distinguishing characteristics. Always "
+            "provide a description, even for sparse mentions. When re-encountering a "
+            "known resource, extend the description with newly discovered context while "
+            "preserving prior information."
+        )
+    )
     resource_type: str = Field(
         description=(
             "Type category. One of: machine, workstation, buffer, source, sink, "
@@ -250,6 +267,14 @@ class FactoryPlanningGraph(BaseModel):
     Use consistent, exact entity names across extractions to enable deduplication.
     All time values in seconds, lengths in meters, weights in grams, speeds in m/s.
     Never extract personal names, contact information, or employee identifiers.
+
+    Resource-specific rules:
+    - Every resource must carry a semantically rich ``description`` capturing its
+      function, location, role in the production flow, and distinguishing
+      characteristics. Extend the description when new context is discovered.
+    - Set ``name_has_index`` to True when the name includes a clear index, ID, or
+      code (e.g. 'AKL-01', 'Workstation-3A'). Set it to False for plain/generic
+      names with no distinguishing index (e.g. 'Machine', 'Buffer').
     """
 
     resources: List[Resource] = Field(default_factory=list, description="All physical resources: machines, buffers, stations, AS/RS, gates, etc.")
