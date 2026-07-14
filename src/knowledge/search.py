@@ -8,6 +8,7 @@ import json
 import os
 
 import litellm
+from loguru import logger
 
 from knowledge.falkordb_backend import FalkorDBBackend
 
@@ -115,8 +116,14 @@ class GraphSearcher:
         }
         if self._api_base:
             cypher_kwargs["api_base"] = self._api_base
+        logger.debug(
+            "NL-to-Cypher request | model={} | messages={}",
+            self._llm_model,
+            json.dumps(cypher_kwargs["messages"], indent=2, ensure_ascii=False),
+        )
         cypher_response = await litellm.acompletion(**cypher_kwargs)
         cypher = cypher_response.choices[0].message.content.strip()
+        logger.debug("NL-to-Cypher response | raw={}", cypher)
 
         # Strip markdown fences if present
         if cypher.startswith("```"):
@@ -158,8 +165,15 @@ class GraphSearcher:
         }
         if self._api_base:
             summary_kwargs["api_base"] = self._api_base
+        logger.debug(
+            "Summarization request | model={} | messages={}",
+            self._llm_model,
+            json.dumps(summary_kwargs["messages"], indent=2, ensure_ascii=False),
+        )
         summary_response = await litellm.acompletion(**summary_kwargs)
-        return summary_response.choices[0].message.content.strip()
+        summary = summary_response.choices[0].message.content.strip()
+        logger.debug("Summarization response | raw={}", summary)
+        return summary
 
     # ------------------------------------------------------------------
     # Full-text mode
@@ -184,8 +198,15 @@ class GraphSearcher:
         kwargs: dict = {"model": self._embedding_model, "input": text}
         if self._api_base:
             kwargs["api_base"] = self._api_base
+        logger.debug(
+            "Embedding request | model={} | input_length={}",
+            self._embedding_model,
+            len(text),
+        )
         response = await litellm.aembedding(**kwargs)
-        return list(response.data[0]["embedding"])
+        embedding = list(response.data[0]["embedding"])
+        logger.debug("Embedding response | dim={}", len(embedding))
+        return embedding
 
     async def vector_search(self, query: str) -> list[dict]:
         """Embed ``query`` and run a vector similarity search."""

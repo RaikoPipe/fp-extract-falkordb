@@ -75,6 +75,20 @@ _REF_FIELD_NAMES: set[str] = {field for (_, field) in _REFERENCE_FIELDS}
 # Name of the list-valued node property that records property conflicts in-graph.
 _CONFLICTS_PROP = "conflicts"
 
+# Node property that holds a JSON-encoded list of aliases (plain names that
+# were reconciled as possible duplicates of this indexed node).
+_ALIASES_PROP = "aliases"
+
+# Node property set on a plain-name node pointing to its canonical indexed name.
+_CANONICAL_NAME_PROP = "canonical_name"
+
+# Relationship type linking a plain-name node to the indexed node it may duplicate.
+_RECON_REL_TYPE = "POSSIBLE_DUPLICATE_OF"
+
+# Scalar fields on Resource that require special handling (not plain conflict
+# detection). ``description`` is coalesced via LLM instead of first-writer-wins.
+_COALESCED_FIELDS = {"description"}
+
 
 class MergeMode(str, Enum):
     """How to reconcile property values when MERGE matches an existing node.
@@ -226,12 +240,18 @@ def build_conflict_merge(
     *,
     source: str | None = None,
     chunk_index: int | None = None,
+    coalesced_values: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
     """Convert one Pydantic entity to a conflict-aware MERGE + SET statement.
 
-    Policy: first-writer-wins.
+    Policy: first-writer-wins, except for fields listed in
+    :data:`_COALESCED_FIELDS` (e.g. ``description``), which are handled via
+    caller-supplied coalesced values.
 
     - For each scalar field on ``entity``:
+        * If the field is in ``coalesced_values``, that value is written via
+          ``SET`` (the caller — the async backend — computed it via an LLM
+          coalesce call). No conflict is recorded for coalesced fields.
         * If the existing node does not have the property (or it is null),
           the incoming value is written via ``SET``.
         * If the existing value equals the incoming value, nothing happens.
@@ -243,6 +263,7 @@ def build_conflict_merge(
     the list of newly-detected conflict dicts (also embedded in the query so
     they land in-graph in the same round-trip).
     """
+    coalesced_values = coalesced_values or {}
     data = entity.model_dump(exclude_none=True)
     name = data.pop("name")
     params: dict[str, Any] = {"name": name}
@@ -251,6 +272,13 @@ def build_conflict_merge(
     conflict_params: dict[str, Any] = {}
 
     for key, incoming in _scalar_fields(entity).items():
+        if key in coalesced_values:
+            coalesced = coalesced_values[key]
+            param_key = f"p_{key}"
+            params[param_key] = _serialize_value(coalesced)
+            set_parts.append(f"n.{key} = ${param_key}")
+            continue
+
         existing = existing_props.get(key)
         if existing is None:
             # No prior value — write it.
@@ -287,6 +315,48 @@ def build_conflict_merge(
 
     params.update(conflict_params)
     return query, params, conflicts
+
+
+def build_reconciliation_link_cypher(
+    plain_name: str,
+    indexed_name: str,
+    *,
+    cosine: float,
+    confidence: float,
+    detected_at: str,
+    source: str | None = None,
+    chunk_index: int | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Build the Cypher that links a plain-name node to its indexed duplicate.
+
+    Creates a ``POSSIBLE_DUPLICATE_OF`` relationship from the plain node to the
+    indexed node, stores the plain name as an alias on the indexed node, and
+    sets the indexed name as ``canonical_name`` on the plain node.
+
+    Returns ``(cypher_query, parameters)``.
+    """
+    params: dict[str, Any] = {
+        "plain_name": plain_name,
+        "indexed_name": indexed_name,
+        "cosine": round(float(cosine), 4),
+        "confidence": round(float(confidence), 4),
+        "detected_at": detected_at,
+        "source": source,
+        "chunk_index": chunk_index,
+    }
+    query = (
+        "MERGE (a:Resource {name: $plain_name}) "
+        "MERGE (b:Resource {name: $indexed_name}) "
+        f"MERGE (a)-[r:{_RECON_REL_TYPE}]->(b) "
+        "SET r.cosine_similarity = $cosine, "
+        "r.llm_confidence = $confidence, "
+        "r.detected_at = $detected_at, "
+        "r.source = $source, "
+        "r.chunk_index = $chunk_index, "
+        f"b.{_ALIASES_PROP} = coalesce(b.{_ALIASES_PROP}, \"[]\") + [$plain_name], "
+        f"a.{_CANONICAL_NAME_PROP} = $indexed_name"
+    )
+    return query, params
 
 
 def extraction_to_cypher_with_mode(
