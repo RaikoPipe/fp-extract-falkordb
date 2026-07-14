@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from loguru import logger
+
 SUPPORTED_EXTENSIONS = {
     ".txt", ".md", ".pdf", ".docx", ".csv", ".json", ".html", ".py",
 }
@@ -100,16 +102,18 @@ def load_and_chunk(
     Returns a list of ``{source: str, chunk_index: int, text: str}`` dicts.
     """
     files = discover_files(data_dir)
+    logger.debug("Discovered {} file(s) in {}", len(files), data_dir)
     all_chunks: list[dict] = []
 
     for f in files:
         try:
             text = read_document(f)
         except Exception as exc:
-            print(f"[!] Failed to read {f}: {exc}")
+            logger.warning("Failed to read {}: {}", f, exc)
             continue
 
         chunks = chunk_text(text, chunk_size=chunk_size, overlap=overlap)
+        logger.debug("{}: {} chars -> {} chunk(s)", f.name, len(text), len(chunks))
         for i, chunk in enumerate(chunks):
             all_chunks.append({
                 "source": f.name,

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from falkordb import FalkorDB
+from loguru import logger
 
 from knowledge.cypher_mapper import (
     MergeMode,
@@ -186,6 +187,7 @@ class FalkorDBBackend:
 
     def execute(self, query: str, params: dict[str, Any] | None = None) -> Any:
         """Execute a Cypher query and return the result."""
+        logger.debug("Cypher execute | {}", query)
         return self._graph.query(query, params or {})
 
     async def write_extraction(
@@ -337,12 +339,19 @@ class FalkorDBBackend:
             return {}
         if existing_desc == incoming_desc:
             return {}
+        logger.debug(
+            "Coalescing descriptions for '{}' | existing={!r} | incoming={!r}",
+            entity.name,
+            existing_desc,
+            incoming_desc,
+        )
         coalesced = await coalesce_description(
             str(existing_desc),
             incoming_desc,
             model=self._llm_model,
             api_base=self._api_base,
         )
+        logger.debug("Coalesced description for '{}': {!r}", entity.name, coalesced)
         return {"description": coalesced}
 
     async def _maybe_write_embedding(
@@ -363,13 +372,18 @@ class FalkorDBBackend:
         if not desc:
             return None
         try:
-            return await embed_description(
+            logger.debug("Embedding description for '{}'", entity.name)
+            embedding = await embed_description(
                 desc,
                 model=self._embedding_model,
                 api_base=self._api_base,
             )
+            logger.debug(
+                "Embedding complete for '{}' | dim={}", entity.name, len(embedding)
+            )
+            return embedding
         except Exception as exc:
-            print(f"[!] Embedding failed for {entity.name}: {exc}")
+            logger.warning("Embedding failed for {}: {}", entity.name, exc)
             return None
 
     async def _overwrite_coalesce_and_embed(
@@ -441,9 +455,10 @@ class FalkorDBBackend:
                 api_base=self._api_base,
             )
         except Exception as exc:
-            print(f"[!] Reconciliation embedding failed for {entity.name}: {exc}")
+            logger.warning("Reconciliation embedding failed for {}: {}", entity.name, exc)
             return None
 
+        logger.debug("Running reconciliation for plain-name '{}'", entity.name)
         decision = await reconcile_new_node(
             self,
             entity,
@@ -457,8 +472,14 @@ class FalkorDBBackend:
             chunk_index=chunk_index,
         )
         if decision.linked and decision.record:
+            logger.debug(
+                "Reconciliation linked '{}' -> '{}'",
+                entity.name,
+                decision.matched_name,
+            )
             self._write_reconciliation_link(decision, source=source, chunk_index=chunk_index)
             return decision.record
+        logger.debug("No reconciliation match for '{}'", entity.name)
         return None
 
     async def _maybe_reconcile_overwrite(

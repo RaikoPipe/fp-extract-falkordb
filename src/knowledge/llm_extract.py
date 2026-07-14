@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from typing import Type
 
 import litellm
+from loguru import logger
 from pydantic import BaseModel
 
 from knowledge.graph_models.factory_graph_model import FactoryPlanningGraph
@@ -88,8 +90,19 @@ async def extract_from_chunk(
 
     for attempt in range(max_retries):
         try:
+            logger.debug(
+                "LLM extraction request | model={} | messages={}",
+                model,
+                json.dumps(messages, indent=2, ensure_ascii=False),
+            )
+            t0 = time.time()
             response = await litellm.acompletion(**kwargs)
             raw = response.choices[0].message.content
+            logger.debug(
+                "LLM extraction response ({:.1f}s) | raw={}",
+                time.time() - t0,
+                raw,
+            )
 
             # Strip markdown code fences if present
             text = raw.strip()
@@ -103,6 +116,7 @@ async def extract_from_chunk(
             try:
                 return schema_class.model_validate_json(text)
             except Exception:
+                logger.debug("JSON validation failed, attempting repair")
                 from json_repair import repair_json
 
                 repaired = repair_json(text)
@@ -112,9 +126,17 @@ async def extract_from_chunk(
 
         except Exception as exc:
             if attempt < max_retries - 1:
+                logger.debug(
+                    "Extraction attempt {}/{} failed: {}, retrying...",
+                    attempt + 1,
+                    max_retries,
+                    exc,
+                )
                 await asyncio.sleep(2 ** attempt)
                 continue
-            print(f"[!] Extraction failed after {max_retries} attempts: {exc}")
+            logger.warning(
+                "Extraction failed after {} attempts: {}", max_retries, exc
+            )
             return None
 
     return None
@@ -141,7 +163,7 @@ async def extract_from_chunks(
         async with semaphore:
             source = chunk_info["source"]
             idx = chunk_info["chunk_index"]
-            print(f"    Extracting {source} chunk {idx}...")
+            logger.debug("Extracting {} chunk {}...", source, idx)
             result = await extract_from_chunk(
                 chunk_info["text"],
                 schema_class=schema_class,
@@ -149,7 +171,7 @@ async def extract_from_chunks(
                 api_base=api_base,
             )
             if result:
-                print(f"    Done {source} chunk {idx}")
+                logger.debug("Done {} chunk {}", source, idx)
                 return (result, source, idx)
             return None
 

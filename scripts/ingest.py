@@ -34,6 +34,10 @@ load_dotenv(override=True)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+from loguru import logger
+
+from knowledge.logging_config import setup_logging
+
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 
 
@@ -49,15 +53,19 @@ async def do_ingest(
     from knowledge.chunking import load_and_chunk
     from knowledge.llm_extract import extract_from_chunks
 
-    print(f"\n[+] Loading and chunking documents from {data_dir.resolve()}...")
+    logger.info("Loading and chunking documents from {}...", data_dir.resolve())
     chunks = load_and_chunk(data_dir, chunk_size=chunk_size)
     if not chunks:
-        print("[!] No chunks produced — check your data directory.")
+        logger.warning("No chunks produced — check your data directory.")
         return
 
-    print(f"    {len(chunks)} chunk(s) from {len(set(c['source'] for c in chunks))} file(s)")
+    logger.info(
+        "{} chunk(s) from {} file(s)",
+        len(chunks),
+        len(set(c["source"] for c in chunks)),
+    )
 
-    print(f"\n[+] Extracting entities via LLM (concurrency={concurrency})...")
+    logger.info("Extracting entities via LLM (concurrency={})...", concurrency)
     t0 = time.time()
     extractions = await extract_from_chunks(
         chunks,
@@ -66,9 +74,9 @@ async def do_ingest(
         concurrency=concurrency,
     )
     elapsed = time.time() - t0
-    print(f"    {len(extractions)} extraction(s) in {elapsed:.1f}s")
+    logger.info("{} extraction(s) in {:.1f}s", len(extractions), elapsed)
 
-    print("\n[+] Writing to FalkorDB...")
+    logger.info("Writing to FalkorDB...")
     total_statements = 0
     total_conflicts = 0
     total_reconciliations = 0
@@ -81,13 +89,21 @@ async def do_ingest(
         total_reconciliations += len(reconciliations)
 
     node_count = backend.node_count()
-    print(f"    {total_statements} Cypher statements executed")
-    print(f"    {node_count} node(s) in graph '{backend.graph_name}'")
-    print(f"    merge mode: {backend.merge_mode.value}")
+    logger.info("{} Cypher statements executed", total_statements)
+    logger.info("{} node(s) in graph '{}'", node_count, backend.graph_name)
+    logger.info("merge mode: {}", backend.merge_mode.value)
     if backend.merge_mode.value == "conflict":
-        print(f"    {total_conflicts} property conflict(s) logged to {backend.conflicts_log_path}")
+        logger.info(
+            "{} property conflict(s) logged to {}",
+            total_conflicts,
+            backend.conflicts_log_path,
+        )
     if backend.recon_enabled:
-        print(f"    {total_reconciliations} reconciliation(s) logged to {backend.reconciliations_log_path}")
+        logger.info(
+            "{} reconciliation(s) logged to {}",
+            total_reconciliations,
+            backend.reconciliations_log_path,
+        )
 
 
 async def do_search(
@@ -158,21 +174,25 @@ async def run(
     )
 
     if do_reset or do_delete:
-        print(f"[+] Resetting graph '{backend.graph_name}'...")
+        logger.info("Resetting graph '{}'...", backend.graph_name)
         backend.reset()
-        print("    Done.")
+        logger.info("Reset complete.")
 
     if do_ingest_flag:
         if not data_dir.exists():
-            print(f"[!] Data directory not found: {data_dir.resolve()}")
-            print("    Create the directory and add your documents to it.")
+            logger.error("Data directory not found: {}", data_dir.resolve())
+            logger.info("Create the directory and add your documents to it.")
             return
         await do_ingest(backend, data_dir, chunk_size, concurrency, llm_model, api_base)
 
     if recon_posthoc:
-        print("\n[+] Post-hoc reconciliation of plain-name Resources...")
+        logger.info("Post-hoc reconciliation of plain-name Resources...")
         records = await backend.reconcile_posthoc()
-        print(f"    {len(records)} reconciliation(s) logged to {backend.reconciliations_log_path}")
+        logger.info(
+            "{} reconciliation(s) logged to {}",
+            len(records),
+            backend.reconciliations_log_path,
+        )
 
     if do_search_flag:
         await do_search(
@@ -183,7 +203,7 @@ async def run(
             vector=search_vector,
         )
 
-    print("\n[+] Done.")
+    logger.info("Done.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -352,6 +372,11 @@ def build_parser() -> argparse.ArgumentParser:
         "VECTOR_LABEL / VECTOR_PROPERTY / VECTOR_DIM / EMBEDDING_MODEL env.",
     )
     parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable verbose debug logging (process steps, LLM calls and responses).",
+    )
+    parser.add_argument(
         "--reset",
         action="store_true",
         help="Delete all graph data.",
@@ -369,14 +394,16 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
+    setup_logging(debug=args.debug)
+
     if args.fulltext and not args.search:
-        print("[!] --fulltext requires --search.")
+        logger.error("--fulltext requires --search.")
         return
     if args.vector and not args.search:
-        print("[!] --vector requires --search.")
+        logger.error("--vector requires --search.")
         return
     if args.fulltext and args.vector:
-        print("[!] --fulltext and --vector are mutually exclusive; using --vector.")
+        logger.warning("--fulltext and --vector are mutually exclusive; using --vector.")
         args.fulltext = False
 
     if not any([args.reset, args.delete, args.ingest, args.search, args.recon_posthoc]):
