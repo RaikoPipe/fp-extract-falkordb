@@ -8,6 +8,6 @@ build/
 .env
 .venv/
 venv/
-data/
+laundry_wash/
 *.html
 .pytest_cache/

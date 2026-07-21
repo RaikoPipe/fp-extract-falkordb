@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "falkordb_agent": "./src/falkordb_harness/agent.py:build_graph"
+  },
+  "env": ".env"
+}

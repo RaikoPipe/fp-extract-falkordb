@@ -77,14 +77,33 @@ class GraphSearcher:
         self._vector_property = vector_property or os.getenv(
             "VECTOR_PROPERTY", "embedding"
         )
-        self._vector_dim = int(
-            vector_dim or os.getenv("VECTOR_DIM", _DEFAULT_EMBEDDING_DIM)
-        )
+        env_dim = os.getenv("VECTOR_DIM")
+        if vector_dim is not None:
+            self._vector_dim: int | None = int(vector_dim)
+        elif env_dim is not None:
+            self._vector_dim = int(env_dim)
+        else:
+            # Defer: probe the embedding model on first vector search.
+            self._vector_dim = None
         self._embedding_model = embedding_model or os.getenv(
             "EMBEDDING_MODEL", _DEFAULT_EMBEDDING_MODEL
         )
         self._vector_k = vector_k
         self._fulltext_k = fulltext_k
+
+    async def _resolve_vector_dim(self) -> int:
+        """Return the effective vector dim, probing the embedding model if needed.
+
+        When ``_vector_dim`` is already set (explicit arg, ``VECTOR_DIM`` env,
+        or a cached probe result), return it directly. Otherwise embed a short
+        probe string once via the configured embedding model and cache the
+        length so subsequent calls are free.
+        """
+        if self._vector_dim is not None:
+            return self._vector_dim
+        probe = await self._embed("dimension probe")
+        self._vector_dim = len(probe)
+        return self._vector_dim
 
     # ------------------------------------------------------------------
     # Graph mode (raw Cypher + NL -> Cypher)
@@ -210,10 +229,11 @@ class GraphSearcher:
 
     async def vector_search(self, query: str) -> list[dict]:
         """Embed ``query`` and run a vector similarity search."""
+        dim = await self._resolve_vector_dim()
         self._backend.ensure_vector_index(
             label=self._vector_label,
             property=self._vector_property,
-            dim=self._vector_dim,
+            dim=dim,
         )
         embedding = await self._embed(query)
         return self._backend.vector_search(
@@ -252,9 +272,11 @@ class GraphSearcher:
                 f"(.{self._fulltext_property})."
             )
         elif mode_label == "vector":
+            dim = self._vector_dim
+            dim_str = str(dim) if dim is not None else "auto-detected"
             print(
                 f"    Vector search on :{self._vector_label}"
-                f"(.{self._vector_property}), dim={self._vector_dim}."
+                f"(.{self._vector_property}), dim={dim_str}."
             )
         print()
 
