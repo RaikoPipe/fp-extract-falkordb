@@ -21,6 +21,7 @@ from knowledge.graph_models.factory_graph_model import FactoryPlanningGraph, Res
 from knowledge.reconciliation import (
     ReconciliationDecision,
     coalesce_description,
+    detect_embedding_dim,
     embed_description,
     reconcile_existing_plain_nodes,
     reconcile_new_node,
@@ -40,16 +41,31 @@ _DEFAULT_VECTOR_LABEL = "Resource"
 _DEFAULT_VECTOR_PROPERTY = "embedding"
 _DEFAULT_SIMILARITY_FUNCTION = "cosine"
 
+# Default embedding provider — independent from the LLM provider. The LLM may
+# run on a cloud endpoint (e.g. ollama.com) that does not expose /api/embed,
+# so embeddings default to a local Ollama instance.
+_DEFAULT_EMBEDDING_API_BASE = "http://localhost:11434"
+
 # Default merge mode and on-disk conflict log path.
 _DEFAULT_MERGE_MODE = MergeMode.OVERWRITE
 _DEFAULT_CONFLICTS_LOG = "./data/conflicts.jsonl"
 
 # Reconciliation defaults.
 _DEFAULT_RECONCILIATIONS_LOG = "./data/reconciliations.jsonl"
-_DEFAULT_RECON_COSINE_CUTOFF = 0.70
+_DEFAULT_RECON_COSINE_CUTOFF = 0.40
 _DEFAULT_RECON_CONFIDENCE_THRESHOLD = 0.90
 _DEFAULT_RECON_TOP_K = 10
 _DEFAULT_RECON_ENABLED = False
+
+
+def _is_index_already_exists_error(exc: Exception) -> bool:
+    """Return True if ``exc`` is a FalkorDB 'index already exists' error.
+
+    FalkorDB reports idempotency violations with varying messages:
+    "Index already exists", "Attribute '...' is already indexed", etc.
+    """
+    msg = str(exc).lower()
+    return "already exists" in msg or "already indexed" in msg
 
 
 def _serialize_embedding(embedding: list[float]) -> str:
@@ -91,6 +107,8 @@ class FalkorDBBackend:
         llm_model: str | None = None,
         embedding_model: str | None = None,
         api_base: str | None = None,
+        embedding_api_base: str | None = None,
+        embedding_api_key: str | None = None,
         embedding_dim: int | None = None,
     ) -> None:
         self._host = host or os.getenv("FALKORDB_HOST", _DEFAULT_HOST)
@@ -147,11 +165,37 @@ class FalkorDBBackend:
         self._llm_model = llm_model or os.getenv("LLM_MODEL")
         self._embedding_model = embedding_model or os.getenv("EMBEDDING_MODEL")
         self._api_base = api_base or os.getenv("OLLAMA_BASE_URL")
-        self._embedding_dim = int(
-            embedding_dim
-            if embedding_dim is not None
-            else os.getenv("VECTOR_DIM", _DEFAULT_VECTOR_DIM)
+        self._embedding_api_base = embedding_api_base or os.getenv(
+            "EMBEDDING_API_BASE", _DEFAULT_EMBEDDING_API_BASE
         )
+        self._embedding_api_key = embedding_api_key or os.getenv("EMBEDDING_API_KEY")
+        env_dim = os.getenv("VECTOR_DIM")
+        if embedding_dim is not None:
+            self._embedding_dim: int | None = int(embedding_dim)
+        elif env_dim is not None:
+            self._embedding_dim = int(env_dim)
+        else:
+            # Defer: probe the embedding model on first use.
+            self._embedding_dim = None
+
+    async def _resolve_embedding_dim(self) -> int:
+        """Return the effective embedding dimension, probing the model if needed.
+
+        When ``_embedding_dim`` is already set (explicit arg, ``VECTOR_DIM``
+        env, or a cached probe result), return it directly. Otherwise probe
+        the configured embedding model once via :func:`embed_description`
+        and cache the result so subsequent calls are free.
+        """
+        if self._embedding_dim is not None:
+            return self._embedding_dim
+        probe = await embed_description(
+            "dimension probe",
+            model=self._embedding_model,
+            api_base=self._embedding_api_base,
+            api_key=self._embedding_api_key,
+        )
+        self._embedding_dim = len(probe)
+        return self._embedding_dim
 
     @property
     def graph_name(self) -> str:
@@ -184,6 +228,14 @@ class FalkorDBBackend:
     @property
     def recon_top_k(self) -> int:
         return self._recon_top_k
+
+    @property
+    def embedding_api_base(self) -> str:
+        return self._embedding_api_base
+
+    @property
+    def embedding_api_key(self) -> str | None:
+        return self._embedding_api_key
 
     def execute(self, query: str, params: dict[str, Any] | None = None) -> Any:
         """Execute a Cypher query and return the result."""
@@ -231,6 +283,11 @@ class FalkorDBBackend:
         all_conflicts: list[dict[str, Any]] = []
         all_reconciliations: list[dict[str, Any]] = []
         statements_run = 0
+
+        # Ensure the vector index exists once before any embedding work.
+        if self._recon_enabled:
+            dim = await self._resolve_embedding_dim()
+            self.ensure_vector_index(dim=dim)
 
         if self._merge_mode is MergeMode.CONFLICT:
             rel_statements, node_entries = extraction_to_cypher_with_mode(
@@ -376,7 +433,8 @@ class FalkorDBBackend:
             embedding = await embed_description(
                 desc,
                 model=self._embedding_model,
-                api_base=self._api_base,
+                api_base=self._embedding_api_base,
+                api_key=self._embedding_api_key,
             )
             logger.debug(
                 "Embedding complete for '{}' | dim={}", entity.name, len(embedding)
@@ -447,12 +505,12 @@ class FalkorDBBackend:
         Returns the reconciliation record dict if a link was created, else
         None.
         """
-        self.ensure_vector_index()
         try:
             embedding = await embed_description(
                 entity.description,
                 model=self._embedding_model,
-                api_base=self._api_base,
+                api_base=self._embedding_api_base,
+                api_key=self._embedding_api_key,
             )
         except Exception as exc:
             logger.warning("Reconciliation embedding failed for {}: {}", entity.name, exc)
@@ -535,7 +593,8 @@ class FalkorDBBackend:
 
         Returns the list of reconciliation records created.
         """
-        self.ensure_vector_index()
+        dim = await self._resolve_embedding_dim()
+        self.ensure_vector_index(dim=dim)
         decisions = await reconcile_existing_plain_nodes(
             self,
             cosine_cutoff=self._recon_cosine_cutoff,
@@ -543,6 +602,8 @@ class FalkorDBBackend:
             top_k=self._recon_top_k,
             llm_model=self._llm_model,
             api_base=self._api_base,
+            embedding_api_base=self._embedding_api_base,
+            embedding_api_key=self._embedding_api_key,
         )
         records: list[dict[str, Any]] = []
         for decision in decisions:
@@ -791,14 +852,15 @@ class FalkorDBBackend:
         """Create a full-text index on ``label`` for the given properties.
 
         Idempotent: existing indexes are reported by FalkorDB as an error
-        ("Index already exists"), which we treat as success.
+        ("Index already exists" / "Attribute already indexed"), which we
+        treat as success.
         """
         prop_list = ", ".join(f"'{p}'" for p in properties)
         cypher = f"CALL db.idx.fulltext.createNodeIndex('{label}', {prop_list})"
         try:
             self._graph.query(cypher)
         except Exception as exc:
-            if "already exists" in str(exc).lower():
+            if _is_index_already_exists_error(exc):
                 return
             raise
 
@@ -844,8 +906,9 @@ class FalkorDBBackend:
     ) -> None:
         """Create a vector index on ``label.property``.
 
-        Idempotent: existing indexes are reported by FalkorDB as an error,
-        which we treat as success.
+        Idempotent: existing indexes are reported by FalkorDB as an error
+        ("Index already exists" / "Attribute already indexed"), which we
+        treat as success.
         """
         cypher = (
             f"CREATE VECTOR INDEX FOR (n:{label}) ON (n.{property}) "
@@ -855,7 +918,7 @@ class FalkorDBBackend:
         try:
             self._graph.query(cypher)
         except Exception as exc:
-            if "already exists" in str(exc).lower():
+            if _is_index_already_exists_error(exc):
                 return
             raise
 

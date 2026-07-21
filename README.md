@@ -35,6 +35,47 @@ python scripts/ingest.py --search
 
 Visualization: FalkorDB's built-in web UI at `http://localhost:3000`.
 
+### LangChain agent harness
+
+A LangChain deep-agent harness (`falkordb_harness`) is bundled in this repo. It exposes the extraction pipeline and graph search as 16 tools driven by an agent you can interact with via the `falkordb-agent` CLI:
+
+```bash
+# Interactive agent session
+falkordb-agent
+
+# Single query
+falkordb-agent --single "How many nodes are in the graph?"
+
+# Use a specific agent model
+falkordb-agent --model openai/gpt-4o
+```
+
+Two separate LLM configurations apply:
+
+- **`LLM_MODEL`** — drives entity extraction and NL-to-Cypher (via litellm).
+- **`AGENT_LLM_MODEL`** — drives the LangChain agent's reasoning (default: `anthropic/claude-sonnet-4-20250514`). Supports `anthropic/...`, `openai/...`, and any litellm model via `langchain_community`'s `ChatLiteLLM`.
+
+| Tool | Description |
+|------|-------------|
+| `chunk_documents` | Preview document chunking without ingestion |
+| `extract_and_write` | Full pipeline: chunk, extract, write to FalkorDB |
+| `cypher_query` | Execute raw Cypher queries |
+| `nl_query` | Natural language to Cypher with summarized answer |
+| `fulltext_search` | RediSearch full-text search |
+| `vector_search` | Vector similarity search via embeddings |
+| `get_schema` | Inspect graph labels, relationships, properties |
+| `list_nodes` | List nodes with properties |
+| `list_edges` | List relationships |
+| `node_count` | Count total nodes |
+| `get_conflicts` | View merge conflicts |
+| `clear_conflicts` | Dismiss reviewed conflicts |
+| `get_reconciliations` | List `POSSIBLE_DUPLICATE_OF` links |
+| `clear_reconciliations` | Dismiss reviewed reconciliation links |
+| `reconcile_posthoc` | Post-hoc reconciliation pass over plain-name Resources |
+| `reset_graph` | Delete all graph data |
+
+See `.env.example` for all configuration options.
+
 ---
 
 ## Dataflow: documents to finished graph

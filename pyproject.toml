@@ -1,7 +1,7 @@
 [project]
 name = "fp-extract-falkordb"
 version = "0.1.0"
-description = "Factory-planning knowledge graph extraction pipeline using FalkorDB"
+description = "Factory-planning knowledge graph extraction pipeline using FalkorDB, with a LangChain deep-agent harness"
 requires-python = ">=3.10"
 dependencies = [
     "falkordb>=1.0.0",
@@ -13,13 +13,25 @@ dependencies = [
     "pyyaml>=6.0",
     "typing-extensions>=4.0.0",
     "loguru>=0.7.0",
+    # LangChain deep-agent harness
+    "langchain>=0.3.0",
+    "langchain-core>=0.3.0",
+    "langchain-anthropic>=0.3.0",
+    "langchain-litellm>=0.2.0",
+    "langgraph>=0.2.0",
+    "deepagents>=0.5.0",
 ]
 
 [project.optional-dependencies]
+openai = ["langchain-openai>=0.3.0"]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
+    "reportlab>=4.0.0",
 ]
+
+[project.scripts]
+falkordb-agent = "falkordb_harness.cli:main"
 
 [build-system]
 requires = ["setuptools"]
