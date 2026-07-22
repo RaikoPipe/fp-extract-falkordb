@@ -1,0 +1,6 @@
+[project]
+name = "FalkorDB Knowledge Graph Agent"
+enable_telemetry = false
+
+[features]
+multi_modal = true
