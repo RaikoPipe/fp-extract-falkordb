@@ -52,11 +52,14 @@ falkordb-agent --model openai/gpt-4o
 
 Two separate LLM configurations apply:
 
-- **`LLM_MODEL`** — drives entity extraction and NL-to-Cypher (via litellm).
-- **`AGENT_LLM_MODEL`** — drives the LangChain agent's reasoning (default: `anthropic/claude-sonnet-4-20250514`). Supports `anthropic/...`, `openai/...`, and any litellm model via `langchain_community`'s `ChatLiteLLM`.
+- **`LLM_MODEL`** — drives entity extraction and NL-to-Cypher (via the OpenAI-compatible endpoint). Bare Ollama tag (e.g. `glm-5.2:cloud`).
+- **`AGENT_LLM_MODEL`** — drives the LangChain agent's reasoning (default: `anthropic/claude-sonnet-4-20250514`). Supports `anthropic/...`, `openai/...`, and bare Ollama tags (e.g. `glm-5.2:cloud`) via Ollama's OpenAI-compatible endpoint.
 
 | Tool | Description |
 |------|-------------|
+| `file_metadata` | Inspect raw source file metadata (size, type, page count) |
+| `read_excerpt` | Read a bounded excerpt of a raw source file |
+| `preprocess_document` | Convert a raw source (scanned PDF/image/office) to Markdown via docprep, write to `PREPROCESSED_DIR` |
 | `chunk_documents` | Preview document chunking without ingestion |
 | `extract_and_write` | Full pipeline: chunk, extract, write to FalkorDB |
 | `cypher_query` | Execute raw Cypher queries |
@@ -117,7 +120,7 @@ The pipeline runs in seven stages. Each stage names the module and function that
 │                                                                         │
 │  Per chunk:                                                             │
 │    • build_extraction_prompt() injects the Pydantic JSON schema + text  │
-│    • litellm.acompletion(model=LLM_MODEL, temperature=0.0)              │
+│    • chat_client().chat.completions.create(model=LLM_MODEL, temperature=0.0)
 │    • strip markdown fences → model_validate_json → json_repair fallback │
 │    • retries up to 3× with exponential backoff                          │
 │    • provenance (source, chunk_index) ATTACHED to the result tuple      │
@@ -386,12 +389,14 @@ Every conflict (both in-graph and JSONL) is a JSON object with these fields:
 
 | CLI flag | Env var | Default | Description |
 |---|---|---|---|
-| `--data-dir` | `DATA_DIR` | `./data` | Source document directory |
+| `--data-dir` | `DATA_DIR` | `./data` | Source document root (originals + preprocessed live under it) |
+| — | `ORIGINALS_DIR` | `./data/originals` | Raw uploaded/source files (PDF/DOCX/images); Chainlit uploads land here, and `file_metadata`/`read_excerpt`/`ls` inspect this tree |
+| — | `PREPROCESSED_DIR` | `./data/preprocessed` | docprep Markdown output; `chunk_documents`/`extract_and_write` read here by default |
 | `--graph-name` | `FALKORDB_GRAPH` | `factory_planning` | FalkorDB graph name |
 | `--chunk-size` | — | `4000` | Chunk size in characters |
 | `--concurrency` | — | `4` | Max parallel LLM calls |
-| `--llm-model` | `LLM_MODEL` | `ollama/qwen3.5:122b-a10b` | litellm model string |
-| `--api-base` | `OLLAMA_BASE_URL` | — | LLM provider base URL |
+| `--llm-model` | `LLM_MODEL` | `qwen3.5:122b-a10b` | bare Ollama model tag |
+| `--api-base` | `OLLAMA_API_BASE` | — | LLM provider base URL |
 | `--merge-mode` | `MERGE_MODE` | `overwrite` | `overwrite` or `conflict` |
 | `--conflicts-log` | `CONFLICTS_LOG` | `./data/conflicts.jsonl` | JSONL conflict log path |
 | `--recon` / `--no-recon` | `RECON_ENABLE` | `false` | Enable similarity reconciliation for plain-name Resources |
@@ -404,6 +409,73 @@ Every conflict (both in-graph and JSONL) is a JSON object with these fields:
 | `--fulltext` | — | — | Fulltext search mode (requires `--search`) |
 | `--vector` | — | — | Vector search mode (requires `--search`) |
 | `--reset` | — | — | Delete all graph data (preserves JSONL logs) |
+
+---
+
+## Document preprocessing (docprep)
+
+The agent harness wraps the [`docprep`](src/document-to-markdown) submodule
+(git submodule) as a `preprocess_document` tool. It converts raw source
+documents — scanned PDFs, images, Excel charts, office formats — into
+Markdown via Docling + EasyOCR + an optional VLM fallback, writing the result
+into `PREPROCESSED_DIR` so the ingest tools pick it up.
+
+### Directory model
+
+```
+DATA_DIR/
+├── originals/      ← ORIGINALS_DIR: raw uploads/sources (PDF/DOCX/images)
+│                      Chainlit uploads land here; file_metadata/read_excerpt/ls inspect this tree.
+└── preprocessed/   ← PREPROCESSED_DIR: docprep Markdown output.
+                       chunk_documents / extract_and_write read here by default.
+```
+
+Keeping originals and preprocessed Markdown in separate directories prevents
+the ingest tools from double-counting a document by reading both the original
+and its Markdown twin.
+
+### Flow
+
+```
+ORIGINALS_DIR/scan.pdf
+        │  preprocess_document(path="scan.pdf")
+        │  docprep.convert() -> Docling + EasyOCR (+ VLM fallback if quality gate fails)
+        ▼
+PREPROCESSED_DIR/scan.md
+        │  chunk_documents() / extract_and_write()  (default data_dir = PREPROCESSED_DIR)
+        ▼
+FalkorDB graph
+```
+
+### When to preprocess
+
+- **Do** preprocess: scanned PDFs, image-only PDFs, images (PNG/JPEG/TIFF),
+  Excel files with charts, DOCX/PPTX with embedded figures.
+- **Don't** preprocess: plain `.txt` / `.md` / `.csv` / `.json` / `.html`
+  sources — they are already LLM-ready and preprocessing wastes a VLM call.
+  Copy them into `PREPROCESSED_DIR` directly (or point `extract_and_write`
+  at `ORIGINALS_DIR` for that run).
+
+### Configuration
+
+docprep reads config in this precedence order (highest first):
+1. `preprocess_document(yaml_path=...)` arg
+2. `./docprep.yaml` if present
+3. `DOCPREP_*` env vars: `DOCPREP_FALLBACK_PROVIDER`, `DOCPREP_FALLBACK_MODEL`,
+   `DOCPREP_FALLBACK_BASE_URL`
+4. `PipelineConfig` defaults
+
+The `[ollama]` extra (the only one the harness pulls in) reuses
+`OLLAMA_API_BASE` / `OLLAMA_API_KEY` for the VLM fallback endpoint. To use a
+different provider (Mistral/OpenAI/Gemini/Anthropic), install the matching
+`docprep[...]` extra and set its `_API_KEY` env var.
+
+> **System dependency:** `python-magic` requires `libmagic` — install
+> `libmagic1` (Debian/Ubuntu) or `libmagic` (macOS) if you see
+> `ImportError: failed to find libmagic`.
+
+See `docprep.example.yaml` for the full config schema and
+`src/document-to-markdown/README.md` for the pipeline routing details.
 
 ---
 

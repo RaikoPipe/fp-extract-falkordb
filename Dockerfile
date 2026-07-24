@@ -4,6 +4,7 @@ WORKDIR /app
 
 COPY pyproject.toml .
 COPY src/ src/
+COPY docprep.yaml .
 
 RUN pip install --no-cache-dir -e ".[chainlit]"
 

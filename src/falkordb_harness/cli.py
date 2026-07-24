@@ -11,12 +11,16 @@ from dotenv import load_dotenv
 async def _async_main(model: str | None, single_query: str | None) -> None:
     from langchain_core.messages import AIMessage, HumanMessage
 
-    from falkordb_harness.agent import build_agent
+    from falkordb_harness.agent import _DEFAULT_RECURSION_LIMIT, build_agent
 
     agent = build_agent({"configurable": {"model_name": model}})
+    run_config = {"recursion_limit": _DEFAULT_RECURSION_LIMIT}
 
     if single_query:
-        result = await agent.ainvoke({"messages": [HumanMessage(content=single_query)]})
+        result = await agent.ainvoke(
+            {"messages": [HumanMessage(content=single_query)]},
+            config=run_config,
+        )
         print(result["messages"][-1].content)
         return
 
@@ -35,7 +39,8 @@ async def _async_main(model: str | None, single_query: str | None) -> None:
             continue
 
         result = await agent.ainvoke(
-            {"messages": chat_history + [HumanMessage(content=user_input)]}
+            {"messages": chat_history + [HumanMessage(content=user_input)]},
+            config=run_config,
         )
         output = result["messages"][-1].content
         print(f"\nAgent> {output}")

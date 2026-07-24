@@ -7,16 +7,16 @@ import asyncio
 import json
 import os
 
-import litellm
 from loguru import logger
 
+from knowledge._clients import chat_client, embedding_client
 from knowledge.falkordb_backend import FalkorDBBackend
 
-_DEFAULT_LLM_MODEL = "ollama/qwen3.5:122b-a10b"
+_DEFAULT_LLM_MODEL = "qwen3.5:122b-a10b"
 
 # Embedding model + dimension. Falls back to the chat model when no
 # dedicated embedding model is configured.
-_DEFAULT_EMBEDDING_MODEL = "ollama/bge-m3"
+_DEFAULT_EMBEDDING_MODEL = "bge-m3"
 _DEFAULT_EMBEDDING_DIM = 1024
 
 _NL_TO_CYPHER_SYSTEM = """\
@@ -65,7 +65,6 @@ class GraphSearcher:
     ) -> None:
         self._backend = backend
         self._llm_model = llm_model or os.getenv("LLM_MODEL", _DEFAULT_LLM_MODEL)
-        self._api_base = api_base or os.getenv("OLLAMA_BASE_URL")
         self._mode = mode
         self._fulltext_label = fulltext_label or os.getenv(
             "FULLTEXT_LABEL", "Resource"
@@ -119,29 +118,27 @@ class GraphSearcher:
         schema_text = json.dumps(schema, indent=2)
 
         # Step 1: NL -> Cypher
-        cypher_kwargs: dict = {
-            "model": self._llm_model,
-            "messages": [
-                {"role": "system", "content": _NL_TO_CYPHER_SYSTEM},
-                {
-                    "role": "user",
-                    "content": (
-                        f"Graph schema:\n{schema_text}\n\n"
-                        f"Question: {question}"
-                    ),
-                },
-            ],
-            "temperature": 0.0,
-        }
-        if self._api_base:
-            cypher_kwargs["api_base"] = self._api_base
+        cypher_messages = [
+            {"role": "system", "content": _NL_TO_CYPHER_SYSTEM},
+            {
+                "role": "user",
+                "content": (
+                    f"Graph schema:\n{schema_text}\n\n"
+                    f"Question: {question}"
+                ),
+            },
+        ]
         logger.debug(
             "NL-to-Cypher request | model={} | messages={}",
             self._llm_model,
-            json.dumps(cypher_kwargs["messages"], indent=2, ensure_ascii=False),
+            json.dumps(cypher_messages, indent=2, ensure_ascii=False),
         )
-        cypher_response = await litellm.acompletion(**cypher_kwargs)
-        cypher = cypher_response.choices[0].message.content.strip()
+        cypher_response = await chat_client().chat.completions.create(
+            model=self._llm_model,
+            messages=cypher_messages,  # type: ignore[arg-type]
+            temperature=0.0,
+        )
+        cypher = (cypher_response.choices[0].message.content or "").strip()
         logger.debug("NL-to-Cypher response | raw={}", cypher)
 
         # Strip markdown fences if present
@@ -168,29 +165,27 @@ class GraphSearcher:
         )
 
         # Step 3: Summarize
-        summary_kwargs: dict = {
-            "model": self._llm_model,
-            "messages": [
-                {"role": "system", "content": _SUMMARIZE_SYSTEM},
-                {
-                    "role": "user",
-                    "content": (
-                        f"Question: {question}\n\n"
-                        f"Query results:\n{results_text}"
-                    ),
-                },
-            ],
-            "temperature": 0.0,
-        }
-        if self._api_base:
-            summary_kwargs["api_base"] = self._api_base
+        summary_messages = [
+            {"role": "system", "content": _SUMMARIZE_SYSTEM},
+            {
+                "role": "user",
+                "content": (
+                    f"Question: {question}\n\n"
+                    f"Query results:\n{results_text}"
+                ),
+            },
+        ]
         logger.debug(
             "Summarization request | model={} | messages={}",
             self._llm_model,
-            json.dumps(summary_kwargs["messages"], indent=2, ensure_ascii=False),
+            json.dumps(summary_messages, indent=2, ensure_ascii=False),
         )
-        summary_response = await litellm.acompletion(**summary_kwargs)
-        summary = summary_response.choices[0].message.content.strip()
+        summary_response = await chat_client().chat.completions.create(
+            model=self._llm_model,
+            messages=summary_messages,  # type: ignore[arg-type]
+            temperature=0.0,
+        )
+        summary = (summary_response.choices[0].message.content or "").strip()
         logger.debug("Summarization response | raw={}", summary)
         return summary
 
@@ -213,17 +208,17 @@ class GraphSearcher:
     # Vector mode
     # ------------------------------------------------------------------
     async def _embed(self, text: str) -> list[float]:
-        """Embed ``text`` via litellm and return a list of floats."""
-        kwargs: dict = {"model": self._embedding_model, "input": text}
-        if self._api_base:
-            kwargs["api_base"] = self._api_base
+        """Embed ``text`` via the embedding client and return a list of floats."""
         logger.debug(
             "Embedding request | model={} | input_length={}",
             self._embedding_model,
             len(text),
         )
-        response = await litellm.aembedding(**kwargs)
-        embedding = list(response.data[0]["embedding"])
+        response = await embedding_client().embeddings.create(
+            model=self._embedding_model,
+            input=text,
+        )
+        embedding = list(response.data[0].embedding)
         logger.debug("Embedding response | dim={}", len(embedding))
         return embedding
 

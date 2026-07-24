@@ -1,0 +1,29 @@
+# docprep configuration — Werma data, glm-ocr VLM fallback via Ollama
+
+pipeline:
+  vlm_preset: granite_docling
+  ocr_languages: [en, de]           # Werma docs contain German text
+  embed_images: false               # suppress base64; emit VLM text descriptions instead
+  render_chart_images: true
+  describe_images: true             # send images to VLM for two-stage processing
+  picture_judge_prompt: "Look at this image and classify it as one of: \"text_only\" (the image contains only text that can be OCR'd) or \"needs_interpretation\" (the image contains charts, diagrams, figures, photos, or other visual elements). Respond with only the label, nothing else."
+  picture_ocr_prompt: "Extract all text from this image. Preserve reading order, headings, and list structure. Output only the extracted text, no commentary."
+  picture_interpret_prompt: "Convert this image to Markdown. Preserve all text, tables, and reading order. Describe any charts or figures in detail. Output only the Markdown content, no commentary."
+  picture_description_timeout: 120
+  picture_description_concurrency: 3
+  picture_area_threshold: 0.01
+
+quality_gate:
+  min_text_density: 50
+  max_garbled_ratio: 0.20
+
+fallback:
+  enabled: true
+  provider: ollama
+  model: minimax-m3:cloud                    # VLM model served by your Ollama endpoint
+  base_url: https://ollama.com/v1   # <-- change to your remote Ollama host
+  max_pages: 50
+  timeout_seconds: 30
+
+# Set your real key before running:
+#   export OLLAMA_API_KEY=sk-...

@@ -5,7 +5,7 @@ description = "Factory-planning knowledge graph extraction pipeline using Falkor
 requires-python = ">=3.10"
 dependencies = [
     "falkordb>=1.0.0",
-    "litellm>=1.40.0",
+    "openai>=2.0.0",
     "pydantic>=2.0.0",
     "python-dotenv>=1.0.0",
     "unstructured[all-docs]",
@@ -17,15 +17,22 @@ dependencies = [
     "langchain>=0.3.0",
     "langchain-core>=0.3.0",
     "langchain-anthropic>=0.3.0",
-    "langchain-litellm>=0.2.0",
+    "langchain-openai>=1.4.0",
     "langgraph>=0.2.0",
     "deepagents>=0.5.0",
+    # Document preprocessing pipeline (git submodule). The [ollama] extra
+    # pulls the OpenAI client used for Ollama's OpenAI-compatible VLM fallback
+    # endpoint, reusing OLLAMA_API_BASE / OLLAMA_API_KEY already configured in
+    # .env. Other providers (mistral/openai/gemini/anthropic) are optional —
+    # install docprep[...] separately if you want them.
+    "docprep[ollama] @ file:src/document-to-markdown",
 ]
 
 [project.optional-dependencies]
-openai = ["langchain-openai>=0.3.0"]
 chainlit = [
     "chainlit>=1.1.0",
+    "anyio>=4.14.2",
+    "starlette>=0.45.0",
 ]
 dev = [
     "pytest>=7.0.0",
@@ -42,3 +49,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+# Scope collection to this repo's own tests. The docprep submodule ships its
+# own tests (with integration/api markers and extra deps); let it run via
+# `pytest` inside src/document-to-markdown instead of polluting this suite.
+testpaths = ["tests"]

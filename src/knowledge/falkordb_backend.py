@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -73,6 +74,11 @@ def _serialize_embedding(embedding: list[float]) -> str:
     return json.dumps([float(x) for x in embedding])
 
 
+def _utc_now_iso() -> str:
+    """Return the current UTC time as an ISO-8601 string (seconds precision)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _append_set(query: str, set_clause: str) -> str:
     """Append a SET clause to a Cypher MERGE query, handling the SET keyword."""
     if " SET " in query:
@@ -110,12 +116,21 @@ class FalkorDBBackend:
         embedding_api_base: str | None = None,
         embedding_api_key: str | None = None,
         embedding_dim: int | None = None,
+        allowed_graphs: list[str] | None = None,
     ) -> None:
         self._host = host or os.getenv("FALKORDB_HOST", _DEFAULT_HOST)
         self._port = port or int(os.getenv("FALKORDB_PORT", str(_DEFAULT_PORT)))
         self._graph_name = graph_name or os.getenv("FALKORDB_GRAPH", _DEFAULT_GRAPH)
-        self._db = FalkorDB(host=self._host, port=self._port)
-        self._graph = self._db.select_graph(self._graph_name)
+        # Allowlist of graph names this backend may switch to. ``None`` means
+        # unrestricted (the CLI / default path). Set by the Chainlit UI to
+        # enforce the user's checkbox selection; ``use_graph`` checks this
+        # before switching.
+        self._allowed_graphs: list[str] | None = list(allowed_graphs) if allowed_graphs else None
+        # Connection is established lazily on first use and recreated on a
+        # transient connection failure, so a startup outage or a mid-run blip
+        # does not poison the (cached) backend for the process lifetime.
+        self._db: FalkorDB | None = None
+        self._graph: Any = None
 
         # Merge mode: explicit arg > MERGE_MODE env > default (overwrite).
         if isinstance(merge_mode, MergeMode):
@@ -164,7 +179,7 @@ class FalkorDBBackend:
 
         self._llm_model = llm_model or os.getenv("LLM_MODEL")
         self._embedding_model = embedding_model or os.getenv("EMBEDDING_MODEL")
-        self._api_base = api_base or os.getenv("OLLAMA_BASE_URL")
+        self._api_base = api_base or os.getenv("OLLAMA_API_BASE")
         self._embedding_api_base = embedding_api_base or os.getenv(
             "EMBEDDING_API_BASE", _DEFAULT_EMBEDDING_API_BASE
         )
@@ -177,6 +192,83 @@ class FalkorDBBackend:
         else:
             # Defer: probe the embedding model on first use.
             self._embedding_dim = None
+
+    def _get_graph(self) -> Any:
+        """Return the live FalkorDB graph handle, (re)connecting as needed.
+
+        The connection is established lazily on first call and rebuilt when a
+        transient connection error has invalidated the previous handle
+        (``self._graph`` is set to ``None`` by the retry wrapper around
+        ``execute``/``_fetch_node_props``/etc. when a ``ConnectionError`` is
+        observed). This means a Redis/FalkorDB restart mid-run does not
+        permanently poison the (cached) backend instance.
+        """
+        if self._graph is None:
+            # Reuse an existing DB client when one is still live (e.g. after
+            # set_active_graph invalidated only the graph handle); only build
+            # a fresh FalkorDB connection when the client itself is absent or
+            # was dropped by _invalidate_connection.
+            if self._db is None:
+                logger.debug(
+                    "FalkorDB connecting to {}:{} graph='{}'",
+                    self._host, self._port, self._graph_name,
+                )
+                self._db = FalkorDB(host=self._host, port=self._port)
+            self._graph = self._db.select_graph(self._graph_name)
+        return self._graph
+
+    def _invalidate_connection(self) -> None:
+        """Drop the current handle so the next ``_get_graph`` reconnects.
+
+        Called by the retry wrapper when a connection-class error is observed
+        so the retry attempt builds a fresh handle instead of reusing the
+        dead one.
+        """
+        self._graph = None
+        self._db = None
+
+    def _get_db(self) -> FalkorDB:
+        """Return the live FalkorDB client, (re)connecting as needed.
+
+        Lazily establishes the connection (mirroring ``_get_graph``'s
+        lazy-connect logic) so ``list_graphs`` — a DB-level command that
+        does not target a specific graph — can run without first selecting
+        a graph handle. Reuses the same client instance ``_get_graph``
+        populates, so the two stay consistent.
+        """
+        if self._db is None:
+            logger.debug(
+                "FalkorDB connecting to {}:{} (for DB-level command)",
+                self._host, self._port,
+            )
+            self._db = FalkorDB(host=self._host, port=self._port)
+            # If a graph handle was previously cached it is now stale relative
+            # to the fresh client; drop it so ``_get_graph`` reselects.
+            self._graph = None
+        return self._db
+
+    def _query(self, query: str, params: dict[str, Any] | None = None) -> Any:
+        """Run a Cypher query, invalidating the handle on a transient error.
+
+        On a connection-class error the cached graph handle is dropped before
+        re-raising, so the caller's retry loop (see :mod:`knowledge.retry`)
+        builds a fresh connection on its next attempt instead of reusing the
+        dead one. Non-transient errors propagate without touching the handle.
+        """
+        try:
+            return self._get_graph().query(query, params or {})
+        except Exception as exc:
+            if _is_index_already_exists_error(exc):
+                # Idempotent no-op; do not invalidate or rewrap.
+                raise
+            from knowledge.retry import is_transient
+
+            if is_transient(exc):
+                logger.debug(
+                    "Transient query error — invalidating FalkorDB handle: {}", exc
+                )
+                self._invalidate_connection()
+            raise
 
     async def _resolve_embedding_dim(self) -> int:
         """Return the effective embedding dimension, probing the model if needed.
@@ -200,6 +292,90 @@ class FalkorDBBackend:
     @property
     def graph_name(self) -> str:
         return self._graph_name
+
+    @property
+    def allowed_graphs(self) -> list[str] | None:
+        """Return the graph-name allowlist, or ``None`` for unrestricted."""
+        return list(self._allowed_graphs) if self._allowed_graphs is not None else None
+
+    def list_graphs(self) -> list[str]:
+        """Return all graph names known to the FalkorDB instance.
+
+        Issues ``GRAPH.LIST`` against the DB-level client (not a specific
+        graph). The connection is established lazily via :meth:`_get_db`.
+        """
+        return list(self._get_db().list_graphs())
+
+    def set_active_graph(self, name: str) -> None:
+        """Switch the backend's bound graph to ``name``.
+
+        Validates ``name`` against :attr:`allowed_graphs` when one is set
+        (enforced — raises ``ValueError`` for an out-of-allowlist name),
+        then records the new name and invalidates the cached graph handle
+        so the next ``_get_graph`` reselects it. The underlying
+        :class:`FalkorDB` client connection is reused (no reconnect).
+        """
+        if not name or not isinstance(name, str):
+            raise ValueError(f"Graph name must be a non-empty string, got {name!r}")
+        if self._allowed_graphs is not None and name not in self._allowed_graphs:
+            raise ValueError(
+                f"Graph '{name}' is not in the allowed set "
+                f"({self._allowed_graphs}). The user has not enabled this "
+                f"knowledge graph for this session."
+            )
+        if name == self._graph_name and self._graph is not None:
+            return  # no-op: already bound and handle is live
+        self._graph_name = name
+        # Drop the cached handle so the next _get_graph reselects the new
+        # graph name on the existing client (self._db is retained).
+        self._graph = None
+        logger.debug("FalkorDB active graph switched to '{}'", name)
+
+    def create_graph(self, name: str) -> None:
+        """Create a new empty knowledge graph named ``name`` on the instance.
+
+        FalkorDB materializes a graph lazily on the first write against its
+        name, so this method selects ``name`` via the DB-level client (without
+        disturbing the cached active-graph handle) and runs a single
+        self-deleting seed-node transaction — enough to register the name in
+        ``GRAPH.LIST`` while leaving the graph truly empty (zero nodes, zero
+        relationships).
+
+        Validates ``name`` (non-empty string) and rejects duplicates (a name
+        already present in ``GRAPH.LIST``) to prevent accidental clobbering.
+        When an allowlist is configured, the new graph is appended to it so
+        subsequent ``use_graph`` calls can target it.
+
+        Does NOT switch the active graph — the caller is expected to follow
+        with ``set_active_graph(name)`` (or rely on the UI rebuild to bind a
+        fresh session backend to the new name).
+        """
+        if not name or not isinstance(name, str):
+            raise ValueError(f"Graph name must be a non-empty string, got {name!r}")
+
+        existing = self.list_graphs()
+        if name in existing:
+            raise ValueError(
+                f"Graph '{name}' already exists on the FalkorDB instance. "
+                f"Use set_active_graph('{name}') to switch to it instead."
+            )
+
+        # Select the new graph on the existing DB client and run a minimal
+        # write that materializes the graph in GRAPH.LIST. The seed node is
+        # created and deleted in one transaction so the graph stays empty.
+        db = self._get_db()
+        graph = db.select_graph(name)
+        graph.query(
+            "CREATE (n:_SchemaSeed {created_at: $created_at}) "
+            "DELETE n",
+            {"created_at": _utc_now_iso()},
+        )
+        logger.info("Created new empty FalkorDB graph '{}'", name)
+
+        # Expand the allowlist so use_graph can target the new graph when
+        # the backend is allowlist-restricted (Chainlit UI path).
+        if self._allowed_graphs is not None and name not in self._allowed_graphs:
+            self._allowed_graphs.append(name)
 
     @property
     def merge_mode(self) -> MergeMode:
@@ -240,7 +416,7 @@ class FalkorDBBackend:
     def execute(self, query: str, params: dict[str, Any] | None = None) -> Any:
         """Execute a Cypher query and return the result."""
         logger.debug("Cypher execute | {}", query)
-        return self._graph.query(query, params or {})
+        return self._query(query, params)
 
     async def write_extraction(
         self,
@@ -319,7 +495,7 @@ class FalkorDBBackend:
                     _append_set(write_q, "n.embedding = $p_embedding")
 
                 if write_q:
-                    self._graph.query(write_q, write_p)
+                    self._query(write_q, write_p)
                     statements_run += 1
                 if conflicts:
                     all_conflicts.extend(conflicts)
@@ -340,7 +516,7 @@ class FalkorDBBackend:
 
             # Pass 2: relationships.
             for query, params in rel_statements:
-                self._graph.query(query, params)
+                self._query(query, params)
                 statements_run += 1
         else:
             # Overwrite mode: coalesce descriptions + persist embeddings for
@@ -352,7 +528,7 @@ class FalkorDBBackend:
                 )
 
             for query, params in statements:
-                self._graph.query(query, params)
+                self._query(query, params)
             statements_run = len(statements)
 
             # Reconciliation pass for new plain-name resources in overwrite mode.
@@ -582,7 +758,7 @@ class FalkorDBBackend:
             source=source,
             chunk_index=chunk_index,
         )
-        self._graph.query(query, params)
+        self._query(query, params)
 
     async def reconcile_posthoc(self) -> list[dict[str, Any]]:
         """Post-hoc reconciliation pass over existing plain-name Resources.
@@ -623,7 +799,7 @@ class FalkorDBBackend:
         is unused for the lookup itself but kept for future schema-aware
         handling.
         """
-        result = self._graph.query(query, params)
+        result = self._query(query, params)
         rows = result.result_set if result.result_set else []
         if not rows:
             return {}
@@ -666,7 +842,7 @@ class FalkorDBBackend:
             f"r.llm_confidence AS llm_confidence, r.detected_at AS detected_at, "
             f"r.source AS source, r.chunk_index AS chunk_index"
         )
-        result = self._graph.query(cypher)
+        result = self._query(cypher)
         rows: list[dict[str, Any]] = []
         for row in result.result_set or []:
             (plain_name, indexed_name, labels, cosine, confidence,
@@ -703,7 +879,7 @@ class FalkorDBBackend:
             f"SET a.canonical_name = null, "
             f"b.aliases = [x IN coalesce(b.aliases, []) WHERE x <> a.name]"
         )
-        result = self._graph.query(cypher, params)
+        result = self._query(cypher, params)
         if hasattr(result, "statistics"):
             stats = result.statistics
             for key in ("relationships_deleted",):
@@ -724,7 +900,7 @@ class FalkorDBBackend:
             f"WHERE n.conflicts IS NOT NULL "
             f"RETURN n.name AS name, labels(n) AS labels, n.conflicts AS conflicts"
         )
-        result = self._graph.query(cypher)
+        result = self._query(cypher)
         rows: list[dict[str, Any]] = []
         for row in result.result_set or []:
             name, labels, raw = row
@@ -768,7 +944,7 @@ class FalkorDBBackend:
             f"WHERE n.conflicts IS NOT NULL{name_clause} "
             f"SET n.conflicts = null"
         )
-        result = self._graph.query(cypher, params)
+        result = self._query(cypher, params)
         # FalkorDB returns statistics on writes; fall back to 0 if absent.
         if hasattr(result, "statistics"):
             stats = result.statistics
@@ -783,16 +959,16 @@ class FalkorDBBackend:
         Note: this does NOT clear the on-disk conflicts JSONL log, which is
         an audit trail that survives graph resets.
         """
-        self._graph.query("MATCH (n) DETACH DELETE n")
+        self._query("MATCH (n) DETACH DELETE n")
 
     def node_count(self) -> int:
         """Return the total number of nodes in the graph."""
-        result = self._graph.query("MATCH (n) RETURN count(n) AS cnt")
+        result = self._query("MATCH (n) RETURN count(n) AS cnt")
         return result.result_set[0][0] if result.result_set else 0
 
     def get_all_nodes(self) -> list[dict[str, Any]]:
         """Return all nodes as dicts with labels and properties."""
-        result = self._graph.query("MATCH (n) RETURN n")
+        result = self._query("MATCH (n) RETURN n")
         nodes = []
         for row in result.result_set:
             node = row[0]
@@ -804,7 +980,7 @@ class FalkorDBBackend:
 
     def get_all_edges(self) -> list[tuple[str, str, str, dict[str, Any]]]:
         """Return all edges as (src_name, tgt_name, rel_type, properties)."""
-        result = self._graph.query(
+        result = self._query(
             "MATCH (a)-[r]->(b) RETURN a.name, b.name, type(r), properties(r)"
         )
         edges = []
@@ -820,17 +996,17 @@ class FalkorDBBackend:
 
     def get_schema_info(self) -> dict[str, Any]:
         """Return graph schema information for search context."""
-        labels_result = self._graph.query(
+        labels_result = self._query(
             "CALL db.labels() YIELD label RETURN collect(label)"
         )
         labels = labels_result.result_set[0][0] if labels_result.result_set else []
 
-        rel_result = self._graph.query(
+        rel_result = self._query(
             "CALL db.relationshipTypes() YIELD relationshipType RETURN collect(relationshipType)"
         )
         rel_types = rel_result.result_set[0][0] if rel_result.result_set else []
 
-        prop_result = self._graph.query(
+        prop_result = self._query(
             "CALL db.propertyKeys() YIELD propertyKey RETURN collect(propertyKey)"
         )
         prop_keys = prop_result.result_set[0][0] if prop_result.result_set else []
@@ -858,7 +1034,7 @@ class FalkorDBBackend:
         prop_list = ", ".join(f"'{p}'" for p in properties)
         cypher = f"CALL db.idx.fulltext.createNodeIndex('{label}', {prop_list})"
         try:
-            self._graph.query(cypher)
+            self._query(cypher)
         except Exception as exc:
             if _is_index_already_exists_error(exc):
                 return
@@ -881,7 +1057,7 @@ class FalkorDBBackend:
             "RETURN node, score "
             f"LIMIT {int(k)}"
         )
-        result = self._graph.query(
+        result = self._query(
             cypher, {"label": label, "query": query}
         )
         rows: list[dict[str, Any]] = []
@@ -916,7 +1092,7 @@ class FalkorDBBackend:
             f"similarityFunction:'{similarity_function}'}}"
         )
         try:
-            self._graph.query(cypher)
+            self._query(cypher)
         except Exception as exc:
             if _is_index_already_exists_error(exc):
                 return
@@ -941,7 +1117,7 @@ class FalkorDBBackend:
             f"vecf32({vec_str})) YIELD node, score "
             "RETURN node, score"
         )
-        result = self._graph.query(cypher)
+        result = self._query(cypher)
         rows: list[dict[str, Any]] = []
         for row in result.result_set or []:
             node, score = row[0], row[1]

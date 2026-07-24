@@ -8,13 +8,13 @@ import os
 import time
 from typing import Type
 
-import litellm
 from loguru import logger
 from pydantic import BaseModel
 
+from knowledge._clients import chat_client
 from knowledge.graph_models.factory_graph_model import FactoryPlanningGraph
 
-_DEFAULT_LLM_MODEL = "ollama/qwen3.5:122b-a10b"
+_DEFAULT_LLM_MODEL = "qwen3.5:122b-a10b"
 
 _SYSTEM_PROMPT = """\
 You are a manufacturing domain expert. Extract all factory-planning entities \
@@ -75,18 +75,13 @@ async def extract_from_chunk(
     """Extract entities from one chunk via LLM.
 
     Returns a validated Pydantic model instance, or None on failure.
+
+    ``api_base`` is accepted for backward-compatibility but ignored — the
+    chat client (:func:`knowledge._clients.chat_client`) carries the base
+    URL and API key derived from ``OLLAMA_API_BASE`` / ``OLLAMA_API_KEY``.
     """
     model = llm_model or os.getenv("LLM_MODEL", _DEFAULT_LLM_MODEL)
-    api_base = api_base or os.getenv("OLLAMA_BASE_URL")
     messages = build_extraction_prompt(chunk, schema_class)
-
-    kwargs: dict = {
-        "model": model,
-        "messages": messages,
-        "temperature": 0.0,
-    }
-    if api_base:
-        kwargs["api_base"] = api_base
 
     for attempt in range(max_retries):
         try:
@@ -96,7 +91,11 @@ async def extract_from_chunk(
                 json.dumps(messages, indent=2, ensure_ascii=False),
             )
             t0 = time.time()
-            response = await litellm.acompletion(**kwargs)
+            response = await chat_client().chat.completions.create(
+                model=model,
+                messages=messages,  # type: ignore[arg-type]
+                temperature=0.0,
+            )
             raw = response.choices[0].message.content
             logger.debug(
                 "LLM extraction response ({:.1f}s) | raw={}",

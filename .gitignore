@@ -11,3 +11,6 @@ venv/
 laundry_wash/
 *.html
 .pytest_cache/
+data/originals/
+data/preprocessed/
+data/uploads/

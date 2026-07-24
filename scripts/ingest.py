@@ -242,13 +242,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--llm-model",
         default=None,
         dest="llm_model",
-        help="LLM model string for litellm (default: from LLM_MODEL env).",
+        help="LLM model tag — bare Ollama tag (default: from LLM_MODEL env).",
     )
     parser.add_argument(
         "--api-base",
         default=None,
         dest="api_base",
-        help="API base URL for the LLM provider (default: from OLLAMA_BASE_URL env).",
+        help="API base URL for the LLM provider (default: from OLLAMA_API_BASE env).",
     )
     parser.add_argument(
         "--merge-mode",
