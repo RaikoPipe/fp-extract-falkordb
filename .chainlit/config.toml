@@ -96,11 +96,11 @@ reaction_on_message_received = false
 # Name of the assistant.
 name = "FalkorDB KG Agent"
 
-# default_theme = "dark"
+default_theme = "dark"
 
-# layout = "wide"
+layout = "wide"
 
-# default_sidebar_state = "open"
+default_sidebar_state = "open"
 
 # Chat settings display location: "message_composer" (default) or "sidebar" (header)
 # chat_settings_location = "message_composer"
