@@ -1,20 +1,27 @@
 # FalkorDB Knowledge Graph Agent
 
-This agent helps you build and query a factory-planning knowledge graph backed by FalkorDB.
+Build and query factory-planning knowledge graphs backed by FalkorDB.
 
-## Capabilities
+## Quick Start
+1. Select a graph in the **sidebar** (opens automatically).
+2. Upload files (PDF, DOCX, PPTX, images, text, CSV, JSON, HTML).
+3. Press **Ingest Documents** to run the extraction pipeline.
+4. Ask questions in natural language or use the starter prompts.
 
-- **Document ingestion** — Upload PDFs, DOCX, PPTX, images, or text files and ingest them into the knowledge graph with one button press.
-- **Natural language queries** — Ask questions about your data in plain English.
-- **Cypher queries** — Run raw Cypher against the graph for precise lookups.
-- **Schema inspection** — View labels, relationship types, and node counts.
+## Supported File Types
+PDF, DOCX, PPTX, XLSX, CSV, JSON, HTML, Markdown, plain text, images.
 
-## Ingestion Toolbar
+## Key Tools
+| Tool | What it does |
+|------|-------------|
+| `get_schema` | Show graph labels, relationships, properties |
+| `list_nodes` / `list_edges` | Browse graph contents |
+| `cypher_query` | Run raw Cypher |
+| `nl_query` | Natural-language question answering |
+| `fulltext_search` / `vector_search` | Find nodes by text or embedding |
+| `extract_and_write` | Ingest documents into the graph |
 
-The sidebar (gear icon) lets you select which knowledge graph the agent targets:
-
-- **Active knowledge graph** (dropdown) — the single graph all queries and ingestion target.
-- **Enabled knowledge graphs** (checkboxes) — the graphs the agent may switch to at runtime via `use_graph`.
-- **Create a new knowledge graph** (text field) — type a name and save to create an empty graph, which becomes the active graph.
-
-Upload files via the chat input (paperclip button), then press the **Ingest Documents** button to run the full pipeline — preprocess (if needed), chunk, LLM-extract entities, and write into the active graph — in a single press. Progress is streamed live as collapsible steps.
+## Tips
+- Upload files first, then press **Ingest Documents** for one-click ingestion.
+- Use `get_schema` to understand the graph before querying.
+- Switch graphs via the sidebar dropdown.

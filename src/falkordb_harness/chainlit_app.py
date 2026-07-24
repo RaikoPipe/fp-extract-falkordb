@@ -187,6 +187,42 @@ def _rebuild_agent_for_selection(
     cl.user_session.set("session_backend", _SESSION_BACKEND.get())
 
 
+@cl.set_starters
+async def set_starters() -> list[cl.Starter]:
+    return [
+        cl.Starter(
+            label="Show all machines",
+            message="List all Resource nodes that represent machines, with their processing times and capacities.",
+            icon="/public/logo.svg",
+        ),
+        cl.Starter(
+            label="Transport routes",
+            message="What transport routes and vehicles are defined in the knowledge graph?",
+            icon="/public/logo.svg",
+        ),
+        cl.Starter(
+            label="Shift models",
+            message="Show me the shift models and worker pools currently in the graph.",
+            icon="/public/logo.svg",
+        ),
+        cl.Starter(
+            label="Graph schema",
+            message="Show me the full schema of the current knowledge graph — labels, relationships, and properties.",
+            icon="/public/logo.svg",
+        ),
+        cl.Starter(
+            label="Search for a resource",
+            message="Search the knowledge graph for resources related to washing machines.",
+            icon="/public/logo.svg",
+        ),
+        cl.Starter(
+            label="How to ingest documents",
+            message="What document types can I upload, and how does the ingestion pipeline work?",
+            icon="/public/logo.svg",
+        ),
+    ]
+
+
 @cl.on_chat_start
 async def on_chat_start() -> None:
     graphs = _list_available_graphs()
@@ -206,17 +242,8 @@ async def on_chat_start() -> None:
     # files uploaded so far, targeting the graph selected in the sidebar.
     await cl.Message(
         content=(
-            "Welcome to the **FalkorDB Knowledge Graph Agent**.\n\n"
-            "I can help you:\n"
-            "- **Ingest** documents into a knowledge graph\n"
-            "- **Query** the graph with natural language or Cypher\n"
-            "- **Inspect** the schema, nodes, and edges\n\n"
-            "Select which knowledge graph(s) to use from the **sidebar** "
-            "(gear icon). The dropdown sets the active graph; the checkboxes "
-            "mark which graphs I may switch among at runtime.\n\n"
-            f"Active graph: `{active}` · enabled: `{', '.join(allowed)}`\n\n"
-            "Upload files below, then press **Ingest Documents** to run the "
-            "full extraction pipeline into the active graph in one press."
+            f"Ready on graph `{active}`. "
+            "Upload files and press **Ingest Documents**, or pick a starter below."
         ),
         actions=[
             Action(
@@ -544,6 +571,32 @@ async def on_message(message: cl.Message) -> None:
                     uploaded.append(dest)
                 cl.user_session.set("uploaded_files", uploaded)
 
+    if message.elements:
+        selection = cl.user_session.get("graph_selection") or {}
+        active_graph = selection.get("active_graph", _DEFAULT_GRAPH)
+        uploaded = cl.user_session.get("uploaded_files") or []
+        n_new = sum(1 for el in message.elements if hasattr(el, "path") and el.path)
+        if n_new:
+            await cl.Message(
+                content=(
+                    f"Received **{n_new}** file(s). "
+                    f"**{len(uploaded)}** total file(s) ready for ingestion "
+                    f"into graph `{active_graph}`."
+                ),
+                actions=[
+                    Action(
+                        name="ingest_documents",
+                        payload={},
+                        label="Ingest Documents Now",
+                        tooltip=(
+                            "Preprocess, chunk, LLM-extract, and write all "
+                            "uploaded files into the active knowledge graph."
+                        ),
+                        icon="upload",
+                    ),
+                ],
+            ).send()
+
     response_msg = cl.Message(content="")
     await response_msg.send()
 
@@ -593,16 +646,25 @@ async def on_message(message: cl.Message) -> None:
                     tool_name = event.get("name", "tool")
                     tool_input = event.get("data", {}).get("input", "")
                     step = cl.Step(name=tool_name, type="tool")
-                    step.input = str(tool_input)[:2000]
+                    try:
+                        from falkordb_harness.chainlit_formatting import format_tool_input
+                        step.input = format_tool_input(tool_name, tool_input)
+                    except Exception:
+                        step.input = str(tool_input)[:2000]
                     await step.send()
                     active_steps[run_id] = step
 
                 elif kind == "on_tool_end":
                     run_id = event.get("run_id", "")
+                    tool_name = event.get("name") or "tool"
                     step = active_steps.pop(run_id, None)
                     if step:
                         output = event.get("data", {}).get("output", "")
-                        step.output = str(output)[:2000]
+                        try:
+                            from falkordb_harness.chainlit_formatting import format_tool_output
+                            step.output = format_tool_output(tool_name, output)
+                        except Exception:
+                            step.output = str(output)[:2000]
                         await step.update()
     except GraphRecursionError:
         # The agent exhausted the recursion budget without reaching a stop
@@ -621,6 +683,24 @@ async def on_message(message: cl.Message) -> None:
                 "could you rephrase or tell me which file/part to focus on?"
             )
             await response_msg.stream_token(full_response)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Unexpected error in agent streaming: %s", exc, exc_info=True)
+        if full_response:
+            await response_msg.stream_token(
+                "\n\n---\n"
+                "*(Processing was interrupted by an error. "
+                "The partial response above may be incomplete.)*"
+            )
+        else:
+            full_response = (
+                "An unexpected error occurred while processing your request. "
+                "Please try again or rephrase your question."
+            )
+            await response_msg.stream_token(full_response)
+        for step in active_steps.values():
+            step.output = "(interrupted by error)"
+            await step.update()
+        active_steps.clear()
 
     await response_msg.update()
 
