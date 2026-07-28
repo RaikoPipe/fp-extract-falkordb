@@ -127,7 +127,7 @@ The pipeline runs in seven stages. Each stage names the module and function that
 │    resources, transport_vehicles, trailers, transport_segments,         │
 │    transport_routes, traffic_rules, products, production_programs,      │
 │    order_logic, shift_models, worker_pools, control_strategies,         │
-│    layout_elements, kpis, ambiguous_durations                           │
+│    layout_elements→zones, kpis, ambiguous_durations                     │
 └───────────────────────────┬─────────────────────────────────────────────┘
                             │
                              │  Stage 3 — backend construction + mode selection
@@ -303,6 +303,7 @@ The `FactoryPlanningGraph` schema (`src/knowledge/graph_models/factory_graph_mod
 |---|---|---|---|
 | Resource | `shift_model` | `HAS_SHIFT_MODEL` | ShiftModel |
 | Resource | `assigned_products` | `PROCESSES` | Product |
+| Resource | `zone` | `CONTAINED_IN` | Zone |
 | TransportSegment | `from_node` | `FROM` | Resource |
 | TransportSegment | `to_node` | `TO` | Resource |
 | TransportRoute | `stop_sequence` | `STOPS_AT` | Resource |
@@ -312,10 +313,12 @@ The `FactoryPlanningGraph` schema (`src/knowledge/graph_models/factory_graph_mod
 | Product | `bom_children` | `HAS_CHILD` | Product |
 | OrderLogic | `associated_product` | `FOR_PRODUCT` | Product |
 | OrderLogic | `associated_resource` | `TARGETS` | Resource |
-| ShiftModel | `applicable_zones` | `APPLIES_TO_ZONE` | LayoutElement |
+| ShiftModel | `applicable_zones` | `APPLIES_TO_ZONE` | Zone |
 | WorkerPool | `assigned_resources` | `OPERATES` | Resource |
 | ControlStrategy | `affected_resources` | `GOVERNS` | Resource |
 | ControlStrategy | `affected_products` | `AFFECTS` | Product |
+| Zone | `parent_zone` | `PART_OF` | Zone |
+| Zone | `member_resources` | `CONTAINS` | Resource |
 | KPI | `scope` | `SCOPED_TO` | Resource |
 
 Reference fields are **never** stored as scalar node properties and **never** produce property conflicts — they are only translated to relationship MERGEs.

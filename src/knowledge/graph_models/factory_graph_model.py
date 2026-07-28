@@ -60,7 +60,8 @@ class Resource(BaseModel):
         description=(
             "Type category. One of: machine, workstation, buffer, source, sink, "
             "conveyor, AS/RS, supermarket, warehouse, gate, charging_station, "
-            "pick_zone, assembly_line, inspection_station, or other."
+            "inspection_station, or other. NOTE: assembly_line and pick_zone are "
+            "NOT resources — model them as Zone entities instead."
         )
     )
     processing_time: Optional[str] = Field(None, description="Processing / cycle time. " + _DURATION_DESC)
@@ -290,16 +291,43 @@ class ControlStrategy(BaseModel):
     affected_products: List[str] = Field(default_factory=list, description="Product names affected.")
 
 
-class LayoutElement(BaseModel):
-    """A spatial or structural element of the factory layout."""
+class Zone(BaseModel):
+    """A spatial or logical area that groups resources: a functional area, hall,
+    segment, assembly line, or pick zone.
 
-    name: str = Field(description="Element name (e.g. 'Hall-A', 'Layout-DWG-Rev3').")
-    element_type: str = Field(description="layout_file, zone, area, building, floor, 3d_model_reference, or other.")
-    file_reference: Optional[str] = Field(None, description="File path or name of layout/CAD/3D file (DWG, DGN, JT, etc.).")
+    Zones are containers — they do NOT carry operational state themselves
+    (no processing time, capacity, MTBF, or storage policy). Those attributes
+    belong to the member Resources. A building-scale warehouse is a Zone; the
+    single storage unit inside it is a Resource of type 'warehouse' or
+    'supermarket'.
+    """
+
+    name: str = Field(description="Zone name (e.g. 'Hall-A', 'Assembly-Line-1', 'Pick-Zone-North').")
+    zone_type: str = Field(
+        description=(
+            "Type category. One of: hall, area, segment, assembly_line, "
+            "pick_zone, building, floor, or other."
+        )
+    )
+    description: Optional[str] = Field(
+        None,
+        description=(
+            "Semantically rich description of the zone: its function, layout, "
+            "the resources it contains, and its role in the production flow."
+        ),
+    )
+    parent_zone: Optional[str] = Field(
+        None,
+        description="Name of the enclosing zone (e.g. a hall containing an area). Supports nesting halls -> areas -> segments.",
+    )
     floor_area_m2: Optional[float] = Field(None, description="Floor area in square meters.")
     ceiling_height_m: Optional[float] = Field(None, description="Ceiling height in meters.")
     coordinate_system: Optional[str] = Field(None, description="Coordinate system or scale description.")
-    description: Optional[str] = Field(None, description="Additional spatial description.")
+    file_reference: Optional[str] = Field(None, description="File path or name of layout/CAD/3D file (DWG, DGN, JT, etc.) depicting this zone.")
+    member_resources: List[str] = Field(
+        default_factory=list,
+        description="Names of Resources located inside this zone.",
+    )
 
 
 class KPI(BaseModel):
@@ -343,6 +371,20 @@ class FactoryPlanningGraph(BaseModel):
         - If the source text is ambiguous, put the raw text in the field; it
           will be flagged and copied into ``ambiguous_durations`` for review.
 
+    Resource / Zone boundary:
+        A Resource is an atomic, addressable asset that performs an operation or
+        stores material — it has processing time, MTBF, capacity, access time,
+        or storage policy. A Zone is a spatial/logical container that groups
+        resources; it has no operational state of its own.
+        - Resource types: machine, workstation, buffer, source, sink, conveyor,
+          AS/RS, supermarket, warehouse, gate, charging_station,
+          inspection_station, other.
+        - Zone types: hall, area, segment, assembly_line, pick_zone, building,
+          floor, other.
+        assembly_line and pick_zone are Zones, NOT Resources. A building-scale
+        warehouse is a Zone; the single storage unit inside it is a Resource
+        of type 'warehouse' or 'supermarket'.
+
     Lengths in meters, weights in grams, speeds in m/s.
     Never extract personal names, contact information, or employee identifiers.
 
@@ -355,7 +397,7 @@ class FactoryPlanningGraph(BaseModel):
       names with no distinguishing index (e.g. 'Machine', 'Buffer').
     """
 
-    resources: List[Resource] = Field(default_factory=list, description="All physical resources: machines, buffers, stations, AS/RS, gates, etc.")
+    resources: List[Resource] = Field(default_factory=list, description="All physical resources: machines, buffers, stations, AS/RS, gates, supermarkets, warehouses, etc.")
     transport_vehicles: List[TransportVehicle] = Field(default_factory=list, description="AGVs, tugger trains, forklifts, AMRs.")
     trailers: List[Trailer] = Field(default_factory=list, description="Passive transport attachments.")
     transport_segments: List[TransportSegment] = Field(default_factory=list, description="Track/path segments with topology.")
@@ -367,7 +409,7 @@ class FactoryPlanningGraph(BaseModel):
     shift_models: List[ShiftModel] = Field(default_factory=list, description="Shift and break schedules.")
     worker_pools: List[WorkerPool] = Field(default_factory=list, description="Worker groups with skills and assignments.")
     control_strategies: List[ControlStrategy] = Field(default_factory=list, description="Dispatching, sequencing, charging, and other control rules.")
-    layout_elements: List[LayoutElement] = Field(default_factory=list, description="Spatial and structural layout data.")
+    zones: List[Zone] = Field(default_factory=list, description="Spatial/logical areas that group resources: halls, areas, segments, assembly lines, pick zones.")
     kpis: List[KPI] = Field(default_factory=list, description="Performance targets from requirements.")
     ambiguous_durations: List[AmbiguousDuration] = Field(default_factory=list, description="Duration fields whose value could not be parsed into the canonical schema; surfaced for human review.")
 

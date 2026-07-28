@@ -279,6 +279,13 @@ STRINGS: dict[str, dict[str, str]] = {
         "de": "Vorverarbeiten, chunken, LLM-extrahieren und alle hochgeladenen Dateien in den aktiven Wissensgraph schreiben.",
     },
 
+    # --- Tool-call container wrapper (chainlit_app.py on_message) ---------
+    "tools.container.label": {"en": "Tool calls", "de": "Tool-Aufrufe"},
+    "tools.container.count": {
+        "en": "Tool calls ({n})",
+        "de": "Tool-Aufrufe ({n})",
+    },
+
     # --- Recursion / error messages (chainlit_app.py on_message) ---------
     "error.recursion": {
         "en": "I got stuck re-checking the same things and ran out of steps before finishing. Here's what I have so far — could you rephrase or tell me which file/part to focus on?",

@@ -74,6 +74,21 @@ information.
 code that distinguishes this resource (e.g. 'AKL-01', 'Workstation-3A', \
 'AGV-02'). Set it to false when the name is a plain or generic word with no \
 distinguishing index (e.g. 'Machine', 'Buffer', 'Conveyor').
+
+Resource / Zone boundary:
+- A Resource is an ATOMIC, addressable asset that performs an operation or \
+stores material — it has processing time, MTBF, capacity, access time, or \
+storage policy. Resource types: machine, workstation, buffer, source, sink, \
+conveyor, AS/RS, supermarket, warehouse, gate, charging_station, \
+inspection_station, other.
+- A Zone is a SPATIAL/LOGICAL container that groups resources; it has NO \
+operational state of its own (no processing time, capacity, MTBF, or storage \
+policy). Zone types: hall, area, segment, assembly_line, pick_zone, building, \
+floor, other.
+- assembly_line and pick_zone are ZONES, NOT Resources. A building-scale \
+warehouse is a Zone; the single storage unit inside it is a Resource of type \
+'warehouse' or 'supermarket'. Link a Resource to its Zone via the 'zone' \
+field, and list member Resources on the Zone via 'member_resources'.
 """
 
 

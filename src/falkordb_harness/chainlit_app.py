@@ -982,6 +982,14 @@ async def on_message(message: cl.Message) -> None:
 
     active_steps: dict[str, cl.Step] = {}
     full_response = ""
+    # Parent "Tool calls" wrapper Step. Lazily created on the first
+    # on_tool_start and anchored to the assistant message (parent_id =
+    # response_msg.id) so every per-tool Step nests inside it instead of
+    # stacking as trailing siblings in the chat timeline — which used to
+    # push the viewport away from the assistant's text. Collapsed by
+    # default; auto-expands only when a tool errors.
+    tool_calls_step: cl.Step | None = None
+    tool_call_count = 0
     # Visual elements (Dataframe/Plotly/CustomElement) collected during the
     # stream and attached to the final assistant message so the chat stays
     # compact — each tool's detailed output already lives in its Step panel.
@@ -1034,7 +1042,38 @@ async def on_message(message: cl.Message) -> None:
                     tool_name = event.get("name", "tool")
                     tool_input = event.get("data", {}).get("input", "")
                     _icon, _lang, _open = _step_meta(tool_name)
+
+                    # Lazily create the collapsed "Tool calls" wrapper,
+                    # anchored to the assistant message, on the first tool
+                    # of the turn. Subsequent tools nest inside it.
+                    if tool_calls_step is None:
+                        tool_calls_step = cl.Step(
+                            name="tool_calls",
+                            type="tools",
+                            parent_id=response_msg.id,
+                            default_open=False,
+                        )
+                        try:
+                            tool_calls_step.auto_collapse = True
+                        except Exception as exc:  # noqa: BLE001 — older Chainlit
+                            logger.debug("step.auto_collapse unsupported: %s", exc)
+                        try:
+                            tool_calls_step.tags = [t("tools.container.label")]
+                        except Exception as exc:  # noqa: BLE001 — older Chainlit
+                            logger.debug("step.tags unsupported: %s", exc)
+                        await tool_calls_step.send()
+
+                    tool_call_count += 1
+                    try:
+                        tool_calls_step.name = t(
+                            "tools.container.count", n=tool_call_count
+                        )
+                        await tool_calls_step.update()
+                    except Exception as exc:  # noqa: BLE001 — never block a turn
+                        logger.debug("tool_calls_step update failed: %s", exc)
+
                     step = cl.Step(name=tool_name, type="tool")
+                    step.parent_id = tool_calls_step.id
                     if _icon:
                         try:
                             step.icon = _icon
@@ -1111,21 +1150,27 @@ async def on_message(message: cl.Message) -> None:
             step.output = t("error.interrupted.step")
             await step.update()
         active_steps.clear()
+        # Auto-expand the wrapper so the failed tool's panel is visible
+        # without manual expansion (it's collapsed by default otherwise).
+        if tool_calls_step is not None:
+            try:
+                tool_calls_step.default_open = True
+                await tool_calls_step.update()
+            except Exception as exc:  # noqa: BLE001 — never block cleanup
+                logger.debug("tool_calls_step expand failed: %s", exc)
 
     await response_msg.update()
 
     # Attach any visual elements (Dataframe/Plotly) collected during the
-    # stream to the final assistant message. Sending them as a separate
-    # element-only message keeps the streamed text intact and the
-    # conversation compact.
+    # stream to the assistant message itself so they render with the
+    # streamed text rather than as a separate trailing element-only
+    # message (which used to push the viewport further from the text).
     if pending_elements:
         try:
-            await cl.Message(
-                content="",
-                elements=pending_elements,
-            ).send()
+            response_msg.elements = pending_elements
+            await response_msg.update()
         except Exception as exc:  # noqa: BLE001 — never break on element send
-            logger.debug("element send failed: %s", exc)
+            logger.debug("element attach failed: %s", exc)
 
     # If the agent fetched the schema, pin it to the ElementSidebar so it
     # stays visible while the user queries. Refresh on every get_schema so

@@ -177,6 +177,18 @@ def test_error_recursion_message_both_langs():
     assert "stuck" in t("error.recursion")
 
 
+def test_tools_container_label_both_langs():
+    assert t("tools.container.label") == "Tool-Aufrufe"
+    set_lang("en")
+    assert t("tools.container.label") == "Tool calls"
+
+
+def test_tools_container_count_formats_n_both_langs():
+    assert t("tools.container.count", n=3) == "Tool-Aufrufe (3)"
+    set_lang("en")
+    assert t("tools.container.count", n=3) == "Tool calls (3)"
+
+
 def test_settings_create_success_formats_allowed_list():
     msg = t(
         "settings.create.success",

@@ -14,7 +14,6 @@ from knowledge.graph_models.factory_graph_model import (
     ControlStrategy,
     FactoryPlanningGraph,
     KPI,
-    LayoutElement,
     OrderLogic,
     Product,
     ProductionProgram,
@@ -26,6 +25,7 @@ from knowledge.graph_models.factory_graph_model import (
     TransportSegment,
     TransportVehicle,
     WorkerPool,
+    Zone,
 )
 
 # Fields on each entity type that reference names of other entity types.
@@ -33,6 +33,7 @@ from knowledge.graph_models.factory_graph_model import (
 _REFERENCE_FIELDS: dict[tuple[str, str], tuple[str, str]] = {
     ("Resource", "shift_model"): ("HAS_SHIFT_MODEL", "ShiftModel"),
     ("Resource", "assigned_products"): ("PROCESSES", "Product"),
+    ("Resource", "zone"): ("CONTAINED_IN", "Zone"),
     ("TransportSegment", "from_node"): ("FROM", "Resource"),
     ("TransportSegment", "to_node"): ("TO", "Resource"),
     ("TransportRoute", "stop_sequence"): ("STOPS_AT", "Resource"),
@@ -42,10 +43,12 @@ _REFERENCE_FIELDS: dict[tuple[str, str], tuple[str, str]] = {
     ("Product", "bom_children"): ("HAS_CHILD", "Product"),
     ("OrderLogic", "associated_product"): ("FOR_PRODUCT", "Product"),
     ("OrderLogic", "associated_resource"): ("TARGETS", "Resource"),
-    ("ShiftModel", "applicable_zones"): ("APPLIES_TO_ZONE", "LayoutElement"),
+    ("ShiftModel", "applicable_zones"): ("APPLIES_TO_ZONE", "Zone"),
     ("WorkerPool", "assigned_resources"): ("OPERATES", "Resource"),
     ("ControlStrategy", "affected_resources"): ("GOVERNS", "Resource"),
     ("ControlStrategy", "affected_products"): ("AFFECTS", "Product"),
+    ("Zone", "parent_zone"): ("PART_OF", "Zone"),
+    ("Zone", "member_resources"): ("CONTAINS", "Resource"),
     ("KPI", "scope"): ("SCOPED_TO", "Resource"),
 }
 
@@ -63,7 +66,7 @@ _ENTITY_LISTS: list[tuple[str, type[BaseModel], str]] = [
     ("shift_models", ShiftModel, "ShiftModel"),
     ("worker_pools", WorkerPool, "WorkerPool"),
     ("control_strategies", ControlStrategy, "ControlStrategy"),
-    ("layout_elements", LayoutElement, "LayoutElement"),
+    ("zones", Zone, "Zone"),
     ("kpis", KPI, "KPI"),
     ("ambiguous_durations", AmbiguousDuration, "AmbiguousDuration"),
 ]
