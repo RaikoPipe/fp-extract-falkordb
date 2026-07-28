@@ -4,14 +4,33 @@ Domain: Factory planning & material flow simulation.
 
 Notes:
     - Field descriptions guide the LLM extractor — be precise.
-    - All time values in seconds, lengths in meters, weights in grams, speeds in m/s.
+    - All time-valued fields are STRINGS following the duration schema:
+      constant ``d=40s`` or distribution ``normal(mean=300, std=45)``.
+      All values are seconds. See ``graph_models.duration`` for the grammar.
+    - Lengths in meters, weights in grams, speeds in m/s.
 """
 
 from __future__ import annotations
 
 from typing import List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from knowledge.graph_models.duration import (
+    AmbiguousRecord,
+    get_ambiguous_records,
+    reset_ambiguous_sink,
+    validate_duration,
+)
+
+
+_DURATION_DESC = (
+    "Duration as a string. Constant: 'd=40s'. "
+    "Distribution: 'normal(mean=300, std=45)' or 'uniform(min=10, max=20)'. "
+    "All values are seconds. Only use 'mean'/'std' (not mu/sigma), "
+    "'min'/'max', 'lambda', 'k'. If the source text is ambiguous, put the "
+    "raw text here — it will be flagged for review."
+)
 
 
 class Resource(BaseModel):
@@ -44,14 +63,14 @@ class Resource(BaseModel):
             "pick_zone, assembly_line, inspection_station, or other."
         )
     )
-    processing_time_s: Optional[float] = Field(None, description="Processing / cycle time in seconds.")
-    setup_time_s: Optional[float] = Field(None, description="Setup / changeover time in seconds.")
+    processing_time: Optional[str] = Field(None, description="Processing / cycle time. " + _DURATION_DESC)
+    setup_time: Optional[str] = Field(None, description="Setup / changeover time. " + _DURATION_DESC)
     capacity: Optional[int] = Field(None, description="Storage or processing capacity in units.")
     availability_pct: Optional[float] = Field(None, description="Technical availability in percent (0-100).")
-    mtbf_s: Optional[float] = Field(None, description="Mean Time Between Failures in seconds.")
-    mttr_s: Optional[float] = Field(None, description="Mean Time To Repair in seconds.")
-    maintenance_duration_s: Optional[float] = Field(None, description="Planned maintenance duration in seconds.")
-    maintenance_interval_s: Optional[float] = Field(None, description="Planned maintenance interval in seconds.")
+    mtbf: Optional[str] = Field(None, description="Mean Time Between Failures. " + _DURATION_DESC)
+    mttr: Optional[str] = Field(None, description="Mean Time To Repair. " + _DURATION_DESC)
+    maintenance_duration: Optional[str] = Field(None, description="Planned maintenance duration. " + _DURATION_DESC)
+    maintenance_interval: Optional[str] = Field(None, description="Planned maintenance interval. " + _DURATION_DESC)
     scrap_rate_pct: Optional[float] = Field(None, description="Scrap rate in percent.")
     rework_rate_pct: Optional[float] = Field(None, description="Rework rate in percent.")
     workers_required: Optional[int] = Field(None, description="Number of workers needed to operate this resource.")
@@ -63,16 +82,30 @@ class Resource(BaseModel):
     position_y_m: Optional[float] = Field(None, description="Y coordinate in layout in meters.")
     zone: Optional[str] = Field(None, description="Named area or zone this resource belongs to.")
     storage_policy: Optional[str] = Field(None, description="Buffer policy: FIFO, LIFO, priority, or other.")
-    access_time_s: Optional[float] = Field(None, description="Time to access/retrieve an item in seconds (AS/RS, supermarket).")
-    loading_time_s: Optional[float] = Field(None, description="Loading time in seconds.")
-    unloading_time_s: Optional[float] = Field(None, description="Unloading time in seconds.")
-    opening_time_s: Optional[float] = Field(None, description="Gate/airlock opening time in seconds.")
-    closing_time_s: Optional[float] = Field(None, description="Gate/airlock closing time in seconds.")
-    cycle_time_s: Optional[float] = Field(None, description="Full passage or cycle time in seconds.")
+    access_time: Optional[str] = Field(None, description="Time to access/retrieve an item (AS/RS, supermarket). " + _DURATION_DESC)
+    loading_time: Optional[str] = Field(None, description="Loading time. " + _DURATION_DESC)
+    unloading_time: Optional[str] = Field(None, description="Unloading time. " + _DURATION_DESC)
+    opening_time: Optional[str] = Field(None, description="Gate/airlock opening time. " + _DURATION_DESC)
+    closing_time: Optional[str] = Field(None, description="Gate/airlock closing time. " + _DURATION_DESC)
+    cycle_time: Optional[str] = Field(None, description="Full passage or cycle time. " + _DURATION_DESC)
     reorder_point: Optional[int] = Field(None, description="Inventory level triggering replenishment.")
     assigned_products: List[str] = Field(default_factory=list, description="Product names or variant IDs assigned to this resource.")
     shift_model: Optional[str] = Field(None, description="Name of the shift model governing this resource.")
     additional_attributes: Optional[str] = Field(None, description="Any other stated attributes not covered above, as key:value pairs.")
+
+    @field_validator(
+        "processing_time", "setup_time", "mtbf", "mttr",
+        "maintenance_duration", "maintenance_interval",
+        "access_time", "loading_time", "unloading_time",
+        "opening_time", "closing_time", "cycle_time",
+        mode="before",
+    )
+    @classmethod
+    def _validate_durations(cls, v, info):
+        if v is None or v == "":
+            return None
+        name = info.data.get("name", "?")
+        return validate_duration(v, "Resource", name, info.field_name)
 
 
 class TransportVehicle(BaseModel):
@@ -88,15 +121,27 @@ class TransportVehicle(BaseModel):
     width_m: Optional[float] = Field(None, description="Vehicle width in meters.")
     battery_capacity_kwh: Optional[float] = Field(None, description="Battery capacity in kWh.")
     charge_current_a: Optional[float] = Field(None, description="Charging current in Ampere.")
-    charge_duration_s: Optional[float] = Field(None, description="Full charge duration in seconds.")
+    charge_duration: Optional[str] = Field(None, description="Full charge duration. " + _DURATION_DESC)
     standby_consumption_a: Optional[float] = Field(None, description="Standby power consumption in Ampere.")
     driving_consumption_a: Optional[float] = Field(None, description="Driving power consumption in Ampere.")
-    battery_swap_time_s: Optional[float] = Field(None, description="Battery swap time in seconds.")
+    battery_swap_time: Optional[str] = Field(None, description="Battery swap time. " + _DURATION_DESC)
     availability_pct: Optional[float] = Field(None, description="Technical availability in percent.")
-    mttr_s: Optional[float] = Field(None, description="Mean Time To Repair in seconds.")
-    maintenance_duration_s: Optional[float] = Field(None, description="Planned maintenance duration in seconds.")
-    maintenance_interval_s: Optional[float] = Field(None, description="Planned maintenance interval in seconds.")
+    mttr: Optional[str] = Field(None, description="Mean Time To Repair. " + _DURATION_DESC)
+    maintenance_duration: Optional[str] = Field(None, description="Planned maintenance duration. " + _DURATION_DESC)
+    maintenance_interval: Optional[str] = Field(None, description="Planned maintenance interval. " + _DURATION_DESC)
     transport_category: Optional[str] = Field(None, description="Product types this vehicle may carry.")
+
+    @field_validator(
+        "charge_duration", "battery_swap_time", "mttr",
+        "maintenance_duration", "maintenance_interval",
+        mode="before",
+    )
+    @classmethod
+    def _validate_durations(cls, v, info):
+        if v is None or v == "":
+            return None
+        name = info.data.get("name", "?")
+        return validate_duration(v, "TransportVehicle", name, info.field_name)
 
 
 class Trailer(BaseModel):
@@ -179,11 +224,26 @@ class OrderLogic(BaseModel):
     order_category: str = Field(description="production_order, transport_order, replenishment, or inbound_delivery.")
     trigger_description: Optional[str] = Field(None, description="What event or condition triggers this order.")
     priority: Optional[str] = Field(None, description="Priority level or rule.")
-    distribution: Optional[str] = Field(None, description="Statistical distribution of order arrival (e.g. 'exponential(120)').")
-    interval_s: Optional[float] = Field(None, description="Order interval in seconds.")
+    interval: Optional[str] = Field(
+        None,
+        description=(
+            "Order interval or arrival distribution. Constant: 'd=120s'. "
+            "Distribution: 'exponential(lambda=0.5)' or 'normal(mean=120, std=15)'. "
+            "All values are seconds. If the source is ambiguous, put the raw text here — "
+            "it will be flagged for review."
+        ),
+    )
     quantity: Optional[str] = Field(None, description="Order quantity or quantity rule.")
     associated_product: Optional[str] = Field(None, description="Product name this order relates to.")
     associated_resource: Optional[str] = Field(None, description="Resource name this order targets.")
+
+    @field_validator("interval", mode="before")
+    @classmethod
+    def _validate_interval(cls, v, info):
+        if v is None or v == "":
+            return None
+        name = info.data.get("name", "?")
+        return validate_duration(v, "OrderLogic", name, info.field_name)
 
 
 class ShiftModel(BaseModel):
@@ -191,10 +251,18 @@ class ShiftModel(BaseModel):
 
     name: str = Field(description="Shift model name (e.g. '3-shift-production').")
     num_shifts: Optional[int] = Field(None, description="Number of shifts per day.")
-    shift_duration_s: Optional[float] = Field(None, description="Duration of one shift in seconds.")
+    shift_duration: Optional[str] = Field(None, description="Duration of one shift. " + _DURATION_DESC)
     break_times: Optional[str] = Field(None, description="Break schedule description (timing and duration).")
     applicable_zones: List[str] = Field(default_factory=list, description="Zones or resources this model applies to.")
     holidays: Optional[str] = Field(None, description="Company holiday or shutdown periods.")
+
+    @field_validator("shift_duration", mode="before")
+    @classmethod
+    def _validate_shift_duration(cls, v, info):
+        if v is None or v == "":
+            return None
+        name = info.data.get("name", "?")
+        return validate_duration(v, "ShiftModel", name, info.field_name)
 
 
 class WorkerPool(BaseModel):
@@ -246,18 +314,18 @@ class KPI(BaseModel):
     description: Optional[str] = Field(None, description="Additional context about the target.")
 
 
-class StochasticParameter(BaseModel):
-    """A parameter defined by a probability distribution rather than a fixed value."""
+class AmbiguousDuration(BaseModel):
+    """A duration field whose value could not be parsed into the canonical schema.
 
-    name: str = Field(description="What this distribution describes (e.g. 'MTBF-Machine-3', 'Delivery-Delay').")
-    distribution_type: str = Field(
-        description="Distribution name: normal, exponential, uniform, triangular, weibull, lognormal, erlang, empirical, or other."
-    )
-    parameters: str = Field(
-        description="Distribution parameters as key-value string (e.g. 'mean=300,std=45' or 'min=10,max=20')."
-    )
-    unit: Optional[str] = Field(None, description="Unit of the distributed value (e.g. 'seconds', 'meters').")
-    associated_entity: Optional[str] = Field(None, description="Name of the resource or process this distribution belongs to.")
+    Surfaced for human review. The raw text is preserved verbatim.
+    """
+
+    name: str = Field(description="Composite key: '<entity_type>:<entity_name>:<field_name>'.")
+    entity_name: str = Field(description="Name of the entity holding the ambiguous field.")
+    entity_type: str = Field(description="Entity class label (e.g. 'Resource', 'OrderLogic').")
+    field_name: str = Field(description="Name of the duration field on the entity.")
+    raw_value: str = Field(description="The unparseable raw string from the extraction.")
+    note: Optional[str] = Field(None, description="Optional context about why it was flagged.")
 
 
 class FactoryPlanningGraph(BaseModel):
@@ -265,7 +333,17 @@ class FactoryPlanningGraph(BaseModel):
 
     Extract all entities found in the text into the appropriate typed lists.
     Use consistent, exact entity names across extractions to enable deduplication.
-    All time values in seconds, lengths in meters, weights in grams, speeds in m/s.
+
+    Duration policy:
+        Every time-valued field is a STRING following a fixed grammar:
+        - Constant: ``d=40s``
+        - Distribution: ``normal(mean=300, std=45)`` / ``uniform(min=10, max=20)``
+          / ``exponential(lambda=0.5)`` / ``weibull(k=1.5, lambda=200)``
+        - All values are SECONDS. Use ``mean``/``std`` (not mu/sigma).
+        - If the source text is ambiguous, put the raw text in the field; it
+          will be flagged and copied into ``ambiguous_durations`` for review.
+
+    Lengths in meters, weights in grams, speeds in m/s.
     Never extract personal names, contact information, or employee identifiers.
 
     Resource-specific rules:
@@ -291,4 +369,36 @@ class FactoryPlanningGraph(BaseModel):
     control_strategies: List[ControlStrategy] = Field(default_factory=list, description="Dispatching, sequencing, charging, and other control rules.")
     layout_elements: List[LayoutElement] = Field(default_factory=list, description="Spatial and structural layout data.")
     kpis: List[KPI] = Field(default_factory=list, description="Performance targets from requirements.")
-    stochastic_parameters: List[StochasticParameter] = Field(default_factory=list, description="Parameters defined by probability distributions.")
+    ambiguous_durations: List[AmbiguousDuration] = Field(default_factory=list, description="Duration fields whose value could not be parsed into the canonical schema; surfaced for human review.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reset_ambiguous_sink(cls, data):
+        """Install a fresh sink before child validators run."""
+        reset_ambiguous_sink()
+        return data
+
+    @model_validator(mode="after")
+    def _harvest_ambiguous(self):
+        """Copy any ambiguous-duration records collected by child field
+        validators into the top-level ``ambiguous_durations`` list."""
+        records: list[AmbiguousRecord] = get_ambiguous_records()
+        if records:
+            existing = {(r.entity_type, r.entity_name, r.field_name, r.raw_value) for r in (
+                self.ambiguous_durations or []
+            )}
+            for r in records:
+                key = (r.entity_type, r.entity_name, r.field_name, r.raw_value)
+                if key in existing:
+                    continue
+                self.ambiguous_durations.append(
+                    AmbiguousDuration(
+                        name=f"{r.entity_type}:{r.entity_name}:{r.field_name}",
+                        entity_name=r.entity_name,
+                        entity_type=r.entity_type,
+                        field_name=r.field_name,
+                        raw_value=r.raw_value,
+                    )
+                )
+                existing.add(key)
+        return self

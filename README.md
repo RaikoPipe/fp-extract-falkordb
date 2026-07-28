@@ -62,7 +62,7 @@ Two separate LLM configurations apply:
 | `preprocess_document` | Convert a raw source (scanned PDF/image/office) to Markdown via docprep, write to `PREPROCESSED_DIR` |
 | `chunk_documents` | Preview document chunking without ingestion |
 | `extract_and_write` | Full pipeline: chunk, extract, write to FalkorDB |
-| `cypher_query` | Execute raw Cypher queries |
+| `cypher_query` | Execute raw Cypher queries; also used to list and resolve merge conflicts (see below) |
 | `nl_query` | Natural language to Cypher with summarized answer |
 | `fulltext_search` | RediSearch full-text search |
 | `vector_search` | Vector similarity search via embeddings |
@@ -70,8 +70,6 @@ Two separate LLM configurations apply:
 | `list_nodes` | List nodes with properties |
 | `list_edges` | List relationships |
 | `node_count` | Count total nodes |
-| `get_conflicts` | View merge conflicts |
-| `clear_conflicts` | Dismiss reviewed conflicts |
 | `get_reconciliations` | List `POSSIBLE_DUPLICATE_OF` links |
 | `clear_reconciliations` | Dismiss reviewed reconciliation links |
 | `reconcile_posthoc` | Post-hoc reconciliation pass over plain-name Resources |
@@ -129,21 +127,18 @@ The pipeline runs in seven stages. Each stage names the module and function that
 │    resources, transport_vehicles, trailers, transport_segments,         │
 │    transport_routes, traffic_rules, products, production_programs,      │
 │    order_logic, shift_models, worker_pools, control_strategies,         │
-│    layout_elements, kpis, stochastic_parameters                         │
+│    layout_elements, kpis, ambiguous_durations                           │
 └───────────────────────────┬─────────────────────────────────────────────┘
                             │
-                            │  Stage 3 — backend construction + mode selection
-                            │  FalkorDBBackend(merge_mode=..., conflicts_log_path=...)
-                            │  scripts/ingest.py:137-141
-                            ▼
+                             │  Stage 3 — backend construction + mode selection
+                             │  FalkorDBBackend(merge_mode=...)
+                             │  scripts/ingest.py:137-141
+                             ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  FalkorDBBackend                                                        │
 │                                                                         │
 │  merge_mode resolution:                                                 │
 │    explicit MergeMode arg  >  string arg  >  MERGE_MODE env  >  OVERWRITE│
-│                                                                         │
-│  conflicts_log_path resolution:                                         │
-│    explicit arg  >  CONFLICTS_LOG env  >  ./data/conflicts.jsonl        │
 │                                                                         │
 │  MergeMode (cypher_mapper.py):                                          │
 │    OVERWRITE = "overwrite"   last-write-wins (original behavior)        │
@@ -200,18 +195,21 @@ The pipeline runs in seven stages. Each stage names the module and function that
 │                          │  │  │   │ existing == incoming?         │ │ │
 │                          │  │  │   │   → no-op        (AGREE)      │ │ │
 │                          │  │  │   │ existing != incoming & non-null?│ │
-│                          │  │  │   │   → CONFLICT: keep existing,  │ │ │
-│                          │  │  │   │     append record to conflicts│ │ │
+│                          │  │  │   │   → CONFLICT: keep existing,  │ │
+│                          │  │  │   │     append record to conflicts│ │
 │                          │  │  │   └───────────────────────────────┘ │ │
 │                          │  │  │                                     │ │
-│                          │  │  │  Conflict record shape:             │ │
+│                          │  │  │  Conflict record shape (JSON string │ │
+│                          │  │  │  stored in n.conflicts list):       │ │
 │                          │  │  │  {                                   │ │
-│                          │  │  │    "property":        "capacity",   │ │
-│                          │  │  │    "existing_value":   500,         │ │
-│                          │  │  │    "incoming_value":   600,         │ │
-│                          │  │  │    "source":           "DOC3....md",│ │
-│                          │  │  │    "chunk_index":      2,           │ │
-│                          │  │  │    "detected_at":      ISO-8601 UTC │ │
+│                          │  │  │    "id":              "capacity:<iso>", │ │
+│                          │  │  │    "property":         "capacity",  │ │
+│                          │  │  │    "existing_value":    500,       │ │
+│                          │  │  │    "incoming_value":    600,       │ │
+│                          │  │  │    "source":            "DOC3.md", │ │
+│                          │  │  │    "chunk_index":       2,         │ │
+│                          │  │  │    "detected_at":       ISO-8601,  │ │
+│                          │  │  │    "resolved":          false      │ │
 │                          │  │  │  }                                   │ │
 │                          │  │  │                                     │ │
 │                          │  │  │  Generated Cypher (conflict case):  │ │
@@ -226,7 +224,7 @@ The pipeline runs in seven stages. Each stage names the module and function that
 │                          │  │  │                                     │ │
 │                          │  │  │ 4c. EXECUTE write                   │ │
 │                          │  │  │   self._graph.query(write_q, ...)   │ │
-│                          │  │  │   collect conflicts into all_conflicts│
+│                          │  │  │   collect conflicts into all_conflicts│ │
 │                          │  │  └─────────────────────────────────────┘ │
 │                          │  │                                          │
 │                          │  │  ┌─────────────────────────────────────┐ │
@@ -246,14 +244,7 @@ The pipeline runs in seven stages. Each stage names the module and function that
 │                          │  │  │ v1: NO conflict detection on edges  │ │
 │                          │  │  └─────────────────────────────────────┘ │
 │                          │  │                                          │
-│                          │  │  4d. JSONL APPEND                       │
-│                          │  │  _append_conflicts_log()                │
-│                          │  │  falkordb_backend.py:170                │
-│                          │  │  if all_conflicts:                      │
-│                          │  │    append 1 json.dumps(conflict) line  │
-│                          │  │    per conflict to conflicts.jsonl      │
-│                          │  │                                          │
-│                          │  │  Returns (statements_run, all_conflicts)│
+│                          │  │  Returns (statements_run, all_conflicts)│ │
 │                          │  └──────────────────────────────────────────┘
 └──────────────────────────┘  └──────────────────────────────────────────┘
                             │
@@ -267,50 +258,38 @@ The pipeline runs in seven stages. Each stage names the module and function that
 │      42 Cypher statements executed                                      │
 │      17 node(s) in graph 'factory_planning'                             │
 │      merge mode: conflict                                               │
-│      3 property conflict(s) logged to data/conflicts.jsonl             │
+│      3 property conflict(s) recorded in the graph                      │
 └───────────────────────────┬─────────────────────────────────────────────┘
                             │
-                            │  Stage 6 — conflict persistence (hybrid)
+                            │  Stage 6 — conflict persistence (graph-only)
                             ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  TWO COMPLEMENTARY CONFLICT STORES                                      │
+│  SINGLE CONFLICT STORE: IN-GRAPH n.conflicts                            │
 │                                                                         │
-│  ┌────────────────────────────────┐  ┌────────────────────────────────┐ │
-│  │ IN-GRAPH: n.conflicts          │  │ ON-DISK: conflicts.jsonl       │ │
-│  │ (current per-entity state)     │  │ (append-only audit history)    │ │
-│  │                                │  │                                │ │
-│  │ • JSON-serialized list on each │  │ • one JSON object per line     │ │
-│  │   conflicted node              │  │ • full provenance per record   │ │
-│  │ • queryable via Cypher:        │  │ • survives --reset (reset()    │ │
-│  │   MATCH (n) WHERE              │  │   only touches the graph)      │ │
-│  │   n.conflicts IS NOT NULL      │  │ • git-diffable                 │ │
-│  │   RETURN n.name, n.conflicts   │  │ • consumable by external tools │ │
-│  │ • mutable via clear_conflicts()│  │ • never truncated              │ │
-│  │   → SET n.conflicts = null     │  │                                │ │
-│  └────────────────────────────────┘  └────────────────────────────────┘ │
-│                                                                         │
-│  Backend helpers (falkordb_backend.py):                                 │
-│    get_conflicts(label=None)  → parsed [{name, labels, conflicts}]      │
-│    clear_conflicts(label=, name=) → nulls n.conflicts, returns count    │
+│  • JSON-string list on each conflicted node                             │
+│  • full provenance per record + stable id + resolved flag               │
+│  • queryable via Cypher (cypher_query tool):                            │
+│    MATCH (n) WHERE n.conflicts IS NOT NULL                              │
+│    RETURN n.name, labels(n), n.conflicts                                │
+│  • resolution is cypher-native: read the list, rewrite the target      │
+│    entry's JSON to set "resolved": true and "resolved_at": <iso>,      │
+│    then SET n.conflicts = [$e1, $e2, ...] back in one query             │
+│  • each entry has a stable "id" of the form "<property>:<detected_at>"   │
 └───────────────────────────┬─────────────────────────────────────────────┘
                             │
                             │  Stage 7 — surface to human / search
                             ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  THREE ACCESS PATHS (all already wired)                                 │
+│  TWO ACCESS PATHS (both wired via cypher_query)                         │
 │                                                                         │
 │  1. Cypher REPL  — python scripts/ingest.py --search                    │
 │     > MATCH (n) WHERE n.conflicts IS NOT NULL                           │
 │         RETURN n.name, labels(n), n.conflicts                           │
 │                                                                         │
-│  2. Programmatic — backend.get_conflicts(label="Resource")              │
-│                                                                         │
-│  3. File review  — cat data/conflicts.jsonl | jq                        │
-│     each line: {property, existing_value, incoming_value,               │
-│                 source, chunk_index, detected_at}                       │
-│                                                                         │
-│  After adjudication: backend.clear_conflicts(name="M-100")              │
-│  (JSONL record remains as history)                                      │
+│  2. Agent — the assistant uses the cypher_query tool to list           │
+│     unresolved conflicts and to mark a specific entry resolved by      │
+│     rewriting its JSON (add "resolved": true, "resolved_at": <iso>)    │
+│     and SETting the full n.conflicts list back.                        │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -337,7 +316,6 @@ The `FactoryPlanningGraph` schema (`src/knowledge/graph_models/factory_graph_mod
 | WorkerPool | `assigned_resources` | `OPERATES` | Resource |
 | ControlStrategy | `affected_resources` | `GOVERNS` | Resource |
 | ControlStrategy | `affected_products` | `AFFECTS` | Product |
-| StochasticParameter | `associated_entity` | `DESCRIBES` | Resource |
 | KPI | `scope` | `SCOPED_TO` | Resource |
 
 Reference fields are **never** stored as scalar node properties and **never** produce property conflicts — they are only translated to relationship MERGEs.
@@ -398,7 +376,6 @@ Every conflict (both in-graph and JSONL) is a JSON object with these fields:
 | `--llm-model` | `LLM_MODEL` | `qwen3.5:122b-a10b` | bare Ollama model tag |
 | `--api-base` | `OLLAMA_API_BASE` | — | LLM provider base URL |
 | `--merge-mode` | `MERGE_MODE` | `overwrite` | `overwrite` or `conflict` |
-| `--conflicts-log` | `CONFLICTS_LOG` | `./data/conflicts.jsonl` | JSONL conflict log path |
 | `--recon` / `--no-recon` | `RECON_ENABLE` | `false` | Enable similarity reconciliation for plain-name Resources |
 | `--recon-posthoc` | — | — | Post-hoc reconciliation pass over existing plain-name nodes |
 | `--recon-cosine-cutoff` | `RECON_COSINE_CUTOFF` | `0.70` | Minimum cosine similarity for candidates |
@@ -580,8 +557,8 @@ backend.reconcile_posthoc()                      # run post-hoc pass (async)
 - **Reconciliation applies to Resources only** — other entity types are not reconciled.
 - **No auto-merge of duplicates** — the plain node is kept as a distinct node with a `POSSIBLE_DUPLICATE_OF` link; humans adjudicate via `clear_reconciliations`.
 - **Relationship property conflicts** — edges use find-or-create `MERGE` in both modes; no conflict detection on edge properties (e.g. `seq` on `STOPS_AT`).
-- **Auto-resolution** — no heuristic picks a winner for property conflicts; humans adjudicate via `clear_conflicts`.
-- **Conflict/reconciliation log rotation** — the JSONL files grow unbounded by design (audit trail).
+- **Auto-resolution** — no heuristic picks a winner for property conflicts; the assistant marks a conflict entry resolved via `cypher_query` (rewrites its JSON to set `resolved: true` + `resolved_at`).
+- **Conflict log rotation** — conflicts live only in the graph's `n.conflicts` list property; there is no on-disk conflict log. Resolved entries are retained for history within the list.
 
 ---
 

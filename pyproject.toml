@@ -33,6 +33,11 @@ chainlit = [
     "chainlit>=1.1.0",
     "anyio>=4.14.2",
     "starlette>=0.45.0",
+    # Visual data-display elements. Both degrade gracefully — the
+    # chainlit_elements helpers return None when a lib is missing, so the
+    # app still runs (with Markdown fallback) without them.
+    "pandas>=2.0.0",
+    "plotly>=5.20.0",
 ]
 dev = [
     "pytest>=7.0.0",

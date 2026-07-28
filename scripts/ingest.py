@@ -93,11 +93,7 @@ async def do_ingest(
     logger.info("{} node(s) in graph '{}'", node_count, backend.graph_name)
     logger.info("merge mode: {}", backend.merge_mode.value)
     if backend.merge_mode.value == "conflict":
-        logger.info(
-            "{} property conflict(s) logged to {}",
-            total_conflicts,
-            backend.conflicts_log_path,
-        )
+        logger.info("{} property conflict(s) recorded in the graph", total_conflicts)
     if backend.recon_enabled:
         logger.info(
             "{} reconciliation(s) logged to {}",
@@ -150,7 +146,6 @@ async def run(
     search_fulltext: bool,
     search_vector: bool,
     merge_mode: str | None,
-    conflicts_log: str | None,
     recon_enabled: bool | None,
     recon_posthoc: bool,
     recon_cosine_cutoff: float | None,
@@ -163,7 +158,6 @@ async def run(
     backend = FalkorDBBackend(
         graph_name=graph_name,
         merge_mode=merge_mode,
-        conflicts_log_path=conflicts_log,
         recon_enabled=recon_enabled,
         reconciliations_log_path=reconciliations_log,
         recon_cosine_cutoff=recon_cosine_cutoff,
@@ -261,17 +255,6 @@ def build_parser() -> argparse.ArgumentParser:
             "first-writer-wins, disagreements recorded as conflicts "
             "(in-graph `conflicts` property + JSONL log). "
             "Also readable from the MERGE_MODE env var."
-        ),
-    )
-    parser.add_argument(
-        "--conflicts-log",
-        default=None,
-        dest="conflicts_log",
-        help=(
-            "Path to the append-only JSONL conflict log written in "
-            "--merge-mode=conflict (default: ./data/conflicts.jsonl). "
-            "Also readable from the CONFLICTS_LOG env var. The log survives "
-            "--reset."
         ),
     )
     parser.add_argument(
@@ -425,7 +408,6 @@ def main() -> None:
             search_fulltext=args.fulltext,
             search_vector=args.vector,
             merge_mode=args.merge_mode,
-            conflicts_log=args.conflicts_log,
             recon_enabled=args.recon_enabled,
             recon_posthoc=args.recon_posthoc,
             recon_cosine_cutoff=args.recon_cosine_cutoff,

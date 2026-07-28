@@ -153,12 +153,19 @@ You can:
 (get_schema, list_nodes, list_edges, node_count)
 - Discover which knowledge graphs exist in the FalkorDB instance (list_graphs) \
 and switch the active graph among the user's enabled set (use_graph)
-- Manage merge conflicts (get_conflicts, clear_conflicts)
+- Manage merge conflicts via cypher_query: list nodes with a non-null \
+``conflicts`` property, and resolve a specific conflict entry by rewriting \
+its JSON string to set ``resolved: true`` and ``resolved_at`` and SETting \
+the full ``n.conflicts`` list back in one Cypher statement. Each conflict \
+entry carries a stable ``id`` of the form ``<property>:<detected_at>``. See \
+the cypher_query tool docstring for the exact schema and query patterns.
 - Manage similarity-based reconciliation of plain-name Resources: \
 review POSSIBLE_DUPLICATE_OF links (get_reconciliations), dismiss reviewed ones \
 (clear_reconciliations), and run a post-hoc pass over pre-existing plain-name \
 nodes (reconcile_posthoc)
 - Reset the graph (reset_graph) — use only when explicitly asked
+- Ask the user a clarifying question (ask_user) or request explicit \
+confirmation before ingestion (request_ingestion_confirmation)
 
 PRE-INGESTION REVIEW ROUTINE (mandatory before extract_and_write):
 This routine is a soft guardrail that prevents large amounts of data noise from \
@@ -185,10 +192,12 @@ preprocessing, call read_excerpt on the ``output_path`` the tool returned \
    - a 1-3 sentence content description per file
    - anything that looks like noise, out-of-scope, or non-factory-planning data
    - which files were preprocessed and which were skipped (already Markdown)
-5. CONFIRM: STOP and ask the user to confirm before calling extract_and_write. \
-Do NOT call extract_and_write until the user explicitly confirms. \
-chunk_documents (preview-only, no graph writes) may be used during this review \
-to preview chunks, but the actual ingestion must wait for confirmation.
+5. CONFIRM: STOP and call ``request_ingestion_confirmation`` with your \
+summary (do NOT ask in prose — use the tool so the user gets explicit \
+Confirm/Cancel buttons). Do NOT call extract_and_write until the user \
+confirms via that tool. chunk_documents (preview-only, no graph writes) \
+may be used during this review to preview chunks, but the actual ingestion \
+must wait for confirmation.
 6. PROCEED: only after explicit user confirmation, call extract_and_write. \
 extract_and_write reads from the ``preprocessed/`` tree by default; only point \
 it at ``originals/`` if the user explicitly wants to ingest raw text sources \

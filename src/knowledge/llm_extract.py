@@ -16,6 +16,33 @@ from knowledge.graph_models.factory_graph_model import FactoryPlanningGraph
 
 _DEFAULT_LLM_MODEL = "qwen3.5:122b-a10b"
 
+
+def _validate_and_log(text: str, schema_class: Type[BaseModel]) -> BaseModel:
+    """Validate JSON text and log any ambiguous durations surfaced."""
+    result = schema_class.model_validate_json(text)
+    _log_ambiguous(result)
+    return result
+
+
+def _validate_and_log_obj(obj: object, schema_class: Type[BaseModel]) -> BaseModel:
+    """Validate a Python object and log any ambiguous durations surfaced."""
+    result = schema_class.model_validate(obj)
+    _log_ambiguous(result)
+    return result
+
+
+def _log_ambiguous(result: BaseModel) -> None:
+    """Log a warning for each ambiguous duration recorded on the extraction."""
+    ambiguous = getattr(result, "ambiguous_durations", None) or []
+    for entry in ambiguous:
+        logger.warning(
+            "Ambiguous duration: entity={} field={} raw={!r}",
+            f"{getattr(entry, 'entity_type', '?')}:"
+            f"{getattr(entry, 'entity_name', '?')}",
+            getattr(entry, "field_name", "?"),
+            getattr(entry, "raw_value", ""),
+        )
+
 _SYSTEM_PROMPT = """\
 You are a manufacturing domain expert. Extract all factory-planning entities \
 from the given document text into the JSON schema provided.
@@ -23,7 +50,15 @@ from the given document text into the JSON schema provided.
 Rules:
 - Extract ONLY information explicitly stated in the text.
 - Use consistent, exact entity names to enable deduplication.
-- All time values in seconds, lengths in meters, weights in grams, speeds in m/s.
+- All time-valued fields are STRINGS following a fixed duration schema:
+  - Constant: 'd=40s'
+  - Distribution: 'normal(mean=300, std=45)' / 'uniform(min=10, max=20)' \
+/ 'exponential(lambda=0.5)' / 'weibull(k=1.5, lambda=200)'
+  - All values are SECONDS. Use 'mean'/'std' (NOT mu/sigma), 'min'/'max', \
+'lambda', 'k'. Use key=value arguments inside the parentheses.
+  - If the source text is ambiguous or lacks precise numbers, put the raw \
+text verbatim in the field — it will be flagged for human review.
+- Lengths in meters, weights in grams, speeds in m/s.
 - Never extract personal names, contact information, or employee identifiers.
 - If a field's value is not mentioned in the text, omit it (do not guess).
 - Return valid JSON matching the schema. No markdown fences, no commentary.
@@ -113,15 +148,15 @@ async def extract_from_chunk(
                 text = "\n".join(lines)
 
             try:
-                return schema_class.model_validate_json(text)
+                return _validate_and_log(text, schema_class)
             except Exception:
                 logger.debug("JSON validation failed, attempting repair")
                 from json_repair import repair_json
 
                 repaired = repair_json(text)
                 if isinstance(repaired, str):
-                    return schema_class.model_validate_json(repaired)
-                return schema_class.model_validate(repaired)
+                    return _validate_and_log(repaired, schema_class)
+                return _validate_and_log_obj(repaired, schema_class)
 
         except Exception as exc:
             if attempt < max_retries - 1:

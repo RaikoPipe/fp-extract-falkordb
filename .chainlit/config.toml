@@ -114,16 +114,16 @@ confirm_new_chat = true
 # description = ""
 
 # Chain of Thought (CoT) display mode. Can be "hidden", "tool_call" or "full".
-cot = "full"
+cot = "tool_call"
 
 # The style of alert boxes. Can be "classic" or "modern".
-alert_style = "classic"
+alert_style = "modern"
 
 # Load assistant logo directly from URL.
-logo_file_url = ""
+logo_file_url = "https://genai4ffd.de/wp-content/uploads/2025/05/GenAI4FFD_LogoOnly_neu.svg"
 
 # Load assistant avatar image directly from URL.
-default_avatar_file_url = ""
+default_avatar_file_url = "https://genai4ffd.de/wp-content/uploads/2025/05/GenAI4FFD_LogoOnly_neu.svg"
 
 [meta]
 generated_by = "2.11.0"

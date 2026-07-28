@@ -47,9 +47,8 @@ _DEFAULT_SIMILARITY_FUNCTION = "cosine"
 # so embeddings default to a local Ollama instance.
 _DEFAULT_EMBEDDING_API_BASE = "http://localhost:11434"
 
-# Default merge mode and on-disk conflict log path.
+# Default merge mode.
 _DEFAULT_MERGE_MODE = MergeMode.OVERWRITE
-_DEFAULT_CONFLICTS_LOG = "./data/conflicts.jsonl"
 
 # Reconciliation defaults.
 _DEFAULT_RECONCILIATIONS_LOG = "./data/reconciliations.jsonl"
@@ -103,7 +102,6 @@ class FalkorDBBackend:
         port: int | None = None,
         graph_name: str | None = None,
         merge_mode: MergeMode | str | None = None,
-        conflicts_log_path: str | Path | None = None,
         *,
         recon_enabled: bool | None = None,
         reconciliations_log_path: str | Path | None = None,
@@ -138,12 +136,6 @@ class FalkorDBBackend:
         else:
             mode_str = merge_mode or os.getenv("MERGE_MODE", _DEFAULT_MERGE_MODE.value)
             self._merge_mode = MergeMode(mode_str)
-
-        # Conflict log path: explicit arg > CONFLICTS_LOG env > default.
-        log_str = conflicts_log_path or os.getenv(
-            "CONFLICTS_LOG", _DEFAULT_CONFLICTS_LOG
-        )
-        self._conflicts_log_path = Path(log_str)
 
         # Reconciliation log path: explicit arg > RECONCILIATIONS_LOG env > default.
         recon_log_str = reconciliations_log_path or os.getenv(
@@ -382,10 +374,6 @@ class FalkorDBBackend:
         return self._merge_mode
 
     @property
-    def conflicts_log_path(self) -> Path:
-        return self._conflicts_log_path
-
-    @property
     def recon_enabled(self) -> bool:
         return self._recon_enabled
 
@@ -544,8 +532,6 @@ class FalkorDBBackend:
                         if recon_record:
                             all_reconciliations.append(recon_record)
 
-        if all_conflicts:
-            self._append_conflicts_log(all_conflicts)
         if all_reconciliations:
             self._append_reconciliations_log(all_reconciliations)
 
@@ -811,14 +797,6 @@ class FalkorDBBackend:
         # — it is not a scalar property we compare against.
         return props
 
-    def _append_conflicts_log(self, conflicts: list[dict[str, Any]]) -> None:
-        """Append conflict records to the JSONL log file (create if needed)."""
-        self._conflicts_log_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._conflicts_log_path.open("a", encoding="utf-8") as fh:
-            for conflict in conflicts:
-                fh.write(json.dumps(conflict, ensure_ascii=False, default=str))
-                fh.write("\n")
-
     def _append_reconciliations_log(self, records: list[dict[str, Any]]) -> None:
         """Append reconciliation records to the JSONL log file (create if needed)."""
         self._reconciliations_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -887,78 +865,8 @@ class FalkorDBBackend:
                     return int(getattr(stats, key) or 0)
         return 0
 
-    def get_conflicts(self, label: str | None = None) -> list[dict[str, Any]]:
-        """Return all nodes that carry a non-null ``conflicts`` property.
-
-        Each row is ``{name, labels, conflicts}`` where ``conflicts`` is the
-        parsed list of conflict dicts. When ``label`` is given, restricts the
-        scan to that label.
-        """
-        label_clause = f":{label}" if label else ""
-        cypher = (
-            f"MATCH (n{label_clause}) "
-            f"WHERE n.conflicts IS NOT NULL "
-            f"RETURN n.name AS name, labels(n) AS labels, n.conflicts AS conflicts"
-        )
-        result = self._query(cypher)
-        rows: list[dict[str, Any]] = []
-        for row in result.result_set or []:
-            name, labels, raw = row
-            parsed: list[dict[str, Any]] = []
-            if isinstance(raw, str):
-                try:
-                    parsed = json.loads(raw)
-                except json.JSONDecodeError:
-                    parsed = [{"_raw": raw}]
-            elif isinstance(raw, list):
-                for item in raw:
-                    if isinstance(item, str):
-                        try:
-                            parsed.append(json.loads(item))
-                        except json.JSONDecodeError:
-                            parsed.append({"_raw": item})
-                    elif isinstance(item, dict):
-                        parsed.append(item)
-            rows.append({
-                "name": str(name) if name is not None else "",
-                "labels": list(labels) if labels else [],
-                "conflicts": parsed,
-            })
-        return rows
-
-    def clear_conflicts(
-        self, label: str | None = None, name: str | None = None
-    ) -> int:
-        """Dismiss reviewed conflicts by nulling the ``conflicts`` property.
-
-        Returns the number of nodes updated. When ``label``/``name`` are
-        given, restricts the operation accordingly.
-        """
-        label_clause = f":{label}" if label else ""
-        name_clause = " AND n.name = $name" if name else ""
-        params: dict[str, Any] = {}
-        if name:
-            params["name"] = name
-        cypher = (
-            f"MATCH (n{label_clause}) "
-            f"WHERE n.conflicts IS NOT NULL{name_clause} "
-            f"SET n.conflicts = null"
-        )
-        result = self._query(cypher, params)
-        # FalkorDB returns statistics on writes; fall back to 0 if absent.
-        if hasattr(result, "statistics"):
-            stats = result.statistics
-            for key in ("properties_set", "nodes_updated"):
-                if hasattr(stats, key):
-                    return int(getattr(stats, key) or 0)
-        return 0
-
     def reset(self) -> None:
-        """Delete all nodes and relationships.
-
-        Note: this does NOT clear the on-disk conflicts JSONL log, which is
-        an audit trail that survives graph resets.
-        """
+        """Delete all nodes and relationships."""
         self._query("MATCH (n) DETACH DELETE n")
 
     def node_count(self) -> int:

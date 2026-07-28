@@ -10,6 +10,7 @@ from typing import Any, Iterator
 from pydantic import BaseModel
 
 from knowledge.graph_models.factory_graph_model import (
+    AmbiguousDuration,
     ControlStrategy,
     FactoryPlanningGraph,
     KPI,
@@ -19,7 +20,6 @@ from knowledge.graph_models.factory_graph_model import (
     ProductionProgram,
     Resource,
     ShiftModel,
-    StochasticParameter,
     Trailer,
     TrafficRule,
     TransportRoute,
@@ -46,7 +46,6 @@ _REFERENCE_FIELDS: dict[tuple[str, str], tuple[str, str]] = {
     ("WorkerPool", "assigned_resources"): ("OPERATES", "Resource"),
     ("ControlStrategy", "affected_resources"): ("GOVERNS", "Resource"),
     ("ControlStrategy", "affected_products"): ("AFFECTS", "Product"),
-    ("StochasticParameter", "associated_entity"): ("DESCRIBES", "Resource"),
     ("KPI", "scope"): ("SCOPED_TO", "Resource"),
 }
 
@@ -66,7 +65,7 @@ _ENTITY_LISTS: list[tuple[str, type[BaseModel], str]] = [
     ("control_strategies", ControlStrategy, "ControlStrategy"),
     ("layout_elements", LayoutElement, "LayoutElement"),
     ("kpis", KPI, "KPI"),
-    ("stochastic_parameters", StochasticParameter, "StochasticParameter"),
+    ("ambiguous_durations", AmbiguousDuration, "AmbiguousDuration"),
 ]
 
 # Fields that are cross-references and should not be stored as scalar properties.
@@ -293,13 +292,16 @@ def build_conflict_merge(
             continue
 
         # Conflict: keep existing, record incoming.
+        detected_at = _now_iso()
         conflict = {
+            "id": f"{key}:{detected_at}",
             "property": key,
             "existing_value": existing,
             "incoming_value": incoming_ser,
             "source": source,
             "chunk_index": chunk_index,
-            "detected_at": _now_iso(),
+            "detected_at": detected_at,
+            "resolved": False,
         }
         conflicts.append(conflict)
         c_key = f"c_{key}"

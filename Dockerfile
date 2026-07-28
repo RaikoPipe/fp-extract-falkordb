@@ -9,7 +9,7 @@ COPY docprep.yaml .
 RUN pip install --no-cache-dir -e ".[chainlit]"
 
 COPY .chainlit/ .chainlit/
-COPY chainlit.md .
+COPY chainlit*.md .
 
 EXPOSE 8000
 

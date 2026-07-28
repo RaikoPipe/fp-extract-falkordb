@@ -38,7 +38,7 @@ def test_model_to_cypher_merge_omits_none_fields():
     query, params = model_to_cypher_merge(r, "Resource")
 
     assert "p_capacity" not in params
-    assert "p_mtbf_s" not in params
+    assert "p_mtbf" not in params
 
 
 def test_model_to_cypher_merge_skips_reference_fields():

@@ -14,17 +14,38 @@ from falkordb_harness.tools._retry import awith_retry, with_retry
 def cypher_query(cypher: str) -> str:
     """Execute a raw Cypher query against the FalkorDB knowledge graph.
 
-    Use this when you know the exact Cypher statement to run.
-    Returns the result rows as JSON.
+    Use this for all graph reads and writes, including conflict management.
+    Conflicts are stored ONLY in the graph: each entity node may carry a
+    ``conflicts`` list property whose elements are JSON-encoded strings of
+    the form::
+
+        {"id": "<property>:<detected_at>", "property": "...",
+         "existing_value": ..., "incoming_value": ..., "source": "...",
+         "chunk_index": ..., "detected_at": "<iso>", "resolved": false}
+
+    To list unresolved conflicts::
+
+        MATCH (n) WHERE n.conflicts IS NOT NULL
+        RETURN n.name AS name, labels(n) AS labels, n.conflicts AS conflicts
+
+    To resolve a specific conflict, read the node's ``conflicts`` list, take
+    the entry whose ``id`` matches the target, rewrite its JSON string to
+    set ``"resolved": true`` and ``"resolved_at": "<iso>"``, then SET the
+    full list back in one query, e.g.::
+
+        MATCH (n:Resource {name: $name})
+        SET n.conflicts = [$e1, $e2, ...]
+
+    where ``$e1`` etc. are the (possibly modified) JSON strings. FalkorDB
+    does not support map-valued list elements, so each entry must remain a
+    JSON string; do not pass maps. Returns the result rows as JSON.
     """
     return with_retry(lambda: _cypher_query_impl(cypher))
 
 
 def _cypher_query_impl(cypher: str) -> str:
     rows = get_searcher().cypher_query(cypher)
-    return json.dumps(
-        [str(r) for r in rows], ensure_ascii=False, default=str
-    )
+    return json.dumps(rows, ensure_ascii=False, default=str)
 
 
 @tool

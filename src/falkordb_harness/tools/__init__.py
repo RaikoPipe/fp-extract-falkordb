@@ -1,7 +1,6 @@
 """Aggregate all tools into a single list."""
 
 from falkordb_harness.tools.admin_tools import reset_graph, use_graph
-from falkordb_harness.tools.conflict_tools import clear_conflicts, get_conflicts
 from falkordb_harness.tools.file_inspection_tools import file_metadata, read_excerpt
 from falkordb_harness.tools.ingest_tools import chunk_documents, extract_and_write
 from falkordb_harness.tools.inspect_tools import (
@@ -23,6 +22,10 @@ from falkordb_harness.tools.reconciliation_tools import (
     get_reconciliations,
     reconcile_posthoc,
 )
+from falkordb_harness.tools.ui_prompt_tools import (
+    ask_user,
+    request_ingestion_confirmation,
+)
 
 all_tools = [
     # File inspection (use before ingestion — see PRE-INGESTION REVIEW ROUTINE)
@@ -33,6 +36,9 @@ all_tools = [
     # Ingestion
     chunk_documents,
     extract_and_write,
+    # Interactive UI prompts (Chainlit Ask*Message / CLI stdin fallback)
+    request_ingestion_confirmation,
+    ask_user,
     # Query
     cypher_query,
     nl_query,
@@ -44,9 +50,6 @@ all_tools = [
     list_edges,
     node_count,
     list_graphs,
-    # Conflicts
-    get_conflicts,
-    clear_conflicts,
     # Reconciliation
     get_reconciliations,
     clear_reconciliations,

@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 from typing import Any, Callable
 
+from falkordb_harness.i18n import t
+
 _MAX_ROWS = 50
 _MAX_CELL = 120
 _DEFAULT_MAX_CHARS = 6000
@@ -49,7 +51,7 @@ def _fmt_default(raw: str, max_chars: int) -> str:
 
 def _records_to_table(records: list[dict], max_chars: int) -> str:
     if not records:
-        return "*No results.*"
+        return t("fmt.no_results")
 
     all_keys: list[str] = []
     seen: set[str] = set()
@@ -78,7 +80,7 @@ def _records_to_table(records: list[dict], max_chars: int) -> str:
 
     table = "\n".join([header, sep, *rows])
     if total > _MAX_ROWS:
-        table += f"\n\n*... and {total - _MAX_ROWS} more rows (showing {_MAX_ROWS} of {total})*"
+        table += t("fmt.more_rows", n=total - _MAX_ROWS, shown=_MAX_ROWS, total=total)
     return _truncate(table, max_chars)
 
 
@@ -107,8 +109,8 @@ def _fmt_cypher_result(raw: str, max_chars: int) -> str:
             return _records_to_table(data, max_chars)
         lines = [f"{i+1}. {_truncate_cell(r)}" for i, r in enumerate(data[:_MAX_ROWS])]
         if len(data) > _MAX_ROWS:
-            lines.append(f"\n*... and {len(data) - _MAX_ROWS} more*")
-        return "\n".join(lines) or "*No results.*"
+            lines.append(t("fmt.more", n=len(data) - _MAX_ROWS))
+        return "\n".join(lines) or t("fmt.no_results")
     if isinstance(data, dict):
         return _records_to_table([data], max_chars)
     return _fmt_default(raw, max_chars)
@@ -120,16 +122,17 @@ def _fmt_schema(raw: str, max_chars: int) -> str:
         return _fmt_default(raw, max_chars)
 
     sections: list[str] = []
-    for heading, key in [
-        ("Node Labels", "labels"),
-        ("Node Labels", "node_labels"),
-        ("Relationship Types", "relationship_types"),
-        ("Relationship Types", "relationships"),
-        ("Property Keys", "property_keys"),
-        ("Property Keys", "properties"),
+    for heading_key, key in [
+        ("fmt.schema.heading.node_labels", "labels"),
+        ("fmt.schema.heading.node_labels", "node_labels"),
+        ("fmt.schema.heading.rel_types", "relationship_types"),
+        ("fmt.schema.heading.rel_types", "relationships"),
+        ("fmt.schema.heading.prop_keys", "property_keys"),
+        ("fmt.schema.heading.prop_keys", "properties"),
     ]:
         items = data.get(key)
         if items and isinstance(items, list):
+            heading = t(heading_key)
             if any(s.startswith(f"**{heading}**") for s in sections):
                 continue
             bullets = "\n".join(f"- `{_escape_pipe(str(i))}`" for i in items)
@@ -143,9 +146,9 @@ def _fmt_schema(raw: str, max_chars: int) -> str:
 def _fmt_node_count(raw: str, max_chars: int) -> str:
     data = _try_parse_json(raw)
     if isinstance(data, (int, float)):
-        return f"**{int(data)}** nodes in the graph."
+        return t("fmt.node_count.one", n=int(data))
     if isinstance(data, dict) and "count" in data:
-        return f"**{data['count']}** nodes in the graph."
+        return t("fmt.node_count.one", n=data["count"])
     return _fmt_default(raw, max_chars)
 
 
@@ -154,7 +157,7 @@ def _fmt_search_results(raw: str, max_chars: int) -> str:
     if not isinstance(data, list):
         return _fmt_default(raw, max_chars)
     if not data:
-        return "*No results found.*"
+        return t("fmt.no_results_found")
 
     lines: list[str] = []
     for i, item in enumerate(data[:_MAX_ROWS], 1):
@@ -173,7 +176,7 @@ def _fmt_search_results(raw: str, max_chars: int) -> str:
             lines.append(f"{i}. {_truncate_cell(item)}")
 
     if len(data) > _MAX_ROWS:
-        lines.append(f"\n*... and {len(data) - _MAX_ROWS} more results*")
+        lines.append(t("fmt.more_results", n=len(data) - _MAX_ROWS))
     return _truncate("\n".join(lines), max_chars)
 
 

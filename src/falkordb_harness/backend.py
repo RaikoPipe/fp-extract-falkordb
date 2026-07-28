@@ -88,7 +88,6 @@ def get_backend() -> FalkorDBBackend:
             port=int(os.getenv("FALKORDB_PORT", "6379")) if os.getenv("FALKORDB_PORT") else None,
             graph_name=os.getenv("FALKORDB_GRAPH"),
             merge_mode=os.getenv("MERGE_MODE"),
-            conflicts_log_path=os.getenv("CONFLICTS_LOG"),
         )
         return _BACKEND
 
