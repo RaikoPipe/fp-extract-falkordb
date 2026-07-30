@@ -18,6 +18,9 @@ persist_user_env = false
 mask_user_env = false
 
 # Authorized origins
+# For production, replace with your exact deployment origin(s), e.g.
+#   ["https://kg.example.com"]
+# Wildcard is left here for local dev convenience; tighten before going public.
 allow_origins = ["*"]
 
 [features]

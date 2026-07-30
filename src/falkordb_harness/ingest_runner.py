@@ -261,7 +261,10 @@ async def run_ingestion(
         ``errors`` (list of per-file error strings; empty on full success).
     """
     from falkordb_harness.backend import get_backend
-    from falkordb_harness.tools._paths import originals_dir, preprocessed_dir
+    from falkordb_harness.tools._paths import (
+        thread_originals_dir,
+        thread_preprocessed_dir,
+    )
     from knowledge.chunking import chunk_text, read_document
     from knowledge.llm_extract import extract_from_chunks
 
@@ -274,16 +277,22 @@ async def run_ingestion(
     if progress is None:
         progress = _noop_progress
 
-    # --- Stage 1: stage files into originals/ ---
-    originals = originals_dir()
+    # The per-session thread id drives on-disk isolation: each session's
+    # originals/preprocessed files live under originals/<thread_id>/ and
+    # preprocessed/<thread_id>/ respectively. None (CLI / no Chainlit
+    # context) lands files in the _unscoped/ subdirectory.
+    thread_id = _session_thread_id()
+
+    # --- Stage 1: stage files into originals/<thread_id>/ ---
+    originals = thread_originals_dir(thread_id)
     staged: list[Path] = []
     for src in file_paths:
         src = Path(src)
         if not src.exists() or not src.is_file():
             errors.append(f"File not found: {src}")
             continue
-        # If the file is already under the data tree (originals/ or
-        # preprocessed/), use it in place; otherwise copy into originals/.
+        # If the file is already under this session's originals tree, use it
+        # in place; otherwise copy into originals/<thread_id>/.
         try:
             src.resolve().relative_to(originals)
             staged.append(src)
@@ -315,8 +324,8 @@ async def run_ingestion(
             "errors": errors or ["No files to ingest."],
         }
 
-    # --- Stage 2: preprocess binary files -> preprocessed/*.md ---
-    pre_out = preprocessed_dir()
+    # --- Stage 2: preprocess binary files -> preprocessed/<thread_id>/*.md ---
+    pre_out = thread_preprocessed_dir(thread_id)
     preprocessed_count = 0
     ingest_paths: list[Path] = []  # files to chunk (md + plain text)
     bin_files = [s for s in staged if _needs_preprocessing(s)]

@@ -3,21 +3,25 @@
 A single ``documents`` table (created by :mod:`falkordb_harness.data_layer`)
 tracks every file through three lifecycle stages:
 
-    uploaded  → raw original copied into ``originals/`` (scoped to a chat
-                thread; ``threadId`` set, ``graphName`` NULL).
-    preprocessed → docprep Markdown output in ``preprocessed/`` (scoped to a
-                thread; paired to its original by name).
+    uploaded  → raw original copied into ``originals/<thread_id>/`` (scoped
+                to a chat thread; ``threadId`` set, ``graphName`` NULL).
+    preprocessed → docprep Markdown output in ``preprocessed/<thread_id>/``
+                (scoped to a thread; paired to its original by name).
     ingested  → file whose extractions were written to a knowledge graph
                 (scoped to the graph; ``graphName`` set, ``threadId`` NULL).
                 Ingested rows are permanent: they are not deletable from the
                 sidebar and are only removed when the graph itself is reset
-                (``clear_ingested_for_graph``).
+                (``clear_ingested_for_graph``). Their ``originalPath`` /
+                ``preprocessedPath`` columns keep the session dir of origin
+                for provenance only.
 
 The registry is the single source of truth for the document-management
 sidebar. Uploaded/preprocessed rows are deduplicated by ``(threadId,
 checksum, stage)``; ingested rows are deduplicated by ``(graphName, name)``.
-On thread deletion, ``orphan_thread`` nulls ``threadId`` so the on-disk
-files remain re-usable by other chats and graphs.
+On thread deletion, ``orphan_thread`` deletes the thread's uploaded/
+preprocessed rows and their per-session on-disk directories
+(``originals/<thread_id>/`` and ``preprocessed/<thread_id>/``); ingested
+rows are graph-scoped and unaffected.
 
 All methods are async and run against the data layer's SQLAlchemy engine
 (see :func:`falkordb_harness.data_layer.build_data_layer`). They are safe
@@ -573,7 +577,33 @@ async def delete(row_id: str, *, remove_file: bool = True) -> dict[str, Any] | N
                     Path(p).unlink(missing_ok=True)
                 except OSError as exc:
                     logger.warning("Could not unlink %s: %s", p, exc)
+        # Best-effort: remove the per-session subdirectory if it is now empty
+        # (the file we just unlinked may have been its last occupant). A
+        # non-empty dir (other files remain) or a missing parent is silently
+        # ignored so this never breaks the delete.
+        _maybe_rmdir_if_empty(deleted.get("originalPath"))
+        _maybe_rmdir_if_empty(deleted.get("preprocessedPath"))
     return deleted
+
+
+def _maybe_rmdir_if_empty(stored_path: str | None) -> None:
+    """Remove the parent directory of ``stored_path`` if it is empty.
+
+    With per-session on-disk isolation, a deleted file's parent is the
+    ``originals/<thread_id>/`` or ``preprocessed/<thread_id>/`` directory.
+    Removing it when empty keeps the tree tidy after the last file of a
+    session is deleted (the top-level ``originals/`` / ``preprocessed/``
+    roots are never removed — only session subdirs, which sit one level
+    below a file). Missing paths / non-empty dirs are ignored.
+    """
+    if not stored_path:
+        return
+    try:
+        parent = Path(stored_path).resolve().parent
+        parent.rmdir()
+    except (OSError, ValueError):
+        # Not empty, missing, or outside an expected root — leave as-is.
+        pass
 
 
 async def clear_ingested_for_graph(graph_name: str) -> int:
@@ -606,32 +636,47 @@ async def clear_ingested_for_graph(graph_name: str) -> int:
 
 
 async def orphan_thread(thread_id: str) -> int:
-    """Null ``threadId`` on all of a thread's rows.
+    """Delete a thread's on-disk session dirs and its uploaded/preprocessed rows.
 
-    Called when a thread is deleted: the uploaded/preprocessed rows lose
-    their thread link but the on-disk files stay so they remain re-usable
-    by other chats and graphs. Ingested rows are unaffected (they're
-    graph-scoped, not thread-scoped).
+    Called when a thread is deleted. With per-session on-disk isolation
+    (``originals/<thread_id>/`` and ``preprocessed/<thread_id>/``), the
+    session's files are removed along with their registry rows so no stale
+    files remain and the on-disk layout keeps reflecting live sessions only.
+    Ingested rows are graph-scoped (``threadId`` NULL already) and are
+    unaffected — they persist with the graph.
 
-    Returns the number of rows updated. Errors are logged and return 0.
+    Returns the number of uploaded/preprocessed rows deleted. Errors are
+    logged and return 0.
     """
+    import shutil
+
+    from falkordb_harness.tools._paths import originals_dir, preprocessed_dir
+
     await _ensure_documents_table()
+    deleted_rows = 0
     try:
         async with _engine().begin() as conn:
             result = await conn.execute(
                 text(
                     """
-                    UPDATE documents
-                       SET "threadId" = NULL
+                    DELETE FROM documents
                      WHERE "threadId" = :threadId
+                       AND "stage" IN ('uploaded', 'preprocessed')
                     """
                 ),
                 {"threadId": thread_id},
             )
-        return result.rowcount or 0
+            deleted_rows = result.rowcount or 0
+        # Remove the per-session on-disk directories. best-effort: a missing
+        # or non-empty dir (e.g. files added out-of-band) is silently skipped.
+        for root in (originals_dir(), preprocessed_dir()):
+            session_dir = root / thread_id
+            if session_dir.is_dir():
+                shutil.rmtree(session_dir, ignore_errors=True)
     except Exception as exc:  # noqa: BLE001
         logger.error("orphan_thread failed for %r: %s", thread_id, exc)
         return 0
+    return deleted_rows
 
 
 __all__ = [

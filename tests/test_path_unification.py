@@ -87,3 +87,54 @@ def test_data_dir_originals_preprocessed_defaults(monkeypatch, tmp_path):
     assert _paths.data_dir() == tmp_path.resolve()
     assert _paths.originals_dir() == (tmp_path / "originals").resolve()
     assert _paths.preprocessed_dir() == (tmp_path / "preprocessed").resolve()
+
+
+# ---------------------------------------------------------------------------
+# Per-session subdirectory helpers
+# ---------------------------------------------------------------------------
+def test_thread_originals_dir_thread_id(tmp_path):
+    d = _paths.thread_originals_dir("thread-123")
+    assert d == (tmp_path / "originals" / "thread-123").resolve()
+    assert d.is_dir()  # auto-created
+
+
+def test_thread_preprocessed_dir_thread_id(tmp_path):
+    d = _paths.thread_preprocessed_dir("thread-123")
+    assert d == (tmp_path / "preprocessed" / "thread-123").resolve()
+    assert d.is_dir()
+
+
+def test_thread_dirs_none_id_uses_unscoped(tmp_path):
+    """thread_id=None (CLI / pre-session) lands in the _unscoped subdir."""
+    assert _paths.thread_originals_dir(None) == (tmp_path / "originals" / "_unscoped").resolve()
+    assert _paths.thread_preprocessed_dir(None) == (tmp_path / "preprocessed" / "_unscoped").resolve()
+    assert _paths.thread_originals_dir(None).is_dir()
+    assert _paths.thread_preprocessed_dir(None).is_dir()
+
+
+def test_thread_dirs_reject_unscoped_sentinel():
+    """A real thread id equal to the reserved '_unscoped' sentinel is rejected."""
+    import pytest
+
+    with pytest.raises(ValueError):
+        _paths.thread_originals_dir("_unscoped")
+    with pytest.raises(ValueError):
+        _paths.thread_preprocessed_dir("_unscoped")
+
+
+def test_resolve_under_thread_subtree(tmp_path):
+    """Files in a per-session subdir resolve via the same root-relative path."""
+    f = tmp_path / "originals" / "t1" / "foo.pdf"
+    f.parent.mkdir(parents=True)
+    f.write_bytes(b"x")
+    resolved = _paths.resolve("originals/t1/foo.pdf")
+    assert isinstance(resolved, Path)
+    assert resolved == f.resolve()
+
+
+def test_virtual_path_includes_session_subdir():
+    """virtual_path produces originals/<tid>/<name> for nested session files."""
+    abs_path = _paths.thread_originals_dir("t1") / "foo.pdf"
+    abs_path.write_bytes(b"x")
+    v = _paths.virtual_path(abs_path)
+    assert v.replace("\\", "/") == "originals/t1/foo.pdf"

@@ -12,6 +12,10 @@ services:
     command: chainlit run src/falkordb_harness/chainlit_app.py --host 0.0.0.0 --port 8000
     ports:
       - "8000:8000"
+    # All auth/email/admin env vars (CHAINLIT_AUTH_SECRET, REGISTER_ENABLED,
+    # SMTP_*, FIRST_ADMIN_*, APP_BASE_URL, etc.) are loaded from .env.
+    # For public deployment, place this behind a TLS-terminating reverse
+    # proxy (e.g. Caddy/nginx) so JWT cookies travel over HTTPS only.
     env_file:
       - .env
     environment:

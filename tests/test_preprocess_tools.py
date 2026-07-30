@@ -70,10 +70,13 @@ def test_preprocess_writes_md_to_preprocessed_dir(tmp_path):
         out = json.loads(_call(preprocess_document, path="originals/scan.pdf"))
 
     fake.assert_called_once()
-    # output_path is a DATA_DIR-relative virtual path (preprocessed/scan.md).
+    # No Chainlit context in tests -> thread id is None -> output lands in the
+    # per-session _unscoped subdir (preprocessed/_unscoped/scan.md).
     out_path = Path(os.getenv("DATA_DIR")) / out["output_path"]
-    assert out["output_path"].replace("\\", "/") == "preprocessed/scan.md"
-    assert out_path.parent == Path(os.getenv("PREPROCESSED_DIR")).resolve()
+    assert out["output_path"].replace("\\", "/") == "preprocessed/_unscoped/scan.md"
+    assert out_path.parent == (
+        Path(os.getenv("PREPROCESSED_DIR")) / "_unscoped"
+    ).resolve()
     assert out_path.name == "scan.md"
     assert out_path.read_text() == "# title\n\nbody text"
     assert out["already_exists"] is False
@@ -90,8 +93,8 @@ def test_preprocess_preserves_relative_path_arg(tmp_path):
     with patch("docprep.entrypoint.convert", return_value=_fake_result()):
         out = json.loads(_call(preprocess_document, path="originals/nested/doc.docx"))
 
-    assert out["output_path"].replace("\\", "/").endswith("preprocessed/doc.md")
-    assert (Path(os.getenv("PREPROCESSED_DIR")) / "doc.md").exists()
+    assert out["output_path"].replace("\\", "/").endswith("preprocessed/_unscoped/doc.md")
+    assert (Path(os.getenv("PREPROCESSED_DIR")) / "_unscoped" / "doc.md").exists()
 
 
 # --------------------------------------------------------------------------
@@ -100,7 +103,8 @@ def test_preprocess_preserves_relative_path_arg(tmp_path):
 def test_preprocess_noop_when_md_exists(tmp_path):
     src = Path(os.getenv("ORIGINALS_DIR")) / "scan.pdf"
     src.write_bytes(b"%PDF-1.4 fake")
-    out_dir = Path(os.getenv("PREPROCESSED_DIR"))
+    out_dir = Path(os.getenv("PREPROCESSED_DIR")) / "_unscoped"
+    out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "scan.md").write_text("old markdown", encoding="utf-8")
 
     with patch("docprep.entrypoint.convert") as fake:
@@ -116,7 +120,8 @@ def test_preprocess_noop_when_md_exists(tmp_path):
 def test_preprocess_overwrite_replaces_existing(tmp_path):
     src = Path(os.getenv("ORIGINALS_DIR")) / "scan.pdf"
     src.write_bytes(b"%PDF-1.4 fake")
-    out_dir = Path(os.getenv("PREPROCESSED_DIR"))
+    out_dir = Path(os.getenv("PREPROCESSED_DIR")) / "_unscoped"
+    out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "scan.md").write_text("old markdown", encoding="utf-8")
 
     with patch("docprep.entrypoint.convert", return_value=_fake_result("new")):
@@ -153,7 +158,9 @@ def test_preprocess_unsupported_format(tmp_path):
     assert "error" in out
     assert "unsupported" in out["error"]
     # No .md written on failure.
-    assert not (Path(os.getenv("PREPROCESSED_DIR")) / "weird.md").exists()
+    assert not (
+        Path(os.getenv("PREPROCESSED_DIR")) / "_unscoped" / "weird.md"
+    ).exists()
 
 
 def test_preprocess_docprep_not_installed(tmp_path):

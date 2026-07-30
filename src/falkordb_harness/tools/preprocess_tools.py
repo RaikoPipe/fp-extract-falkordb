@@ -4,8 +4,10 @@
 ``src/document-to-markdown``). It converts a single raw source file — scanned
 PDF, image, Excel chart, office format — to Markdown using the docprep
 pipeline (Docling + EasyOCR + optional VLM fallback), and writes the result
-into ``PREPROCESSED_DIR`` so the ingest tools (``chunk_documents`` /
-``extract_and_write``, which default to ``PREPROCESSED_DIR``) pick it up.
+into ``preprocessed/<thread_id>/`` so the ingest tools (``chunk_documents`` /
+``extract_and_write``, which default to the ``preprocessed/`` tree) pick it
+up. The per-session subdirectory mirrors the document registry's ``threadId``
+discrimination so the agent's filesystem view exposes session ownership.
 
 The tool resolves input paths through the shared ``FilesystemBackend`` rooted
 at ``DATA_DIR`` (see :mod:`falkordb_harness.tools._paths`), so both the
@@ -29,9 +31,26 @@ from langchain_core.tools import tool
 from falkordb_harness.tools._paths import (
     fs_backend as _fs_backend,  # noqa: F401  (imported to clear lru_cache in tests)
 )
-from falkordb_harness.tools._paths import preprocessed_dir, virtual_path
+from falkordb_harness.tools._paths import thread_preprocessed_dir, virtual_path
 from falkordb_harness.tools._paths import resolve as _resolve
 from falkordb_harness.tools._retry import with_retry
+
+
+def _current_thread_id() -> str | None:
+    """Return the current Chainlit thread id, or ``None`` outside Chainlit.
+
+    ``preprocess_document`` is a sync ``@tool`` that runs inside the agent's
+    tool coroutine, where ``cl.context.session.thread_id`` is available when
+    invoked from the Chainlit UI. Mirrors ``ingest_runner._session_thread_id``
+    so the preprocessed output lands in ``preprocessed/<thread_id>/`` and the
+    agent's filesystem view exposes session ownership directly.
+    """
+    try:
+        import chainlit as cl
+
+        return cl.context.session.thread_id  # type: ignore[no-any-return]
+    except Exception:  # noqa: BLE001 — not in a Chainlit context
+        return None
 
 
 @tool
@@ -129,7 +148,7 @@ def _preprocess_document_impl(path: str, yaml_path: str, overwrite: bool) -> str
     if not resolved.exists() or not resolved.is_file():
         return json.dumps({"error": f"File not found: {path}"}, ensure_ascii=False)
 
-    out_dir = preprocessed_dir()
+    out_dir = thread_preprocessed_dir(_current_thread_id())
     out_path = out_dir / (resolved.stem + ".md")
     # Root-relative virtual path so the agent can feed output_path straight
     # back into read_excerpt / file_metadata (which resolve under DATA_DIR).

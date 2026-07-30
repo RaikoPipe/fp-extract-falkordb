@@ -58,3 +58,15 @@ all_tools = [
     reset_graph,
     use_graph,
 ]
+
+
+def all_tools_for_role(role: str) -> list:
+    """Return the tool list scoped to the user's role.
+
+    The destructive ``reset_graph`` tool is only available to admins.
+    Every other tool (including ``use_graph``, which is already scoped to
+    the user's enabled graph set) is available to all authenticated users.
+    """
+    if role == "admin":
+        return all_tools
+    return [t for t in all_tools if t.name != "reset_graph"]

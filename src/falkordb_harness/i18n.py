@@ -304,11 +304,6 @@ STRINGS: dict[str, dict[str, str]] = {
         "de": "(durch Fehler unterbrochen)",
     },
 
-    # --- ElementSidebar schema title (chainlit_app.py) --------------------
-    "sidebar.schema.title": {
-        "en": "Schema — {active}",
-        "de": "Schema — {active}",
-    },
     # --- Document manager sidebar title (chainlit_app.py) -----------------
     "sidebar.title": {
         "en": "Documents — {active}",
@@ -329,6 +324,10 @@ STRINGS: dict[str, dict[str, str]] = {
     "doc.action.open.tooltip": {
         "en": "Preview this document inline",
         "de": "Dieses Dokument als Vorschau öffnen",
+    },
+    "doc.action.open.disabled_tooltip": {
+        "en": "Inline preview isn't available for this file type. Preprocess it to Markdown first.",
+        "de": "Für diesen Dateityp ist keine Vorschau verfügbar. Bitte zuerst nach Markdown vorverarbeiten.",
     },
     "doc.action.preprocess.label": {"en": "Preprocess", "de": "Vorverarbeiten"},
     "doc.action.preprocess.tooltip": {
@@ -351,6 +350,10 @@ STRINGS: dict[str, dict[str, str]] = {
     "doc.open.ingested_hint": {
         "en": "Ingested files live in the knowledge graph. Ask the assistant to read an excerpt via the chat.",
         "de": "Ingestierte Dateien liegen im Wissensgraphen. Bitte die Assistentin im Chat, einen Auszug zu lesen.",
+    },
+    "doc.open.unsupported": {
+        "en": "Inline preview isn't available for **{name}**. Preprocess it to Markdown first, then open the result.",
+        "de": "Für **{name}** ist keine Vorschau verfügbar. Bitte zuerst nach Markdown vorverarbeiten und dann das Ergebnis öffnen.",
     },
     "doc.open.success": {
         "en": "Showing **{name}**.",

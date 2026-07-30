@@ -588,3 +588,90 @@ def test_build_agent_without_graph_config_uses_module_backend():
     assert harness_backend._SESSION_BACKEND.get() is None
 
     harness_backend.reset_backend_cache()
+
+
+# ---------------------------------------------------------------------------
+# Agent builder: per-session thread id surfaced in the prompt preamble
+# ---------------------------------------------------------------------------
+def test_build_agent_preamble_surfaces_thread_id():
+    """build_agent with thread_id in the configurable must include the session
+    id in the prompt preamble so the agent knows its on-disk subdirectory."""
+    from falkordb_harness import agent as agent_mod
+    from falkordb_harness import backend as harness_backend
+
+    harness_backend.clear_session_backend()
+
+    captured: dict = {}
+    fake_agent = MagicMock(name="agent")
+    fake_agent.checkpointer = None
+
+    def fake_build(model, tools, system_prompt, backend, **kwargs):  # noqa: ANN001
+        captured["system_prompt"] = system_prompt
+        return fake_agent
+
+    with patch.object(agent_mod, "resolve_model", return_value=MagicMock()), \
+         patch.object(agent_mod, "create_deep_agent", side_effect=fake_build), \
+         patch.object(agent_mod, "FilesystemBackend", return_value=MagicMock()):
+        agent_mod.build_agent(
+            {
+                "configurable": {
+                    "active_graph": "g1",
+                    "allowed_graphs": ["g1"],
+                    "thread_id": "thread-abc-123",
+                }
+            }
+        )
+
+    assert "SESSION FILE ISOLATION" in captured["system_prompt"]
+    assert "Your current session id is 'thread-abc-123'" in captured["system_prompt"]
+    assert "originals/thread-abc-123/" in captured["system_prompt"]
+
+    harness_backend.clear_session_backend()
+
+
+def test_build_agent_preamble_thread_id_none_refers_to_unscoped():
+    """build_agent with thread_id=None (CLI) must tell the agent that
+    _unscoped/ files belong to no session."""
+    from falkordb_harness import agent as agent_mod
+    from falkordb_harness import backend as harness_backend
+
+    harness_backend.clear_session_backend()
+    harness_backend.reset_backend_cache()
+
+    captured: dict = {}
+    fake_agent = MagicMock(name="agent")
+    fake_agent.checkpointer = None
+
+    def fake_build(model, tools, system_prompt, backend, **kwargs):  # noqa: ANN001
+        captured["system_prompt"] = system_prompt
+        return fake_agent
+
+    with patch.object(agent_mod, "resolve_model", return_value=MagicMock()), \
+         patch.object(agent_mod, "create_deep_agent", side_effect=fake_build), \
+         patch.object(agent_mod, "FilesystemBackend", return_value=MagicMock()):
+        agent_mod.build_agent(
+            {"configurable": {"active_graph": "g1", "allowed_graphs": ["g1"], "thread_id": None}}
+        )
+
+    assert "No session id is set" in captured["system_prompt"]
+    assert "originals/_unscoped/" in captured["system_prompt"]
+
+    harness_backend.reset_backend_cache()
+
+
+def test_build_graph_context_prefix_thread_id_only():
+    """The preamble emits the session id even without a graph selection
+    (e.g. CLI with a thread context but no graph pick)."""
+    from falkordb_harness.agent import _build_graph_context_prefix
+
+    prefix = _build_graph_context_prefix(None, None, thread_id="t-9")
+    assert "Your current session id is 't-9'" in prefix
+    assert "originals/t-9/" in prefix
+
+
+def test_build_graph_context_prefix_no_context_empty():
+    """No active graph, no allowed graphs, no thread id -> empty preamble
+    (preserves the original CLI prompt unchanged)."""
+    from falkordb_harness.agent import _build_graph_context_prefix
+
+    assert _build_graph_context_prefix(None, None, thread_id=None) == ""

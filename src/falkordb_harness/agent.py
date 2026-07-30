@@ -24,7 +24,7 @@ from langgraph.graph.message import MessagesState
 from langgraph.types import Checkpointer
 
 from falkordb_harness._loop_guard import RepeatGuardMiddleware
-from falkordb_harness.tools import all_tools
+from falkordb_harness.tools import all_tools_for_role
 
 # Default recursion limit for the agent graph. LangGraph's built-in default
 # (25) is too low for the tool-heavy PRE-INGESTION REVIEW ROUTINE, which can
@@ -167,26 +167,54 @@ nodes (reconcile_posthoc)
 - Ask the user a clarifying question (ask_user) or request explicit \
 confirmation before ingestion (request_ingestion_confirmation)
 
+SESSION FILE ISOLATION (mandatory):
+Raw sources and preprocessed Markdown are stored on disk under per-session \
+subdirectories named after the current Chainlit thread id:
+  - ``originals/<session_id>/<name>``   — raw uploaded sources
+  - ``preprocessed/<session_id>/<name>`` — docprep Markdown output
+``<session_id>`` is YOUR current session id, given in the preamble below. \
+Files under ``originals/<session_id>/`` and ``preprocessed/<session_id>/`` \
+belong to THIS session and you may freely inspect, preprocess, and ingest them.
+Rules:
+- Only operate on files under YOUR session's subdirectory unless the user \
+explicitly references a file from another session by name or path. Do NOT \
+read, preprocess, or ingest files from another session's subdirectory on \
+your own initiative, even if they look relevant.
+- ``originals/_unscoped/`` and ``preprocessed/_unscoped/`` belong to no \
+session (CLI / pre-session uploads). Touch them only when the user \
+explicitly references them.
+- Ingested files are graph-scoped (cross-session), tracked in the registry \
+under a graph name rather than a thread. Query them via the graph tools \
+(cypher_query, nl_query, fulltext_search, vector_search, list_nodes) — do \
+NOT reach into another session's directory to inspect an already-ingested \
+file. The registry's ``originalPath``/``preprocessedPath`` columns on \
+ingested rows are provenance only and may point at a different session's \
+directory; treat them as metadata, not as files to open.
+
 PRE-INGESTION REVIEW ROUTINE (mandatory before extract_and_write):
 This routine is a soft guardrail that prevents large amounts of data noise from \
 entering the knowledge graph. Follow it every time the user asks to ingest from \
 a directory or names files to ingest.
-1. DISCOVER: call ls (or glob) on the ``originals/`` directory to list \
-candidate files. The filesystem root is DATA_DIR; both ``originals/`` (raw \
-uploaded sources) and ``preprocessed/`` (Markdown output) are visible under it.
+1. DISCOVER: call ls (or glob) on ``originals/<session_id>/`` to list \
+candidate files for THIS session. The filesystem root is DATA_DIR; both \
+``originals/`` (raw uploaded sources) and ``preprocessed/`` (Markdown output) \
+are visible under it, each containing one subdirectory per session. Only \
+consider files under your own ``<session_id>`` subdirectory unless the user \
+explicitly asks for files from another session.
 2. METADATA: call file_metadata on each candidate file (or a representative \
 sample if there are many) to get size, type, page/char/word counts. Pass \
-paths as ``originals/<name>``.
+paths as ``originals/<session_id>/<name>``.
 3. EXCERPT: call read_excerpt on a FEW small slices per file — e.g. the first \
 lines (text) or pages 1, 3, and the last page (PDF/DOCX) — enough to understand \
 the content, not the whole file. Avoid dumping large bodies into context.
 3b. PREPROCESS (when needed): if a file is a scanned PDF, image, Excel with \
 charts, or any binary format where read_excerpt returned garbage, placeholders, \
 or low text density, call preprocess_document(path) to convert it to Markdown \
-in the ``preprocessed/`` tree. Do NOT preprocess plain .txt/.md sources — they \
-are already LLM-ready and preprocessing them wastes a VLM call. After \
-preprocessing, call read_excerpt on the ``output_path`` the tool returned \
-(e.g. ``preprocessed/<stem>.md``) to verify the conversion before extraction.
+in the ``preprocessed/<session_id>/`` tree. Do NOT preprocess plain .txt/.md \
+sources — they are already LLM-ready and preprocessing them wastes a VLM \
+call. After preprocessing, call read_excerpt on the ``output_path`` the tool \
+returned (e.g. ``preprocessed/<session_id>/<stem>.md``) to verify the \
+conversion before extraction.
 4. SUMMARIZE: report back to the user, in plain prose, what each file contains:
    - file name, type, size, page/line count
    - a 1-3 sentence content description per file
@@ -201,7 +229,9 @@ must wait for confirmation.
 6. PROCEED: only after explicit user confirmation, call extract_and_write. \
 extract_and_write reads from the ``preprocessed/`` tree by default; only point \
 it at ``originals/`` if the user explicitly wants to ingest raw text sources \
-directly.
+directly. When passing a data_dir to extract_and_write/chunk_documents, prefer \
+your session's subdirectory (``preprocessed/<session_id>``) so you do not \
+pick up another session's files.
 Err on the side of showing the user too much summary rather than too little.
 
 Guidelines:
@@ -224,15 +254,20 @@ listing. Do NOT claim no graphs exist just because the active graph is empty.
 def _build_graph_context_prefix(
     active_graph: str | None,
     allowed_graphs: list[str] | None,
+    thread_id: str | None = None,
 ) -> str:
     """Build the dynamic preamble appended to SYSTEM_PROMPT for graph selection.
 
     Tells the agent which graph is active and which graphs are in scope, so it
     can answer "which KGs are available?" without falling back to node_count
-    on the bound graph. Returns an empty string when no per-session selection
-    is configured (the CLI / default path), preserving the original prompt.
+    on the bound graph. Also surfaces the current session (Chainlit thread)
+    id so the agent knows which per-session on-disk subdirectory
+    (``originals/<thread_id>/`` / ``preprocessed/<thread_id>/``) is its own —
+    this drives the SESSION FILE ISOLATION rule in SYSTEM_PROMPT. Returns an
+    empty string when no per-session selection is configured (the CLI /
+    default path), preserving the original prompt.
     """
-    if not active_graph and not allowed_graphs:
+    if not active_graph and not allowed_graphs and not thread_id:
         return ""
     parts: list[str] = [
         "",
@@ -252,6 +287,19 @@ def _build_graph_context_prefix(
         "enabled names. The user selected these via the UI; do not question "
         "or expand the set."
     )
+    if thread_id:
+        parts.append(
+            f"- Your current session id is '{thread_id}'. Only files under "
+            f"originals/{thread_id}/ and preprocessed/{thread_id}/ belong to "
+            f"this session; do not touch other sessions' files unless the "
+            f"user explicitly references them."
+        )
+    else:
+        parts.append(
+            "- No session id is set (CLI / pre-session). Files under "
+            "originals/_unscoped/ and preprocessed/_unscoped/ belong to no "
+            "session; touch them only when the user explicitly references them."
+        )
     parts.append("")
     return "\n".join(parts)
 
@@ -457,6 +505,12 @@ def build_agent(
     active_graph: str | None = configurable.get("active_graph")
     allowed_graphs_raw = configurable.get("allowed_graphs")
     allowed_graphs: list[str] | None = None
+    # Per-session thread id (Chainlit) surfaced to the prompt so the agent
+    # knows which originals/<thread_id>/ and preprocessed/<thread_id>/
+    # subdirectories are its own (SESSION FILE ISOLATION in SYSTEM_PROMPT).
+    # None in the CLI / pre-session path; the preamble then refers to
+    # originals/_unscoped/.
+    thread_id: str | None = configurable.get("thread_id")
     if isinstance(allowed_graphs_raw, (list, tuple)):
         allowed_graphs = [str(g) for g in allowed_graphs_raw if g]
 
@@ -478,14 +532,21 @@ def build_agent(
         set_session_backend(session_backend)
 
     system_prompt = SYSTEM_PROMPT + _build_graph_context_prefix(
-        active_graph, allowed_graphs
+        active_graph, allowed_graphs, thread_id
     )
+
+    # Role-based tool gating: the destructive reset_graph tool is only
+    # exposed to admins. The CLI path (no role in config) defaults to
+    # admin so local development isn't hobbled; the Chainlit layer passes
+    # the authenticated user's role through the configurable.
+    role = configurable.get("role") or "admin"
+    tools = all_tools_for_role(role)
 
     data_dir = Path(os.getenv("DATA_DIR", "./data")).resolve()
     backend = FilesystemBackend(root_dir=str(data_dir), virtual_mode=True)
     agent = create_deep_agent(
         model=llm,
-        tools=all_tools,
+        tools=tools,
         system_prompt=system_prompt,
         backend=backend,
         middleware=[RepeatGuardMiddleware()],

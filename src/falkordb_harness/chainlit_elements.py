@@ -279,26 +279,6 @@ def build_ingestion_summary_plot(summary: dict):
     )
 
 
-def build_schema_card_props(raw_output: str) -> dict | None:
-    """Shape ``get_schema`` JSON output into props for the SchemaBrowser card.
-
-    Returns ``{"labels", "relationship_types", "property_keys"}`` lists, or
-    ``None`` if the output isn't a schema dict. Counts are not available from
-    ``get_schema_info`` (which only lists names) so they are omitted.
-    """
-    data = _try_parse_json(raw_output if isinstance(raw_output, str) else str(raw_output))
-    if not isinstance(data, dict):
-        return None
-    labels = data.get("labels") or data.get("node_labels") or []
-    rels = data.get("relationship_types") or data.get("relationships") or []
-    props = data.get("property_keys") or data.get("properties") or []
-    return {
-        "labels": [{"name": str(l)} for l in labels],
-        "relationship_types": [{"name": str(r)} for r in rels],
-        "property_keys": [str(p) for p in props],
-    }
-
-
 def build_source_elements(raw_output: str, data_dir: Path):
     """Return Pdf/Image/Text elements for ``preprocess_document`` / ``read_excerpt``.
 
@@ -477,7 +457,6 @@ __all__ = [
     "build_label_distribution_plot",
     "build_rel_distribution_plot",
     "build_result_dataframe",
-    "build_schema_card_props",
     "build_search_score_plot",
     "build_source_elements",
     "build_source_elements_from_row",

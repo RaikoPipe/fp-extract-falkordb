@@ -28,7 +28,6 @@ from falkordb_harness.chainlit_elements import (
     build_label_distribution_plot,
     build_rel_distribution_plot,
     build_result_dataframe,
-    build_schema_card_props,
     build_search_score_plot,
     build_source_elements,
     build_source_elements_from_row,
@@ -46,13 +45,18 @@ from falkordb_harness.stream_recovery import (
     register_stream,
     replay_inflight_stream,
 )
-from falkordb_harness.tools._paths import originals_dir, preprocessed_dir
+from falkordb_harness.tools._paths import (
+    originals_dir,
+    preprocessed_dir,
+    thread_originals_dir,
+)
 
 load_dotenv(override=True)
 
-# Uploaded raw files land in ORIGINALS_DIR (default: ./data/originals).
-# Falls back to the legacy ./data/uploads path only when ORIGINALS_DIR is
-# unset, preserving the previous behaviour for users who never set it.
+# Uploaded raw files land in ORIGINALS_DIR (default: ./data/originals), under
+# a per-session subdirectory named after the Chainlit thread id. The parent
+# roots are kept for the agent's filesystem tools (rooted at DATA_DIR) and
+# for any path that needs the top-level tree rather than a session subdir.
 ORIGINALS_DIR = originals_dir()
 # Markdown output tree is auto-created so the agent's filesystem tools can
 # ls/glob into it on the very first turn (previously it was created lazily
@@ -123,18 +127,28 @@ def _data_layer():
 
 @cl.on_app_startup
 async def _on_app_startup() -> None:
-    """Initialize the persistence schema and mount the /register route.
+    """Initialize the persistence schema and mount the auth routes.
 
     Runs once when the Chainlit server starts (inside its lifespan
-    handler). Two jobs:
+    handler). Jobs:
 
     1. Create the Chainlit tables (users/threads/steps/elements/feedbacks)
        in the SQLite database if missing — Chainlit's SQLAlchemy layer
        does not auto-create them. Idempotent.
-    2. Register the custom ``/register`` FastAPI route and the
-       ``/public/elements`` static mount on Chainlit's app so users can
-       self-register and so persisted uploaded-file blobs are served.
+    2. Register the custom auth routes (register, verify-email, password
+       reset, admin UI) and the ``/public/elements`` static mount.
+    3. Migrate legacy pre-auth accounts (no password hash) into a disabled
+       state so they can't be accidentally approved into a passwordless
+       active state.
+    4. Bootstrap the first admin account from FIRST_ADMIN_* env vars
+       (idempotent) so an operator can provision the initial admin without
+       pre-existing credentials.
     """
+    from falkordb_harness.auth import (
+        bootstrap_admin_from_env,
+        migrate_legacy_accounts,
+    )
+
     layer = build_data_layer()
     try:
         await init_db(layer)
@@ -143,7 +157,15 @@ async def _on_app_startup() -> None:
     try:
         register_routes()
     except Exception as exc:  # noqa: BLE001 — never block server startup
-        logger.error("Could not register /register route: %s", exc)
+        logger.error("Could not register auth routes: %s", exc)
+    try:
+        await migrate_legacy_accounts()
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Could not migrate legacy accounts: %s", exc)
+    try:
+        await bootstrap_admin_from_env()
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Could not bootstrap admin account: %s", exc)
 
 
 def _list_available_graphs() -> list[str]:
@@ -366,16 +388,35 @@ def _rebuild_agent_for_selection(
     """Rebuild the agent bound to the user's graph selection and stash it.
 
     Constructs the deep agent with a ``configurable`` carrying the active +
-    allowed graphs; :func:`build_agent` installs a per-session backend bound
-    to ``active_graph`` and restricted to ``allowed_graphs``.
+    allowed graphs and the current Chainlit thread id; :func:`build_agent`
+    installs a per-session backend bound to ``active_graph`` and restricted
+    to ``allowed_graphs``, and surfaces the thread id in the prompt so the
+    agent knows its own per-session on-disk subdirectory.
     """
     from falkordb_harness.agent import build_agent
+
+    try:
+        thread_id = cl.context.session.thread_id
+    except Exception:  # noqa: BLE001 — older Chainlit / no context
+        thread_id = None
+
+    # Role-based tool gating: only admins get the destructive reset_graph
+    # tool. The authenticated user's role is stashed in user_session by
+    # on_chat_start/on_chat_resume (read from cl.context.session.user,
+    # whose metadata carries 'role' from verify_credentials). Default to
+    # 'user' when the role can't be determined (defense in depth).
+    current_user = cl.user_session.get("user")
+    role = "user"
+    if current_user is not None:
+        role = getattr(current_user, "metadata", {}).get("role") or "user"
 
     agent = build_agent(
         {
             "configurable": {
                 "active_graph": active_graph,
                 "allowed_graphs": allowed_graphs,
+                "thread_id": thread_id,
+                "role": role,
             }
         }
     )
@@ -559,6 +600,14 @@ async def on_chat_start() -> None:
     # Default node-label filter (Tags widget in the Graph tab). Empty by
     # default; the agent reads it as a UI hint when browsing nodes.
     cl.user_session.set("label_filter", [])
+    # Whether the persistent "open document sidebar" floating button has
+    # been sent this session. The button is NOT sent during on_chat_start so
+    # the starter/startup screen is preserved (sending any chat message
+    # transitions Chainlit's frontend out of the starter view). It is sent
+    # lazily — on the first on_message / on_settings_update where there are
+    # documents to show (see _maybe_send_open_docs_button) — and then stays
+    # for the rest of the session.
+    cl.user_session.set("open_docs_button_sent", False)
     # Install the interactive UI prompt callback so the agent's
     # request_ingestion_confirmation / ask_user tools emit Chainlit
     # AskActionMessage / AskUserMessage prompts (and block until the user
@@ -568,13 +617,14 @@ async def on_chat_start() -> None:
     set_ui_callback(_ui_prompt_callback)
 
     # Seed the sidebar with whatever documents are already tracked for
-    # this thread / active graph (empty on a fresh chat).
+    # this thread / active graph (empty on a fresh chat). The sidebar is
+    # opened via ElementSidebar.set_elements (not a chat message), so it
+    # does NOT transition the frontend out of the starter screen.
     await _refresh_sidebar()
-    # Pin the persistent "open document sidebar" button to the viewport.
-    # Re-sent on every chat start (and resume) so it survives new chats /
-    # thread switches. The JSX uses position:fixed, so it stays visible
-    # regardless of chat scroll.
-    await _send_open_docs_button()
+    # NOTE: _send_open_docs_button() is intentionally NOT called here.
+    # Sending it would emit an assistant chat message, swapping the
+    # startup/starter screen for an empty active chat. The button is
+    # injected lazily on the first user turn where documents exist.
 
 
 @cl.on_chat_resume
@@ -677,8 +727,13 @@ async def on_chat_resume(thread: ThreadDict) -> None:
     # — so it lands after the resume_thread socket event.
     asyncio.create_task(_refresh_sidebar())
     # Re-pin the persistent "open document sidebar" button for the resumed
-    # thread (same rationale as on_chat_start).
+    # thread. A resumed thread is always an active chat (it has persisted
+    # messages), so there is no starter/startup screen to disturb — sending
+    # the button here does NOT swap any startup view.
     asyncio.create_task(_send_open_docs_button())
+    # Mark the button as sent so on_message's _maybe_send_open_docs_button
+    # guard doesn't re-send it on the next turn of this resumed thread.
+    cl.user_session.set("open_docs_button_sent", True)
 
 
 @cl.on_settings_update
@@ -773,6 +828,10 @@ async def on_settings_update(settings: dict) -> None:
                 allowed=", ".join(allowed),
             ),
         ).send()
+        # A freshly created graph has no ingested rows, but the thread may
+        # already have uploads — lazily inject the floating Documents button
+        # if there's now something to show.
+        await _maybe_send_open_docs_button()
         return
 
     active, allowed = _normalize_selection(active_raw, allowed_raw)
@@ -788,6 +847,11 @@ async def on_settings_update(settings: dict) -> None:
     # Refresh the document sidebar so ingested rows for the newly-active
     # graph appear (and the previous graph's rows disappear).
     await _refresh_sidebar()
+    # The graph switch may have brought ingested rows into view (or the
+    # first message of a session against a populated graph happens here
+    # before any on_message). Lazily inject the floating Documents button
+    # if there's now something to show and it hasn't been sent yet.
+    await _maybe_send_open_docs_button()
 
 
 @cl.action_callback("ingest_documents")
@@ -1015,28 +1079,16 @@ async def _collect_visual_elements(
         logger.debug("visual element build failed for %s: %s", tool_name, exc)
 
 
-async def _pin_schema_sidebar(schema_raw: str) -> None:
-    """Pin the current graph schema to the Chainlit ElementSidebar.
-
-    Stores the raw schema in ``cl.user_session`` so the unified
-    :func:`_refresh_sidebar` can re-include it alongside the document
-    manager (both share the single ElementSidebar slot — ``set_elements``
-    replaces the full list, so they must be composed together). Then
-    triggers a sidebar refresh.
-    """
-    cl.user_session.set("last_schema_raw", schema_raw)
-    await _refresh_sidebar()
-
-
 async def _refresh_sidebar() -> None:
-    """Re-render the ElementSidebar with the document manager + schema.
+    """Re-render the ElementSidebar with the document manager.
 
-    Single source of truth for the sidebar's content. Composes:
-    1. A ``DocumentManager`` CustomElement built from the document
-       registry — uploaded + preprocessed rows for the current thread and
-       ingested rows for the active graph.
-    2. A ``SchemaBrowser`` (Text fallback + CustomElement) when a schema
-       was fetched this session (stored in ``last_schema_raw``).
+    Single source of truth for the sidebar's content. Builds a
+    ``DocumentManager`` CustomElement from the document registry — uploaded
+    + preprocessed rows for the current thread and ingested rows for the
+    active graph. The schema-browser feature that previously shared this
+    slot has been retracted (it conflicted with the document manager in the
+    single ``set_elements`` slot); the schema remains viewable via the
+    agent's ``get_schema`` tool output in its Step panel.
 
     Uses a stable ``key="main"`` so the sidebar isn't needlessly re-keyed.
     On any failure (older Chainlit without ElementSidebar, registry error)
@@ -1060,30 +1112,6 @@ async def _refresh_sidebar() -> None:
                 logger.debug("DocumentManager CustomElement build failed: %s", exc)
     except Exception as exc:  # noqa: BLE001
         logger.debug("document manager props failed: %s", exc)
-
-    # --- Schema browser (re-include so set_elements doesn't wipe it) ---
-    schema_raw = cl.user_session.get("last_schema_raw")
-    if schema_raw:
-        try:
-            props = build_schema_card_props(schema_raw)
-            if props is not None:
-                try:
-                    elements.append(
-                        cl.CustomElement(name="SchemaBrowser", props=props)
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("CustomElement build failed: %s", exc)
-            try:
-                from falkordb_harness.chainlit_formatting import format_tool_output
-
-                rendered = format_tool_output("get_schema", schema_raw)
-                elements.append(
-                    cl.Text(name="Schema", content=rendered, display="side")
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("schema Text fallback failed: %s", exc)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("schema props build failed: %s", exc)
 
     if not elements:
         return
@@ -1130,14 +1158,46 @@ async def _send_open_docs_button() -> None:
         logger.debug("OpenDocsButton send failed: %s", exc)
 
 
+async def _maybe_send_open_docs_button() -> None:
+    """Send the floating Documents button iff there are documents to show.
+
+    Guards the once-per-session ``open_docs_button_sent`` flag so the button
+    is injected at most once, and only when the document sidebar would have
+    content (uploaded/preprocessed rows for this thread OR ingested rows for
+    the active graph). Reuses :func:`_build_document_manager_props` as the
+    "is there anything to show?" predicate. Once sent, the flag stays True
+    for the rest of the session — the button persists even if the user
+    later switches to an empty graph (toggling visibility would flicker;
+    reopening an empty sidebar is an acceptable minor state).
+
+    Called from:
+    - :func:`on_message` (first user turn where docs exist)
+    - :func:`on_settings_update` (graph switch to a populated graph)
+
+    NOT called from :func:`on_chat_start` — sending it there would emit a
+    chat message and swap the starter/startup screen for an empty chat.
+    """
+    try:
+        import chainlit as cl
+    except ImportError:
+        return
+    if cl.user_session.get("open_docs_button_sent"):
+        return
+    props = await _build_document_manager_props()
+    if props is None:
+        return
+    await _send_open_docs_button()
+    cl.user_session.set("open_docs_button_sent", True)
+
+
 @cl.action_callback("open_document_sidebar")
 async def on_open_document_sidebar(action: Action) -> None:
     """Re-open the ElementSidebar from the persistent OpenDocsButton.
 
     Re-runs :func:`_refresh_sidebar`, which re-pushes the current
-    DocumentManager + SchemaBrowser elements (Chainlit's
-    ``set_elements`` re-opens the sidebar). No-op when there are no
-    documents / schema to show (``_refresh_sidebar`` returns early).
+    DocumentManager element (Chainlit's ``set_elements`` re-opens the
+    sidebar). No-op when there are no documents to show (``_refresh_sidebar``
+    returns early).
     """
     await _refresh_sidebar()
 
@@ -1181,6 +1241,27 @@ async def on_open_document(action: Action) -> None:
     if row.get("stage") == STAGE_INGESTED:
         await cl.Message(content=t("doc.open.ingested_hint")).send()
         return
+
+    # Defense-in-depth: the JSX disables the Open button for rows the
+    # backend can't render (no preprocessed Markdown + an original whose
+    # extension build_source_elements_from_row doesn't handle, e.g. an
+    # uploaded .pptx). An older cached JSX could still fire the action, so
+    # short-circuit with a clear message instead of falling through to the
+    # generic "file not found on disk" error (the file IS on disk — it just
+    # has no inline view). Mirrors the _VIEWABLE_ORIG_EXTS set computed in
+    # _build_document_manager_props.
+    if not row.get("preprocessedPath"):
+        from pathlib import Path as _Path
+
+        from falkordb_harness.chainlit_elements import _IMAGE_EXTS
+        from falkordb_harness.ingest_runner import _PLAIN_EXTS
+
+        _orig_ext = _Path(row.get("originalPath") or row.get("name") or "").suffix.lower()
+        if _orig_ext not in _IMAGE_EXTS | _PLAIN_EXTS | {".pdf"}:
+            await cl.Message(
+                content=t("doc.open.unsupported", name=row.get("name") or "")
+            ).send()
+            return
 
     elements = build_source_elements_from_row(row, data_dir())
     if not elements:
@@ -1229,7 +1310,8 @@ async def on_preprocess_document(action: Action) -> None:
         ).send()
         return
 
-    from falkordb_harness.tools._paths import resolve as _resolve, virtual_path
+    from falkordb_harness.tools._paths import resolve as _resolve
+    from falkordb_harness.tools._paths import virtual_path
 
     resolved = _resolve(original_path)
     if isinstance(resolved, str):
@@ -1334,6 +1416,8 @@ async def on_delete_document(action: Action) -> None:
         return
     from falkordb_harness.document_registry import (
         IngestedDocumentNotDeletable,
+    )
+    from falkordb_harness.document_registry import (
         delete as registry_delete,
     )
 
@@ -1432,13 +1516,20 @@ async def _build_document_manager_props() -> dict | None:
     except ImportError:
         return None
 
+    from falkordb_harness.chainlit_elements import _IMAGE_EXTS
     from falkordb_harness.document_registry import (
         STAGE_INGESTED,
         STAGE_UPLOADED,
         list_for_graph,
         list_for_thread,
     )
-    from falkordb_harness.ingest_runner import _needs_preprocessing
+    from falkordb_harness.ingest_runner import _PLAIN_EXTS, _needs_preprocessing
+
+    # Extensions the "Open" button can render inline without a preprocessed
+    # Markdown fallback (mirrors build_source_elements_from_row in
+    # chainlit_elements.py: PDF, images, plain text). Kept here so the JSX
+    # gating matches backend capability without coupling the two modules.
+    _VIEWABLE_ORIG_EXTS = _IMAGE_EXTS | _PLAIN_EXTS | {".pdf"}
 
     try:
         thread_id = cl.context.session.thread_id
@@ -1460,12 +1551,21 @@ async def _build_document_manager_props() -> dict | None:
     # Trim to the fields the JSX component renders. ``canPreprocess`` is
     # True only for uploaded originals whose extension is non-plain-text
     # (preprocessed rows are already Markdown; ingested rows are permanent).
+    # ``canOpen`` is True when the row has a viewable form: a preprocessed
+    # Markdown path, or an original whose extension build_source_elements_from_row
+    # can render (PDF / image / plain text). Ingested rows have neither and
+    # are gated off regardless (no thread-scoped preview file).
     documents = []
     for d in docs:
         stage = d.get("stage")
         name = d.get("name") or ""
         can_preprocess = stage == STAGE_UPLOADED and _needs_preprocessing(
             Path(name)
+        )
+        has_preprocessed = bool(d.get("preprocessedPath"))
+        original_ext = Path(d.get("originalPath") or name).suffix.lower()
+        can_open = stage != STAGE_INGESTED and (
+            has_preprocessed or original_ext in _VIEWABLE_ORIG_EXTS
         )
         documents.append(
             {
@@ -1477,11 +1577,13 @@ async def _build_document_manager_props() -> dict | None:
                 "ingestedAt": d.get("ingestedAt"),
                 "path": d.get("preprocessedPath") or d.get("originalPath"),
                 "canPreprocess": can_preprocess,
+                "canOpen": can_open,
                 "deletable": stage != STAGE_INGESTED,
             }
         )
     labels = {
         "open": t("doc.action.open.tooltip"),
+        "openDisabled": t("doc.action.open.disabled_tooltip"),
         "preprocess": t("doc.action.preprocess.tooltip"),
         "delete": t("doc.action.delete.tooltip"),
         "deleteConfirm": t("doc.action.delete.confirm"),
@@ -1503,6 +1605,13 @@ async def on_message(message: cl.Message) -> None:
     if session_backend is not None:
         set_session_backend(session_backend)
 
+    # Lazily inject the floating "Documents" button on the first user turn
+    # where there are documents to show (uploaded/preprocessed for this
+    # thread, or ingested for the active graph). Once sent it persists for
+    # the session. NOT sent during on_chat_start to preserve the starter
+    # screen (see _maybe_send_open_docs_button).
+    await _maybe_send_open_docs_button()
+
     agent = cl.user_session.get("agent")
     chat_history: list = cl.user_session.get("chat_history")
 
@@ -1521,7 +1630,12 @@ async def on_message(message: cl.Message) -> None:
         _user_id = cl.user_session.get("user_identifier")
         for element in message.elements:
             if hasattr(element, "path") and element.path:
-                dest = ORIGINALS_DIR / element.name
+                # Per-session subdirectory so the agent's ls/glob tools
+                # expose session ownership directly (mirrors the registry's
+                # threadId discrimination). _thread_id was read above; it is
+                # None only outside a Chainlit thread context (CLI path), in
+                # which case the file lands in originals/_unscoped/.
+                dest = thread_originals_dir(_thread_id) / element.name
                 shutil.copy2(element.path, dest)
                 # Root-relative virtual path under DATA_DIR so the agent's
                 # file_metadata / read_excerpt / ls tools (rooted at DATA_DIR)
@@ -1635,10 +1749,6 @@ async def on_message(message: cl.Message) -> None:
     # stream and attached to the final assistant message so the chat stays
     # compact — each tool's detailed output already lives in its Step panel.
     pending_elements: list = []
-    # Track whether the agent fetched the schema so we can (a) pin it to the
-    # ElementSidebar and (b) build a label-distribution chart if list_nodes
-    # ran too.
-    last_schema_raw: str | None = None
 
     agent_input = {"messages": chat_history + [HumanMessage(content=user_content)]}
     from langgraph.errors import GraphRecursionError
@@ -1776,10 +1886,6 @@ async def on_message(message: cl.Message) -> None:
                     await _collect_visual_elements(
                         tool_name, output, pending_elements
                     )
-                    if tool_name == "get_schema":
-                        last_schema_raw = (
-                            output if isinstance(output, str) else str(output)
-                        )
                     # Register preprocessed documents in the registry when
                     # the agent ran preprocess_document directly (not via
                     # the Ingest button / extract_and_write, which register
@@ -1868,12 +1974,6 @@ async def on_message(message: cl.Message) -> None:
             await response_msg.update()
         except Exception as exc:  # noqa: BLE001 — never break on element send
             logger.debug("element attach failed: %s", exc)
-
-    # If the agent fetched the schema, pin it to the ElementSidebar so it
-    # stays visible while the user queries. Refresh on every get_schema so
-    # a use_graph switch (which re-fetches) updates the pinned view.
-    if last_schema_raw is not None:
-        await _pin_schema_sidebar(last_schema_raw)
 
     chat_history.append(HumanMessage(content=user_content))
     chat_history.append(AIMessage(content=full_response))

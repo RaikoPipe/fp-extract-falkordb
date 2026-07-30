@@ -43,6 +43,14 @@ chainlit = [
     # async SQLite driver and the password-hashing lib are not.
     "aiosqlite>=0.19.0",
     "bcrypt>=4.0.0",
+    # Public-deployment auth: async SMTP for email verification / password
+    # reset / approval notifications; RFC-compliant email validation;
+    # per-IP/username rate limiting on auth endpoints; signed CSRF tokens
+    # for the server-rendered registration/reset/admin forms.
+    "aiosmtplib>=3.0.0",
+    "email-validator>=2.0.0",
+    "slowapi>=0.1.9",
+    "itsdangerous>=2.1.0",
 ]
 dev = [
     "pytest>=7.0.0",

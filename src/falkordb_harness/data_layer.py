@@ -118,17 +118,35 @@ class LocalStorageClient(BaseStorageClient):
 
 
 _DDL_STATEMENTS: tuple[str, ...] = (
-    # users — Chainlit's user table (identifier + metadata). We add a
-    # password_hash column for the app's own password auth (kept here so
-    # the auth module can use the same SQLite file without a second DB).
+    # users — Chainlit's user table (identifier + metadata). We extend it
+    # with columns for the app's own password auth, role-based access
+    # control, account lifecycle (email verification + admin approval),
+    # and password-reset / email-verification tokens. All added columns
+    # are nullable or have defaults so Chainlit's own queries (which only
+    # touch id/identifier/createdAt/metadata) keep working unchanged.
     """
     CREATE TABLE IF NOT EXISTS users (
         "id" TEXT PRIMARY KEY,
         "identifier" TEXT UNIQUE NOT NULL,
         "createdAt" TEXT NOT NULL,
         "metadata" TEXT DEFAULT '{}',
-        "passwordHash" TEXT
+        "passwordHash" TEXT,
+        "email" TEXT,
+        "role" TEXT NOT NULL DEFAULT 'user',
+        "accountStatus" TEXT NOT NULL DEFAULT 'pending',
+        "displayName" TEXT,
+        "emailVerifiedAt" TEXT,
+        "emailVerifyToken" TEXT,
+        "emailVerifyExpires" TEXT,
+        "passwordResetToken" TEXT,
+        "passwordResetExpires" TEXT
     )
+    """,
+    # Unique email index (partial — only enforced when email is set, so
+    # legacy/seed rows with NULL email don't collide).
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email
+        ON users ("email") WHERE "email" IS NOT NULL
     """,
     # threads — one row per chat thread, owned by a user.
     """
@@ -274,6 +292,19 @@ _MIGRATION_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # elements — to_dict doesn't emit 'path', but defensive in case a
     # future version does.
     ("elements", "path", "TEXT"),
+    # users — auth columns added for public-deployment account lifecycle
+    # (email verification + admin approval), role-based access control,
+    # and password-reset / email-verification tokens. Nullable/defaulted
+    # so pre-existing rows and Chainlit's own queries are unaffected.
+    ("users", "email", "TEXT"),
+    ("users", "role", "TEXT NOT NULL DEFAULT 'user'"),
+    ("users", "accountStatus", "TEXT NOT NULL DEFAULT 'pending'"),
+    ("users", "displayName", "TEXT"),
+    ("users", "emailVerifiedAt", "TEXT"),
+    ("users", "emailVerifyToken", "TEXT"),
+    ("users", "emailVerifyExpires", "TEXT"),
+    ("users", "passwordResetToken", "TEXT"),
+    ("users", "passwordResetExpires", "TEXT"),
 )
 
 

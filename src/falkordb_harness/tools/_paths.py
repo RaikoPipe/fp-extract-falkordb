@@ -15,10 +15,19 @@ recursion limit.
 Env vars:
 - ``DATA_DIR``: the single filesystem root (default ``./data``).
 - ``ORIGINALS_DIR``: raw uploaded/source files. Defaults to
-  ``DATA_DIR/originals``. Chainlit uploads land here.
+  ``DATA_DIR/originals``. Chainlit uploads land here, under a per-session
+  subdirectory named after the Chainlit thread id (``originals/<thread_id>/``);
+  uploads with no thread context (CLI / pre-session) land in
+  ``originals/_unscoped/``.
 - ``PREPROCESSED_DIR``: docprep Markdown output. Defaults to
   ``DATA_DIR/preprocessed``. ``chunk_documents`` / ``extract_and_write``
-  read from here by default.
+  read from here by default. Output is written under a per-session
+  subdirectory (``preprocessed/<thread_id>/``), mirroring the originals tree.
+
+The per-session subdirectory layout mirrors the document registry's
+``threadId`` discrimination (:mod:`falkordb_harness.document_registry`), so
+the agent's ``ls`` / ``glob`` tools expose session ownership directly and
+the LLM can avoid touching files from sessions other than the current one.
 
 All incoming paths are Unicode-normalized to NFC before resolution so
 non-ASCII filenames (e.g. ``Technologieübersicht.pptx``) resolve
@@ -48,6 +57,46 @@ def originals_dir() -> Path:
 def preprocessed_dir() -> Path:
     """Return the resolved ``PREPROCESSED_DIR`` (Markdown output), created if missing."""
     p = Path(os.getenv("PREPROCESSED_DIR", str(data_dir() / "preprocessed"))).resolve()
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+# Sentinel used as the on-disk subdirectory for files that belong to no
+# session (e.g. CLI uploads, or uploads arriving before the Chainlit thread
+# id is known). Reserved: a real Chainlit thread id is a UUID and will never
+# equal this value, but we reject it defensively in the helpers below.
+_UNSCOPED = "_unscoped"
+
+
+def thread_originals_dir(thread_id: str | None) -> Path:
+    """Return the per-session originals directory, created if missing.
+
+    ``thread_id is None`` (CLI / pre-session uploads) resolves to
+    ``originals/_unscoped``. Otherwise resolves to ``originals/<thread_id>``.
+    The on-disk layout mirrors the registry's ``threadId`` discrimination so
+    the agent's ``ls`` / ``glob`` tools see session ownership directly.
+    """
+    if thread_id == _UNSCOPED:
+        raise ValueError(
+            f"Invalid thread id {thread_id!r}: '_unscoped' is a reserved sentinel."
+        )
+    p = originals_dir() / (thread_id if thread_id is not None else _UNSCOPED)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def thread_preprocessed_dir(thread_id: str | None) -> Path:
+    """Return the per-session preprocessed directory, created if missing.
+
+    ``thread_id is None`` (CLI / pre-session) resolves to
+    ``preprocessed/_unscoped``. Otherwise resolves to
+    ``preprocessed/<thread_id>``.
+    """
+    if thread_id == _UNSCOPED:
+        raise ValueError(
+            f"Invalid thread id {thread_id!r}: '_unscoped' is a reserved sentinel."
+        )
+    p = preprocessed_dir() / (thread_id if thread_id is not None else _UNSCOPED)
     p.mkdir(parents=True, exist_ok=True)
     return p
 
