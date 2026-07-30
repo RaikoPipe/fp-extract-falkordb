@@ -26,3 +26,9 @@ PDF, Word (.docx), PowerPoint (.pptx), Excel (.xlsx), CSV, JSON, HTML, Markdown,
 - Upload your files first, then click **Ingest Documents** — that's all it takes to build the graph automatically.
 - Switch the knowledge graph any time via the sidebar.
 - If you're unsure what's inside, just ask: "What is in the knowledge graph?"
+
+## Accounts & Chat History
+
+- **Login is required.** On first visit, sign in with your username and password.
+- **No account yet?** Open the `/register` page (e.g. `http://localhost:8000/register`) to create one — pick a username, an optional display name, and a password (minimum 8 characters). Registration can be disabled by your administrator (`REGISTER_ENABLED=0`).
+- **Your chats are saved.** Every conversation is stored under your account and listed in the sidebar; you can resume any past thread. Uploaded files in those threads are kept on the server under `./data/elements`.

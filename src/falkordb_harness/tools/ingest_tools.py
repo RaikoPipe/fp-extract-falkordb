@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 
 from langchain_core.tools import tool
 
-from falkordb_harness.backend import get_backend
 from falkordb_harness.tools._paths import resolve as _resolve
 from falkordb_harness.tools._retry import awith_retry, with_retry
+
+logger = logging.getLogger("falkordb_harness.tools.ingest")
 
 
 def _resolve_data_dir(data_dir: str) -> Path | str:
@@ -95,39 +97,71 @@ async def extract_and_write(
 async def _extract_and_write_impl(
     data_dir: str, chunk_size: int, concurrency: int
 ) -> str:
-    from knowledge.chunking import load_and_chunk
-    from knowledge.llm_extract import extract_from_chunks
+    from falkordb_harness.ingest_runner import run_ingestion
 
-    backend = get_backend()
     resolved = _resolve_data_dir(data_dir)
     if isinstance(resolved, str):
         return json.dumps({"error": resolved}, ensure_ascii=False)
-    chunks = load_and_chunk(resolved, chunk_size=chunk_size)
-    if not chunks:
+    # Discover every supported file under the resolved tree so the unified
+    # ``run_ingestion`` pipeline (which stages → preprocess → chunk → extract
+    # → write) operates on the same files the previous direct path would
+    # have chunked via ``load_and_chunk``. Binary formats are routed through
+    # docprep; plain-text files are ingested as-is.
+    from knowledge.chunking import discover_files
+
+    files = discover_files(resolved)
+    if not files:
         return "No documents found or no chunks produced."
 
-    extractions = await extract_from_chunks(
-        chunks,
-        llm_model=os.getenv("LLM_MODEL"),
-        api_base=os.getenv("OLLAMA_API_BASE"),
-        concurrency=concurrency,
-    )
+    # UI progress bridge: when invoked from the Chainlit UI, ``on_message``
+    # installs a zero-arg async factory into ``cl.user_session`` that builds a
+    # live ``cl.TaskList`` panel and returns ``(progress, finalize)``. The
+    # tool consumes it so the agent-driven path gets the same per-stage /
+    # per-file progress UI as the "Ingest documents" action button. In any
+    # non-Chainlit runtime (CLI, tests) no factory is installed and
+    # ``run_ingestion`` runs with ``progress=None`` silently.
+    progress = None
+    finalize = None
+    try:
+        import chainlit as cl
 
-    total_stmts, total_conflicts, total_reconciliations = 0, 0, 0
-    for graph, source, chunk_index in extractions:
-        stmts, conflicts, reconciliations = await backend.write_extraction(
-            graph, source=source, chunk_index=chunk_index
+        factory = cl.user_session.get("ingest_progress_factory")
+    except Exception:  # noqa: BLE001 — not in a Chainlit context
+        factory = None
+    if factory is not None:
+        try:
+            # ``make_ingestion_progress`` returns a 3-tuple
+            # ``(tasklist, progress, finalize)``; the tasklist is sent as a
+            # standalone chat element by the factory, so we only need the
+            # progress/finalize callbacks here.
+            _tasklist, progress, finalize = await factory()
+        except Exception as exc:  # noqa: BLE001 — never strand ingestion
+            logger.warning("ingest progress factory failed: %s", exc)
+            progress, finalize = None, None
+
+    result: dict = {}
+    try:
+        result = await run_ingestion(
+            files,
+            chunk_size=chunk_size,
+            overlap=200,
+            concurrency=concurrency,
+            docprep_yaml=os.getenv("DOCPREP_YAML", ""),
+            overwrite_preprocessed=False,
+            progress=progress,
         )
-        total_stmts += stmts
-        total_conflicts += len(conflicts)
-        total_reconciliations += len(reconciliations)
+    except Exception:
+        if finalize is not None:
+            try:
+                await finalize(False)
+            except Exception as exc:  # noqa: BLE001 — never strand the UI
+                logger.warning("ingest progress finalize failed: %s", exc)
+        raise
+    else:
+        if finalize is not None:
+            try:
+                await finalize(bool(result.get("errors") or []) is False)
+            except Exception as exc:  # noqa: BLE001 — never strand the UI
+                logger.warning("ingest progress finalize failed: %s", exc)
 
-    return json.dumps({
-        "chunks_processed": len(chunks),
-        "extractions": len(extractions),
-        "cypher_statements": total_stmts,
-        "nodes_in_graph": backend.node_count(),
-        "conflicts_detected": total_conflicts,
-        "reconciliations": total_reconciliations,
-        "merge_mode": backend.merge_mode.value,
-    }, indent=2, ensure_ascii=False)
+    return json.dumps(result, indent=2, ensure_ascii=False)

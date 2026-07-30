@@ -26,8 +26,9 @@ from __future__ import annotations
 
 import os
 import shutil
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from loguru import logger
 
@@ -61,6 +62,21 @@ _PLAIN_EXTS = {".txt", ".md", ".csv", ".json", ".html", ".py"}
 ProgressFn = Callable[[str, dict[str, Any] | None], Awaitable[None]]
 
 
+async def _noop_progress(_label: str, _details: dict[str, Any] | None = None) -> None:
+    """Default no-op progress sink so callers can omit ``progress`` safely.
+
+    Several call sites in this module invoke ``progress(...)`` without an
+    ``if progress`` guard (notably the per-file chunk loop and the
+    ``_preprocess_one`` helper). When the Chainlit progress factory fails
+    to build a panel — or in any non-UI runtime — ``progress`` arrives as
+    ``None`` and those unguarded calls raise ``'NoneType' object is not
+    callable``. Routing every call through this no-op (set at the top of
+    :func:`run_ingestion` / :func:`_preprocess_one`) keeps the call sites
+    unconditional without forcing callers to pass a callback.
+    """
+    return
+
+
 def _ensure_session_backend() -> None:
     """Re-install the per-session FalkorDB backend in the current context.
 
@@ -83,6 +99,32 @@ def _ensure_session_backend() -> None:
 def _needs_preprocessing(path: Path) -> bool:
     """Return True if ``path`` is a binary/non-text format requiring docprep."""
     return path.suffix.lower() not in _PLAIN_EXTS
+
+
+def _session_thread_id() -> str | None:
+    """Return the current Chainlit thread id, or ``None`` outside Chainlit.
+
+    ``run_ingestion`` is called from both the Chainlit UI (action button +
+    ``extract_and_write`` tool) and the CLI / tests. Only the Chainlit path
+    has a thread context; the document registry accepts ``thread_id=None``
+    for the non-UI path, so a missing context degrades gracefully.
+    """
+    try:
+        import chainlit as cl
+
+        return cl.context.session.thread_id  # type: ignore[no-any-return]
+    except Exception:  # noqa: BLE001 — not in a Chainlit context
+        return None
+
+
+def _session_user_id() -> str | None:
+    """Return the current Chainlit user identifier, or ``None``."""
+    try:
+        import chainlit as cl
+
+        return cl.user_session.get("user_identifier")  # type: ignore[no-any-return]
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _build_docprep_config(yaml_path: str = ""):
@@ -220,11 +262,17 @@ async def run_ingestion(
     """
     from falkordb_harness.backend import get_backend
     from falkordb_harness.tools._paths import originals_dir, preprocessed_dir
-
     from knowledge.chunking import chunk_text, read_document
     from knowledge.llm_extract import extract_from_chunks
 
     errors: list[str] = []
+
+    # Normalize ``progress`` to a no-op so the unconditional call sites below
+    # (the per-file chunk loop, ``_preprocess_one``) are safe even when no
+    # UI callback was supplied or the Chainlit factory failed. Callers that
+    # pass a real callback still drive the live TaskList panel as before.
+    if progress is None:
+        progress = _noop_progress
 
     # --- Stage 1: stage files into originals/ ---
     originals = originals_dir()
@@ -285,6 +333,24 @@ async def run_ingestion(
             if md is not None:
                 ingest_paths.append(md)
                 preprocessed_count += 1
+                # Register the preprocessed output in the document registry
+                # (single source of truth for the sidebar). Best-effort:
+                # errors are swallowed inside register_preprocessed, so a
+                # registry failure never breaks ingestion.
+                try:
+                    from falkordb_harness.document_registry import (
+                        register_preprocessed,
+                    )
+
+                    await register_preprocessed(
+                        thread_id=_session_thread_id(),
+                        user_identifier=_session_user_id(),
+                        name=md.name,
+                        original_path=str(src),
+                        preprocessed_path=str(md),
+                    )
+                except Exception as exc:  # noqa: BLE001 — never block ingestion
+                    logger.debug("register_preprocessed failed: {}", exc)
             else:
                 errors.append(f"Preprocessing failed for `{src.name}`")
         else:
@@ -401,6 +467,19 @@ async def run_ingestion(
     backend = get_backend()
     total_stmts = 0
     total_conflicts = 0
+    # Track which source filenames produced at least one successful write,
+    # so we can register them as ingested in the document registry after
+    # the loop. A source maps to its staged file (original or preprocessed)
+    # via the ingest_paths list, which carries ``source = path.name`` on
+    # each chunk (see the chunk stage above).
+    ingested_sources: set[str] = set()
+    # Map source name -> staged path for registry registration.
+    source_to_path: dict[str, Path] = {}
+    for p in ingest_paths:
+        source_to_path.setdefault(p.name, p)
+    # Also map original stems so a preprocessed ``foo.md`` can be linked
+    # back to its original ``foo.pdf`` for the registry's originalPath.
+    original_by_stem: dict[str, Path] = {p.stem: p for p in staged}
     for graph, source, chunk_index in extractions:
         try:
             stmts, conflicts, _reconciliations = await backend.write_extraction(
@@ -408,6 +487,7 @@ async def run_ingestion(
             )
             total_stmts += stmts
             total_conflicts += len(conflicts)
+            ingested_sources.add(source)
         except Exception as exc:  # noqa: BLE001 — per-extraction resilience
             errors.append(f"Write failed for `{source}` chunk {chunk_index}: {exc}")
             logger.error("Ingestion write error for {} chunk {}: {}", source, chunk_index, exc)
@@ -428,6 +508,44 @@ async def run_ingestion(
             },
         )
 
+    # Register successfully-ingested files in the document registry. One
+    # row per source filename (deduplicated by ``(graphName, name)`` inside
+    # ``register_ingested``), scoped to the active graph. Best-effort:
+    # registry failures never break ingestion.
+    if ingested_sources:
+        graph_name = backend.graph_name
+        user_id = _session_user_id()
+        try:
+            from falkordb_harness.document_registry import register_ingested
+
+            for src_name in sorted(ingested_sources):
+                staged_path = source_to_path.get(src_name)
+                # Link back to the original (if this was a preprocessed .md)
+                # so the registry row keeps the source file's provenance.
+                original_path: str | None = None
+                if staged_path is not None:
+                    if staged_path.suffix.lower() == ".md":
+                        original = original_by_stem.get(staged_path.stem)
+                        if original is not None:
+                            original_path = str(original)
+                    else:
+                        original_path = str(staged_path)
+                await register_ingested(
+                    graph_name=graph_name,
+                    user_identifier=user_id,
+                    name=src_name,
+                    source=src_name,
+                    original_path=original_path,
+                    preprocessed_path=(
+                        str(staged_path)
+                        if staged_path is not None
+                        and staged_path.suffix.lower() == ".md"
+                        else None
+                    ),
+                )
+        except Exception as exc:  # noqa: BLE001 — never block ingestion
+            logger.debug("register_ingested failed: {}", exc)
+
     return {
         "files_staged": len(staged),
         "files_preprocessed": preprocessed_count,
@@ -441,4 +559,4 @@ async def run_ingestion(
     }
 
 
-__all__ = ["run_ingestion", "_ensure_session_backend"]
+__all__ = ["_ensure_session_backend", "run_ingestion"]

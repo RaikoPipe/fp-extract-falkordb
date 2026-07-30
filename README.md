@@ -363,6 +363,9 @@ Every conflict (both in-graph and JSONL) is a JSON object with these fields:
 | `src/knowledge/reconciliation.py` | Similarity-based reconciliation engine: embedding, cosine search, LLM pairwise confidence, description coalescing |
 | `src/knowledge/falkordb_backend.py` | FalkorDB connection, write, conflict + reconciliation logging, search helpers |
 | `src/knowledge/search.py` | Graph / fulltext / vector search REPL |
+| `src/falkordb_harness/chainlit_app.py` | Chainlit frontend: chat UI, settings widgets, ingestion progress, tool-step rendering |
+| `src/falkordb_harness/auth.py` | Password authentication + self-service `/register` route (bcrypt-hashed users in the SQLite data layer DB) |
+| `src/falkordb_harness/data_layer.py` | Chainlit data layer (SQLite + local element storage) for per-user chat persistence |
 
 ---
 
@@ -389,6 +392,10 @@ Every conflict (both in-graph and JSONL) is a JSON object with these fields:
 | `--fulltext` | — | — | Fulltext search mode (requires `--search`) |
 | `--vector` | — | — | Vector search mode (requires `--search`) |
 | `--reset` | — | — | Delete all graph data (preserves JSONL logs) |
+| — | `CHAINLIT_AUTH_SECRET` | — | JWT signing secret for login cookies (required when password auth is enabled). Generate with `chainlit create-secret` |
+| — | `DATABASE_URL` | `sqlite+aiosqlite:///./data/chainlit.db` | SQLAlchemy async URL for the Chainlit data layer (users, threads, steps, elements, feedback) |
+| — | `ELEMENTS_DIR` | `./data/elements` | Where uploaded-file blobs attached to persisted threads are stored |
+| — | `REGISTER_ENABLED` | `1` | Set to `0` to disable the self-service `/register` route (admin-only account creation) |
 
 ---
 
@@ -565,10 +572,41 @@ backend.reconcile_posthoc()                      # run post-hoc pass (async)
 
 ---
 
+## Authentication & chat persistence
+
+The Chainlit app supports **user accounts** and **per-user chat history** out of the box, backed by a SQLite database (the same file the data layer uses for threads/steps/elements). No external auth provider or object store is required.
+
+### How it works
+
+- **Login is required.** Registering a `@cl.password_auth_callback` flips Chainlit's `require_login()` to true, so every visitor hits the built-in login page first.
+- **Self-service registration** is exposed at the `/register` route (a small server-rendered HTML form). On success the user is redirected to the login page. Registration can be disabled with `REGISTER_ENABLED=0` (admin-only account creation).
+- **Passwords** are hashed with bcrypt and stored in the `passwordHash` column of the `users` table.
+- **Chat history** is persisted by Chainlit's `SQLAlchemyDataLayer`: every thread, message (step), element (uploaded file), and feedback entry is written to the SQLite DB at `DATABASE_URL`. Logged-in users see their past threads in the sidebar and can resume any of them.
+- **Uploaded files** in persisted threads are written to `ELEMENTS_DIR` (default `./data/elements`) by a `LocalStorageClient` and served back via a `/public/elements/...` static mount — no S3/Azure/GCS needed.
+
+### Setup
+
+1. Generate a JWT secret and put it in `.env`:
+
+   ```bash
+   chainlit create-secret
+   # copy the printed value into CHAINLIT_AUTH_SECRET
+   ```
+
+2. Start the app as usual (`docker compose up` or `chainlit run src/falkordb_harness/chainlit_app.py`). On first startup the five Chainlit tables (`users`, `threads`, `steps`, `elements`, `feedbacks`) are created automatically in the SQLite file.
+
+3. Visit `http://localhost:8000/register` to create your first account, then log in at `/login`.
+
+### Switching to Postgres
+
+For multi-host or high-concurrency deployments, set `DATABASE_URL` to a Postgres async URL (e.g. `postgresql+asyncpg://user:pw@host/db`) and add a `postgres` service to `docker-compose.yml`. The schema bootstrap DDL in `data_layer.init_db` uses `CREATE TABLE IF NOT EXISTS` statements that are portable across SQLite and Postgres. Element blobs can be moved to S3 by swapping `LocalStorageClient` for `chainlit.data.storage_clients.s3.S3StorageClient`.
+
+---
+
 ## Running the tests
 
 ```bash
 pytest -q
 ```
 
-87 tests covering chunking, Cypher mapping (both modes), conflict detection, conflict logging, reconciliation decisions, reconciliation logging, backend query helpers, and CLI flag plumbing.
+295 tests covering chunking, Cypher mapping (both modes), conflict detection, conflict logging, reconciliation decisions, reconciliation logging, backend query helpers, CLI flag plumbing, password auth + registration, and the SQLite data layer + local element storage.

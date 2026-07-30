@@ -27,6 +27,12 @@ PDF, Word (.docx), PowerPoint (.pptx), Excel (.xlsx), CSV, JSON, HTML, Markdown,
 - Wechseln Sie den Wissensgraphen jederzeit über die Seitenleiste.
 - Wenn Sie sich unsicher sind, was enthalten ist, fragen Sie einfach: „Was ist im Wissensgraph enthalten?“
 
+## Konten & Chat-Verlauf
+
+- **Anmeldung erforderlich.** Beim ersten Besuch melden Sie sich mit Benutzername und Passwort an.
+- **Noch kein Konto?** Öffnen Sie die Seite `/register` (z. B. `http://localhost:8000/register`), um eines anzulegen – wählen Sie einen Benutzernamen, einen optionalen Anzeigenamen und ein Passwort (mindestens 8 Zeichen). Die Registrierung kann durch die Administration deaktiviert werden (`REGISTER_ENABLED=0`).
+- **Ihre Chats werden gespeichert.** Jede Unterhaltung wird unter Ihrem Konto abgelegt und in der Seitenleiste aufgelistet; Sie können jeden vergangenen Thread fortsetzen. Hochgeladene Dateien dieser Threads werden auf dem Server unter `./data/elements` vorgehalten.
+
 ---
 
 *Hinweis: Diese Datei ist die Standard-Anzeige für Sprachen, für die keine übersetzte Version vorliegt. Für Deutsch wird `chainlit_de-DE.md` und für Englisch `chainlit_en-US.md` verwendet.*

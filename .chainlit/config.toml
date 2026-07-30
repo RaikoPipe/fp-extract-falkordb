@@ -107,8 +107,11 @@ default_sidebar_state = "open"
 
 # default_chat_settings_open = false
 
-# Whether to prompt user confirmation on clicking 'New Chat'
-confirm_new_chat = true
+# Whether to prompt user confirmation on clicking 'New Chat'. Disabled
+# because chat history is persisted per user (see on_chat_resume + the
+# SQLAlchemy data layer): starting a new chat does NOT clear the current
+# thread, it starts a fresh one while the old one remains in the sidebar.
+confirm_new_chat = false
 
 # Description of the assistant. This is used for HTML tags.
 # description = ""

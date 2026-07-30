@@ -359,6 +359,99 @@ def build_source_elements(raw_output: str, data_dir: Path):
     return elements
 
 
+def build_source_elements_from_row(row: dict, data_dir: Path):
+    """Return Pdf/Image/Text elements for a registry document row.
+
+    Sibling of :func:`build_source_elements` for the "Open" sidebar button.
+    ``row`` is a :mod:`document_registry` row dict (absolute on-disk paths in
+    ``preprocessedPath`` / ``originalPath``). Prefers the preprocessed
+    Markdown (renders as a ``cl.Text``); falls back to the original (``cl.Pdf``
+    for PDFs, ``cl.Image`` for images, ``cl.Text`` for plain text). The path
+    must resolve under ``data_dir`` (containment guard via :func:`_safe_resolve`
+    on the root-relative form of the path) — paths outside the data dir are
+    skipped. Returns ``[]`` when ``chainlit`` is missing or no usable file is
+    found (the caller sends a chat message instead).
+    """
+    try:
+        import chainlit as cl
+    except ImportError:
+        return []
+
+    elements: list = []
+    pre_path = row.get("preprocessedPath")
+    src_path = row.get("originalPath")
+
+    # Prefer the preprocessed Markdown when it exists on disk.
+    if pre_path:
+        pre_abs = _abs_under_data_dir(pre_path, data_dir)
+        if pre_abs and pre_abs.exists():
+            try:
+                content = pre_abs.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                content = ""
+            if content:
+                elements.append(
+                    cl.Text(
+                        name=t("element.preprocessed.name", name=pre_abs.name),
+                        content=content[:20000],
+                        display="inline",
+                        language="markdown",
+                    )
+                )
+                return elements  # preprocessed Markdown is the LLM-ready view
+
+    # Fall back to the original file.
+    if src_path:
+        src_abs = _abs_under_data_dir(src_path, data_dir)
+        if src_abs and src_abs.exists():
+            ext = src_abs.suffix.lower()
+            if ext == ".pdf":
+                elements.append(
+                    cl.Pdf(name=src_abs.name, path=str(src_abs), display="side")
+                )
+            elif ext in _IMAGE_EXTS:
+                elements.append(
+                    cl.Image(name=src_abs.name, path=str(src_abs), display="side")
+                )
+            else:
+                try:
+                    content = src_abs.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    content = ""
+                if content:
+                    elements.append(
+                        cl.Text(
+                            name=src_abs.name,
+                            content=content[:20000],
+                            display="inline",
+                        )
+                    )
+    return elements
+
+
+def _abs_under_data_dir(path_str: str, data_dir: Path) -> Path | None:
+    """Return ``path_str`` as an absolute Path if it lies under ``data_dir``.
+
+    Registry rows store absolute on-disk paths (e.g. ``/app/data/originals/x.pdf``).
+    This guards against a path that escapes the data root (e.g. a row seeded
+    from a test fixture pointing outside ``data_dir``) by refusing to resolve
+    it. Returns ``None`` on traversal or unresolvable input.
+    """
+    try:
+        root = data_dir.resolve()
+    except OSError:
+        return None
+    try:
+        candidate = Path(path_str).resolve()
+    except OSError:
+        return None
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return None
+    return candidate
+
+
 def _safe_resolve(data_dir: Path, virtual: str) -> Path | None:
     """Resolve a root-relative virtual path under ``data_dir`` safely.
 
@@ -387,4 +480,5 @@ __all__ = [
     "build_schema_card_props",
     "build_search_score_plot",
     "build_source_elements",
+    "build_source_elements_from_row",
 ]

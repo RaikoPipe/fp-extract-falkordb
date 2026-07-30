@@ -6,6 +6,7 @@ Run with:
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import os
@@ -16,10 +17,12 @@ from typing import Any
 import chainlit as cl
 from chainlit import input_widget
 from chainlit.action import Action
-from chainlit.element import Task, TaskList, TaskStatus
+from chainlit.types import ThreadDict
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage
 
+from falkordb_harness import auth as _auth_module  # noqa: F401
+from falkordb_harness.auth import register_routes
 from falkordb_harness.chainlit_elements import (
     build_ingestion_summary_plot,
     build_label_distribution_plot,
@@ -28,9 +31,21 @@ from falkordb_harness.chainlit_elements import (
     build_schema_card_props,
     build_search_score_plot,
     build_source_elements,
+    build_source_elements_from_row,
 )
+
+# Side-effect imports: registering the @cl.data_layer / @cl.on_app_startup
+# hooks and the password auth callback. These modules call into Chainlit's
+# decorator API at import time, so importing them here (before any handler
+# runs) wires user management + chat persistence into the running app.
+from falkordb_harness.data_layer import build_data_layer, init_db
 from falkordb_harness.i18n import t
 from falkordb_harness.ingest_runner import run_ingestion
+from falkordb_harness.stream_recovery import (
+    deregister_stream,
+    register_stream,
+    replay_inflight_stream,
+)
 from falkordb_harness.tools._paths import originals_dir, preprocessed_dir
 
 load_dotenv(override=True)
@@ -46,12 +61,89 @@ PREPROCESSED_DIR = preprocessed_dir()
 
 MAX_HISTORY_PAIRS = 20
 
+
+def _history_from_thread(thread: dict) -> list:
+    """Reconstruct the agent's in-memory chat history from a persisted thread.
+
+    Only ``user_message`` / ``assistant_message`` steps are real
+    conversation turns — tool-call steps (type ``"tool"`` / ``"run"``) are
+    not LLM context and are skipped. The output (assistant) or input
+    (user) field carries the message text. Capped at
+    ``MAX_HISTORY_PAIRS`` pairs (most recent kept) so resumed long
+    threads don't blow the agent's token budget.
+    """
+    history: list = []
+    for step in thread.get("steps", []):
+        step_type = step.get("type", "")
+        if step_type == "user_message":
+            # Chainlit's Message.to_dict() stores the text of BOTH user and
+            # assistant messages in the "output" field (chainlit/message.py);
+            # the "input" field is only populated for Step objects whose
+            # show_input is set, which user messages never are. The SQL
+            # layer (sql_alchemy.get_all_user_threads) further gates "input"
+            # on showInput not in [None, "false"], so a persisted
+            # user_message always returns input="" and output=<text>. Read
+            # output first; fall back to input only for any legacy thread
+            # whose steps were persisted the old way.
+            content = step.get("output") or step.get("input") or ""
+        elif step_type == "assistant_message":
+            content = step.get("output") or ""
+        else:
+            continue
+        if not content:
+            continue
+        if step_type == "user_message":
+            history.append(HumanMessage(content=content))
+        else:
+            history.append(AIMessage(content=content))
+    if len(history) > MAX_HISTORY_PAIRS * 2:
+        history = history[-(MAX_HISTORY_PAIRS * 2):]
+    return history
+
 # Default graph, used to seed the sidebar widgets when no FalkorDB instance is
 # reachable yet (e.g. starting before `docker-compose up`). Resolved from the
 # same env var the backend reads.
 _DEFAULT_GRAPH = os.getenv("FALKORDB_GRAPH", "factory_planning")
 
 logger = logging.getLogger("falkordb_harness.chainlit")
+
+
+@cl.data_layer
+def _data_layer():
+    """Register the SQLAlchemy + local-storage data layer with Chainlit.
+
+    Enables per-user thread persistence: every chat thread, its steps
+    (messages), elements (uploaded files) and feedback are written to
+    the SQLite database at ``DATABASE_URL``. Logged-in users see their
+    past threads in the sidebar and can resume them. The data layer is
+    constructed once per process and reused.
+    """
+    return build_data_layer()
+
+
+@cl.on_app_startup
+async def _on_app_startup() -> None:
+    """Initialize the persistence schema and mount the /register route.
+
+    Runs once when the Chainlit server starts (inside its lifespan
+    handler). Two jobs:
+
+    1. Create the Chainlit tables (users/threads/steps/elements/feedbacks)
+       in the SQLite database if missing — Chainlit's SQLAlchemy layer
+       does not auto-create them. Idempotent.
+    2. Register the custom ``/register`` FastAPI route and the
+       ``/public/elements`` static mount on Chainlit's app so users can
+       self-register and so persisted uploaded-file blobs are served.
+    """
+    layer = build_data_layer()
+    try:
+        await init_db(layer)
+    except Exception as exc:  # noqa: BLE001 — never block server startup
+        logger.error("Could not initialize data layer schema: %s", exc)
+    try:
+        register_routes()
+    except Exception as exc:  # noqa: BLE001 — never block server startup
+        logger.error("Could not register /register route: %s", exc)
 
 
 def _list_available_graphs() -> list[str]:
@@ -430,6 +522,24 @@ async def on_chat_start() -> None:
         pass
     cl.user_session.set("lang", lang_from_accept_language(browser_lang))
 
+    # Capture the authenticated user (now guaranteed because the password
+    # auth callback is registered, which flips require_login() to true).
+    # Stash the whole user object and the identifier separately so tools /
+    # handlers can scope behaviour (e.g. per-user graph preferences) and
+    # tag persisted threads without re-reading cl.context.session.
+    try:
+        current_user = cl.context.session.user
+    except Exception:  # noqa: BLE001 — older Chainlit / no user
+        current_user = None
+    if current_user is not None:
+        cl.user_session.set("user", current_user)
+        cl.user_session.set(
+            "user_identifier", getattr(current_user, "identifier", None)
+        )
+    else:
+        cl.user_session.set("user", None)
+        cl.user_session.set("user_identifier", None)
+
     graphs = _list_available_graphs()
     settings = _build_settings_widgets(graphs)
     await settings.send()
@@ -456,6 +566,119 @@ async def on_chat_start() -> None:
     from falkordb_harness.ui_prompts import set_ui_callback
 
     set_ui_callback(_ui_prompt_callback)
+
+    # Seed the sidebar with whatever documents are already tracked for
+    # this thread / active graph (empty on a fresh chat).
+    await _refresh_sidebar()
+    # Pin the persistent "open document sidebar" button to the viewport.
+    # Re-sent on every chat start (and resume) so it survives new chats /
+    # thread switches. The JSX uses position:fixed, so it stays visible
+    # regardless of chat scroll.
+    await _send_open_docs_button()
+
+
+@cl.on_chat_resume
+async def on_chat_resume(thread: ThreadDict) -> None:
+    """Restore a persisted thread when the user reopens it from the sidebar.
+
+    Chainlit only resumes a thread when this handler is registered
+    (``threadResumable = bool(config.code.on_chat_resume)`` in the
+    project settings endpoint). Without it the frontend treats past
+    threads as non-resumable and clicking one falls through to
+    ``on_chat_start``, which wipes ``chat_history`` and starts a fresh
+    conversation — the bug where opening a past chat "deleted" history.
+
+    Two jobs:
+
+    1. Rebuild the same session state ``on_chat_start`` would have set
+       (language, user, settings widgets, agent bound to the thread's
+       graph, ingestion config, UI prompt callback) so the resumed
+       thread is fully functional and new messages flow into the same
+       graph. The graph selection + ingestion settings are recovered
+       from the thread metadata that Chainlit persisted automatically.
+    2. Reconstruct the agent's in-memory ``chat_history`` from the
+       thread's persisted steps (user_message / assistant_message) so
+       the agent has the conversational context it had when the thread
+       was last active. Without this the agent would answer the next
+       message as if the conversation had never happened.
+    """
+    from falkordb_harness.i18n import lang_from_accept_language
+
+    # --- language + user (mirror on_chat_start) ---
+    browser_lang = "en-US"
+    try:
+        browser_lang = cl.context.session.language or "en-US"
+    except Exception:  # noqa: BLE001, S110
+        pass
+    cl.user_session.set("lang", lang_from_accept_language(browser_lang))
+
+    try:
+        current_user = cl.context.session.user
+    except Exception:  # noqa: BLE001
+        current_user = None
+    if current_user is not None:
+        cl.user_session.set("user", current_user)
+        cl.user_session.set("user_identifier", getattr(current_user, "identifier", None))
+    else:
+        cl.user_session.set("user", None)
+        cl.user_session.set("user_identifier", None)
+
+    # --- recover persisted graph selection + ingestion settings ---
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        import json as _json
+
+        try:
+            metadata = _json.loads(metadata)
+        except _json.JSONDecodeError:
+            metadata = {}
+
+    graph_selection = metadata.get("graph_selection") or {}
+    active_graph = graph_selection.get("active_graph", _DEFAULT_GRAPH)
+    allowed_graphs = graph_selection.get("allowed_graphs") or [active_graph]
+
+    # Re-send the settings widgets so the sidebar reflects the resumed
+    # thread's graph selection (not the default).
+    graphs = _list_available_graphs()
+    settings = _build_settings_widgets(graphs)
+    await settings.send()
+
+    active, allowed = _normalize_selection(active_graph, allowed_graphs)
+    _rebuild_agent_for_selection(active, allowed)
+
+    # --- reconstruct chat_history from persisted steps ---
+    cl.user_session.set("chat_history", _history_from_thread(thread))
+
+    # --- restore the remaining session state ---
+    cl.user_session.set("uploaded_files", metadata.get("uploaded_files") or [])
+    cl.user_session.set(
+        "ingestion_settings",
+        metadata.get("ingestion_settings") or _default_ingestion_settings(),
+    )
+    cl.user_session.set("label_filter", metadata.get("label_filter") or [])
+
+    from falkordb_harness.ui_prompts import set_ui_callback
+
+    set_ui_callback(_ui_prompt_callback)
+
+    # If the assistant is still streaming an answer for this thread in the
+    # background (the on_message task survives a socket disconnect), recover
+    # the in-flight message so the reconnected UI shows the accumulated text
+    # and continues appending live tokens. Scheduled as a fire-and-forget task
+    # because Chainlit emits its resume_thread socket event *after*
+    # on_chat_resume returns, so the replay must land post-resume_thread to
+    # avoid being overwritten by the persisted (empty-output) placeholder.
+    thread_id = thread.get("id") if isinstance(thread, dict) else None
+    if thread_id:
+        asyncio.create_task(replay_inflight_stream(thread_id))
+    # Refresh the document sidebar for the resumed thread (uploaded/
+    # preprocessed rows) + active graph (ingested rows). Scheduled as a
+    # fire-and-forget task for the same reason as the stream replay above
+    # — so it lands after the resume_thread socket event.
+    asyncio.create_task(_refresh_sidebar())
+    # Re-pin the persistent "open document sidebar" button for the resumed
+    # thread (same rationale as on_chat_start).
+    asyncio.create_task(_send_open_docs_button())
 
 
 @cl.on_settings_update
@@ -562,6 +785,9 @@ async def on_settings_update(settings: dict) -> None:
             allowed=", ".join(allowed),
         ),
     ).send()
+    # Refresh the document sidebar so ingested rows for the newly-active
+    # graph appear (and the previous graph's rows disappear).
+    await _refresh_sidebar()
 
 
 @cl.action_callback("ingest_documents")
@@ -610,81 +836,11 @@ async def on_ingest_documents(action: Action) -> None:
     # top-level pipeline stage gets a task; per-file preprocessing and
     # chunking get nested tasks so the user sees which file is converting.
     # The runner emits discriminated events via the `details["kind"]`
-    # field (see ingest_runner.ProgressFn) which we switch on here.
-    tasklist = TaskList()
-    tasklist.status = "Running"
-    await tasklist.send()
+    # field (see ingest_runner.ProgressFn) which the shared
+    # ``make_ingestion_progress`` factory switches on.
+    from falkordb_harness.chainlit_progress import make_ingestion_progress
 
-    # Human-readable labels for the top-level stages.
-    _stage_titles = {
-        "stage": t("ingest.stage.stage"),
-        "preprocess": t("ingest.stage.preprocess"),
-        "chunk": t("ingest.stage.chunk"),
-        "extract": t("ingest.stage.extract"),
-        "write": t("ingest.stage.write"),
-    }
-    # One top-level Task per stage, keyed by stage name. Per-file tasks are
-    # nested under their stage; we track them to update statuses in place.
-    stage_tasks: dict[str, Task] = {}
-    file_tasks: dict[tuple[str, str], Task] = {}
-
-    async def _get_stage_task(stage: str) -> Task:
-        task = stage_tasks.get(stage)
-        if task is None:
-            task = Task(title=_stage_titles.get(stage, stage), status=TaskStatus.RUNNING)
-            stage_tasks[stage] = task
-            await tasklist.add_task(task)
-            await tasklist.update()
-        return task
-
-    async def _progress(label: str, details: dict | None = None) -> None:
-        kind = (details or {}).get("kind", "info")
-        stage = (details or {}).get("stage", "")
-        fname = (details or {}).get("file")
-
-        if kind == "stage_start":
-            await _get_stage_task(stage)
-        elif kind == "stage_end":
-            task = stage_tasks.get(stage)
-            if task:
-                task.status = TaskStatus.DONE
-                await tasklist.update()
-        elif kind == "file_start" and fname:
-            await _get_stage_task(stage)
-            t = Task(title=f"{stage}: {fname}", status=TaskStatus.RUNNING)
-            file_tasks[(stage, fname)] = t
-            await tasklist.add_task(t)
-            await tasklist.update()
-        elif kind == "file_end" and fname:
-            t = file_tasks.pop((stage, fname), None)
-            if t:
-                t.status = TaskStatus.DONE
-                await tasklist.update()
-        elif kind == "error" and fname:
-            t = file_tasks.pop((stage, fname), None)
-            if t:
-                t.status = TaskStatus.FAILED
-                await tasklist.update()
-            err = (details or {}).get("error", "")
-            err_task = Task(
-                title=t("ingest.failed.file", stage=stage, file=fname, err=err[:160]),
-                status=TaskStatus.FAILED,
-            )
-            await tasklist.add_task(err_task)
-            await tasklist.update()
-        elif kind == "error":
-            err = (details or {}).get("error", "")
-            err_task = Task(
-                title=t(
-                    "ingest.failed.stage",
-                    stage=stage or "pipeline",
-                    err=err[:160],
-                ),
-                status=TaskStatus.FAILED,
-            )
-            await tasklist.add_task(err_task)
-            await tasklist.update()
-        # info events: no task change, the label still surfaces in chat if needed.
+    _tasklist, _progress, _finalize_progress = await make_ingestion_progress()
 
     yaml_path = os.getenv("DOCPREP_YAML", "")
     # Read ingestion parameters from the session (set by the Ingestion tab,
@@ -706,23 +862,13 @@ async def on_ingest_documents(action: Action) -> None:
         )
     except Exception as exc:  # noqa: BLE001 — UI must stay usable on failure
         logger.error("Ingestion pipeline failed: %s", exc)
-        # Mark any still-running stage as failed so the panel doesn't hang.
-        for task in stage_tasks.values():
-            if task.status == TaskStatus.RUNNING:
-                task.status = TaskStatus.FAILED
-        tasklist.status = "Failed"
-        await tasklist.update()
+        await _finalize_progress(success=False)
         await cl.Message(
             content=t("ingest.failed.pipeline", exc=exc),
         ).send()
         return
 
-    # Finalize the panel: mark any stage not already closed as done.
-    for task in stage_tasks.values():
-        if task.status == TaskStatus.RUNNING:
-            task.status = TaskStatus.DONE
-    tasklist.status = "Done"
-    await tasklist.update()
+    await _finalize_progress(success=True)
 
     errors = result.get("errors") or []
     summary_lines = [
@@ -750,6 +896,8 @@ async def on_ingest_documents(action: Action) -> None:
         content="\n".join(summary_lines),
         elements=summary_elements,
     ).send()
+    # Refresh the document sidebar so the newly-ingested files appear.
+    await _refresh_sidebar()
 
 
 def _step_meta(tool_name: str) -> tuple[str | None, str | None, bool]:
@@ -870,48 +1018,475 @@ async def _collect_visual_elements(
 async def _pin_schema_sidebar(schema_raw: str) -> None:
     """Pin the current graph schema to the Chainlit ElementSidebar.
 
-    Renders the schema (labels / relationship types / property keys) as a
-    ``Text`` element in the side panel so it stays visible while the user
-    queries. On any failure (e.g. older Chainlit without ElementSidebar),
-    the call is a silent no-op — the schema is already in the Step panel
-    and the CustomElement (if sent).
+    Stores the raw schema in ``cl.user_session`` so the unified
+    :func:`_refresh_sidebar` can re-include it alongside the document
+    manager (both share the single ElementSidebar slot — ``set_elements``
+    replaces the full list, so they must be composed together). Then
+    triggers a sidebar refresh.
+    """
+    cl.user_session.set("last_schema_raw", schema_raw)
+    await _refresh_sidebar()
+
+
+async def _refresh_sidebar() -> None:
+    """Re-render the ElementSidebar with the document manager + schema.
+
+    Single source of truth for the sidebar's content. Composes:
+    1. A ``DocumentManager`` CustomElement built from the document
+       registry — uploaded + preprocessed rows for the current thread and
+       ingested rows for the active graph.
+    2. A ``SchemaBrowser`` (Text fallback + CustomElement) when a schema
+       was fetched this session (stored in ``last_schema_raw``).
+
+    Uses a stable ``key="main"`` so the sidebar isn't needlessly re-keyed.
+    On any failure (older Chainlit without ElementSidebar, registry error)
+    the call is a silent no-op — the chat still works.
+    """
+    try:
+        import chainlit as cl
+    except ImportError:
+        return
+
+    elements: list = []
+    # --- Document manager ---
+    try:
+        props = await _build_document_manager_props()
+        if props is not None:
+            try:
+                elements.append(
+                    cl.CustomElement(name="DocumentManager", props=props)
+                )
+            except Exception as exc:  # noqa: BLE001 — CustomElement may be unavailable
+                logger.debug("DocumentManager CustomElement build failed: %s", exc)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("document manager props failed: %s", exc)
+
+    # --- Schema browser (re-include so set_elements doesn't wipe it) ---
+    schema_raw = cl.user_session.get("last_schema_raw")
+    if schema_raw:
+        try:
+            props = build_schema_card_props(schema_raw)
+            if props is not None:
+                try:
+                    elements.append(
+                        cl.CustomElement(name="SchemaBrowser", props=props)
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("CustomElement build failed: %s", exc)
+            try:
+                from falkordb_harness.chainlit_formatting import format_tool_output
+
+                rendered = format_tool_output("get_schema", schema_raw)
+                elements.append(
+                    cl.Text(name="Schema", content=rendered, display="side")
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("schema Text fallback failed: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("schema props build failed: %s", exc)
+
+    if not elements:
+        return
+    try:
+        selection = cl.user_session.get("graph_selection") or {}
+        active = selection.get("active_graph", _DEFAULT_GRAPH)
+        await cl.ElementSidebar.set_title(
+            t("sidebar.title", active=active)
+        )
+        await cl.ElementSidebar.set_elements(elements, key="main")
+    except Exception as exc:  # noqa: BLE001 — older Chainlit lacks ElementSidebar
+        logger.debug("ElementSidebar refresh failed: %s", exc)
+
+
+async def _send_open_docs_button() -> None:
+    """Pin the persistent "open document sidebar" button to the viewport.
+
+    Renders the ``OpenDocsButton`` CustomElement inline in a low-key
+    assistant message. The JSX uses ``position: fixed`` so the button
+    floats over the chat at the bottom-right corner regardless of scroll.
+    Clicking it calls the ``open_document_sidebar`` action
+    (:func:`on_open_document_sidebar`), which re-runs
+    :func:`_refresh_sidebar` to re-open the ElementSidebar.
+
+    Best-effort: silently no-ops on older Chainlit without CustomElement
+    support, so the chat still works.
     """
     try:
         import chainlit as cl
     except ImportError:
         return
     try:
-        props = build_schema_card_props(schema_raw)
-    except Exception:  # noqa: BLE001
-        props = None
-    elements: list = []
-    if props is not None:
-        try:
-            elements.append(
-                cl.CustomElement(name="SchemaBrowser", props=props)
-            )
-        except Exception as exc:  # noqa: BLE001 — CustomElement may be unavailable
-            logger.debug("CustomElement build failed: %s", exc)
-    # Always also push a Text fallback so the sidebar is useful even
-    # without the JSX file mounted.
-    try:
-        from falkordb_harness.chainlit_formatting import format_tool_output
+        lang = cl.user_session.get("lang") or "de"
+        props = {
+            "lang": lang,
+            "label": t("sidebar.open_button.label"),
+            "title": t("sidebar.open_button.title"),
+        }
+        await cl.Message(
+            content="",
+            elements=[cl.CustomElement(name="OpenDocsButton", props=props)],
+        ).send()
+    except Exception as exc:  # noqa: BLE001 — never break the chat on UI
+        logger.debug("OpenDocsButton send failed: %s", exc)
 
-        rendered = format_tool_output("get_schema", schema_raw)
-        elements.append(
-            cl.Text(name="Schema", content=rendered, display="side")
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("schema Text fallback failed: %s", exc)
-    if not elements:
+
+@cl.action_callback("open_document_sidebar")
+async def on_open_document_sidebar(action: Action) -> None:
+    """Re-open the ElementSidebar from the persistent OpenDocsButton.
+
+    Re-runs :func:`_refresh_sidebar`, which re-pushes the current
+    DocumentManager + SchemaBrowser elements (Chainlit's
+    ``set_elements`` re-opens the sidebar). No-op when there are no
+    documents / schema to show (``_refresh_sidebar`` returns early).
+    """
+    await _refresh_sidebar()
+
+
+async def _resolve_doc_row(action: Action) -> dict | None:
+    """Fetch the document row referenced by a per-row action callback.
+
+    The per-row buttons (Open/Preprocess/Delete) send ``payload={"id": ...}``
+    from the ``DocumentManager`` JSX. Returns the row dict (or ``None`` when
+    the id is missing/the row was already deleted) and posts a not-found
+    message for the missing case so the caller can ``return`` immediately.
+    """
+    payload = getattr(action, "payload", {}) or {}
+    row_id = payload.get("id")
+    if not row_id:
+        await cl.Message(content=t("doc.open.not_found")).send()
+        return None
+    from falkordb_harness.document_registry import get as registry_get
+
+    row = await registry_get(row_id)
+    if row is None:
+        await cl.Message(content=t("doc.open.not_found")).send()
+    return row
+
+
+@cl.action_callback("open_document")
+async def on_open_document(action: Action) -> None:
+    """Render a document inline as a Chainlit element (the "Open" button).
+
+    Prefers the preprocessed Markdown (renders as a ``cl.Text``); falls back
+    to the original (``cl.Pdf`` / ``cl.Image`` / ``cl.Text`` by extension).
+    Ingested rows have no thread-scoped preview file — the user is told to
+    ask the assistant for an excerpt via chat instead.
+    """
+    row = await _resolve_doc_row(action)
+    if row is None:
         return
+    from falkordb_harness.document_registry import STAGE_INGESTED
+    from falkordb_harness.tools._paths import data_dir
+
+    if row.get("stage") == STAGE_INGESTED:
+        await cl.Message(content=t("doc.open.ingested_hint")).send()
+        return
+
+    elements = build_source_elements_from_row(row, data_dir())
+    if not elements:
+        await cl.Message(
+            content=t(
+                "doc.open.failed",
+                name=row.get("name") or "",
+                err="file not found on disk",
+            )
+        ).send()
+        return
+    await cl.Message(
+        content=t("doc.open.success", name=row.get("name") or ""),
+        elements=elements,
+    ).send()
+
+
+@cl.action_callback("preprocess_document_action")
+async def on_preprocess_document(action: Action) -> None:
+    """Run docprep on a single uploaded original (the "Preprocess" button).
+
+    Reuses :func:`_preprocess_document_impl` verbatim (no agent round-trip)
+    so the conversion is identical to the Ingest button's per-file step.
+    Runs in a worker thread because docprep (Docling + OCR / VLM) is
+    synchronous and can take minutes; the JSX keeps the button disabled
+    with a spinner while this callback is in flight. Registers the result
+    so the new ``preprocessed`` row appears in the sidebar.
+    """
+    row = await _resolve_doc_row(action)
+    if row is None:
+        return
+    from falkordb_harness.document_registry import STAGE_UPLOADED
+
+    if row.get("stage") != STAGE_UPLOADED:
+        await cl.Message(content=t("doc.preprocess.wrong_stage")).send()
+        return
+
+    original_path = row.get("originalPath")
+    if not original_path:
+        await cl.Message(
+            content=t(
+                "doc.preprocess.failed",
+                name=row.get("name") or "",
+                err="no original path recorded",
+            )
+        ).send()
+        return
+
+    from falkordb_harness.tools._paths import resolve as _resolve, virtual_path
+
+    resolved = _resolve(original_path)
+    if isinstance(resolved, str):
+        await cl.Message(
+            content=t(
+                "doc.preprocess.failed",
+                name=row.get("name") or "",
+                err=resolved,
+            )
+        ).send()
+        return
+    virtual = virtual_path(resolved)
+    yaml_path = os.getenv("DOCPREP_YAML", "")
+    ingest_cfg = cl.user_session.get("ingestion_settings") or _default_ingestion_settings()
+    overwrite = bool(ingest_cfg.get("overwrite_preprocessed", False))
+
+    await cl.Message(content=t("doc.preprocess.starting", name=row.get("name") or "")).send()
+
+    from falkordb_harness.tools.preprocess_tools import _preprocess_document_impl
+
+    result_json = await asyncio.to_thread(
+        _preprocess_document_impl, virtual, yaml_path, overwrite
+    )
+
+    import json as _json
+
     try:
-        selection = cl.user_session.get("graph_selection") or {}
-        active = selection.get("active_graph", _DEFAULT_GRAPH)
-        await cl.ElementSidebar.set_title(t("sidebar.schema.title", active=active))
-        await cl.ElementSidebar.set_elements(elements)
-    except Exception as exc:  # noqa: BLE001 — older Chainlit lacks ElementSidebar
-        logger.debug("ElementSidebar pin failed: %s", exc)
+        data = _json.loads(result_json)
+    except (_json.JSONDecodeError, TypeError):
+        data = {"error": result_json}
+
+    if isinstance(data, dict) and data.get("error"):
+        await cl.Message(
+            content=t(
+                "doc.preprocess.failed",
+                name=row.get("name") or "",
+                err=str(data["error"])[:300],
+            )
+        ).send()
+        return
+
+    out_virtual = (data or {}).get("output_path")
+    if (data or {}).get("already_exists"):
+        await cl.Message(
+            content=t(
+                "doc.preprocess.already_exists",
+                name=row.get("name") or "",
+                out=out_virtual or "",
+            )
+        ).send()
+    else:
+        await cl.Message(
+            content=t(
+                "doc.preprocess.done",
+                name=row.get("name") or "",
+                out=out_virtual or "",
+            )
+        ).send()
+
+    # Register the preprocessed output in the registry (best-effort),
+    # mirroring _register_preprocessed_from_tool_output.
+    if out_virtual:
+        from falkordb_harness.tools._paths import resolve as _resolve2
+
+        pre_abs = _resolve2(out_virtual)
+        if not isinstance(pre_abs, str):
+            try:
+                thread_id = cl.context.session.thread_id
+            except Exception:  # noqa: BLE001
+                thread_id = None
+            user_id = cl.user_session.get("user_identifier")
+            name = Path(pre_abs).name
+            from falkordb_harness.document_registry import register_preprocessed
+
+            try:
+                await register_preprocessed(
+                    thread_id=thread_id,
+                    user_identifier=user_id,
+                    name=name,
+                    original_path=str(resolved),
+                    preprocessed_path=str(pre_abs),
+                )
+            except Exception as exc:  # noqa: BLE001 — never block the chat
+                logger.debug("register_preprocessed failed: %s", exc)
+    await _refresh_sidebar()
+
+
+@cl.action_callback("delete_document")
+async def on_delete_document(action: Action) -> None:
+    """Delete an uploaded/preprocessed document (the "Delete" button).
+
+    Delegates to :func:`document_registry.delete`, which removes the row and
+    unlinks its on-disk file(s). Ingested rows are permanent and raise
+    :class:`IngestedDocumentNotDeletable` — the JSX hides the button for
+    them, so this path is a defensive fallback. The confirmation window is
+    handled client-side in the JSX (``window.confirm``) before the action
+    is dispatched. Trims the session's ``uploaded_files`` list so the
+    Ingest button target stays consistent.
+    """
+    row = await _resolve_doc_row(action)
+    if row is None:
+        return
+    from falkordb_harness.document_registry import (
+        IngestedDocumentNotDeletable,
+        delete as registry_delete,
+    )
+
+    try:
+        deleted = await registry_delete(row["id"])
+    except IngestedDocumentNotDeletable:
+        await cl.Message(content=t("doc.delete.not_deletable")).send()
+        return
+    if deleted is None:
+        await cl.Message(content=t("doc.open.not_found")).send()
+        return
+
+    # Keep the Ingest button's target list in sync with the registry.
+    original_path = deleted.get("originalPath")
+    if original_path:
+        uploaded = cl.user_session.get("uploaded_files") or []
+        if uploaded:
+            uploaded = [p for p in uploaded if str(p) != original_path]
+            cl.user_session.set("uploaded_files", uploaded)
+
+    await cl.Message(content=t("doc.delete.done", name=deleted.get("name") or "")).send()
+    await _refresh_sidebar()
+
+
+async def _register_preprocessed_from_tool_output(output: Any) -> None:
+    """Register a preprocessed doc in the registry from a tool's JSON output.
+
+    Called from ``on_tool_end`` when the agent ran ``preprocess_document``
+    directly (not via the Ingest button / ``extract_and_write``, which
+    register inside :func:`run_ingestion`). Parses the tool's JSON output
+    for ``output_path`` (the preprocessed ``.md``) and ``source`` (the
+    original), resolves their absolute on-disk paths, and calls
+    :func:`register_preprocessed`. Best-effort: any parse/registry error
+    is swallowed so the chat never breaks on a tracking failure.
+    """
+    try:
+        import json as _json
+
+        raw = output if isinstance(output, str) else str(output)
+        data = _json.loads(raw)
+        if not isinstance(data, dict) or data.get("error"):
+            return
+        pre_virtual = data.get("output_path")
+        src_virtual = data.get("source")
+        if not pre_virtual:
+            return
+        from falkordb_harness.tools._paths import resolve
+
+        pre_abs = resolve(pre_virtual)
+        src_abs = resolve(src_virtual) if src_virtual else pre_abs
+        if isinstance(pre_abs, str) or isinstance(src_abs, str):
+            return  # resolution error string — skip registration
+        try:
+            thread_id = cl.context.session.thread_id
+        except Exception:  # noqa: BLE001
+            thread_id = None
+        user_id = cl.user_session.get("user_identifier")
+        from pathlib import Path
+
+        # The preprocessed file's display name is the .md filename; the
+        # original's name is the source filename. Use the original stem +
+        # ".md" so it pairs with its uploaded row by name.
+        name = Path(pre_abs).name
+        from falkordb_harness.document_registry import register_preprocessed
+
+        await register_preprocessed(
+            thread_id=thread_id,
+            user_identifier=user_id,
+            name=name,
+            original_path=str(src_abs),
+            preprocessed_path=str(pre_abs),
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort tracking
+        logger.debug("register_preprocessed from tool output failed: %s", exc)
+
+
+async def _build_document_manager_props() -> dict | None:
+    """Build the props for the DocumentManager CustomElement.
+
+    Reads from the document registry:
+    - uploaded + preprocessed rows for the current thread (``threadId``).
+    - ingested rows for the active graph (``graphName``).
+
+    Returns ``{documents: [...], lang: "en"|"de", labels: {...}}`` or ``None``
+    if no rows and no schema (so the sidebar isn't opened empty). Each document
+    dict carries the fields the JSX component needs: ``id``, ``name``,
+    ``stage``, ``bytes``, ``mime``, ``ingestedAt``, a ``path`` for the "open"
+    action (the preprocessed path when available, else original), plus
+    ``canPreprocess`` (only uploaded non-plain-text originals) and
+    ``deletable`` (everything except ingested rows) which gate the per-row
+    action buttons. ``labels`` carries the localized button tooltips/confirm
+    strings so the JSX stays a dumb view.
+    """
+    try:
+        import chainlit as cl
+    except ImportError:
+        return None
+
+    from falkordb_harness.document_registry import (
+        STAGE_INGESTED,
+        STAGE_UPLOADED,
+        list_for_graph,
+        list_for_thread,
+    )
+    from falkordb_harness.ingest_runner import _needs_preprocessing
+
+    try:
+        thread_id = cl.context.session.thread_id
+    except Exception:  # noqa: BLE001
+        thread_id = None
+
+    selection = cl.user_session.get("graph_selection") or {}
+    active_graph = selection.get("active_graph", _DEFAULT_GRAPH)
+
+    docs: list[dict] = []
+    if thread_id:
+        docs.extend(await list_for_thread(thread_id))
+    docs.extend(await list_for_graph(active_graph))
+
+    if not docs:
+        return None
+
+    lang = cl.user_session.get("lang") or "de"
+    # Trim to the fields the JSX component renders. ``canPreprocess`` is
+    # True only for uploaded originals whose extension is non-plain-text
+    # (preprocessed rows are already Markdown; ingested rows are permanent).
+    documents = []
+    for d in docs:
+        stage = d.get("stage")
+        name = d.get("name") or ""
+        can_preprocess = stage == STAGE_UPLOADED and _needs_preprocessing(
+            Path(name)
+        )
+        documents.append(
+            {
+                "id": d.get("id"),
+                "name": name,
+                "stage": stage,
+                "bytes": d.get("bytes"),
+                "mime": d.get("mime"),
+                "ingestedAt": d.get("ingestedAt"),
+                "path": d.get("preprocessedPath") or d.get("originalPath"),
+                "canPreprocess": can_preprocess,
+                "deletable": stage != STAGE_INGESTED,
+            }
+        )
+    labels = {
+        "open": t("doc.action.open.tooltip"),
+        "preprocess": t("doc.action.preprocess.tooltip"),
+        "delete": t("doc.action.delete.tooltip"),
+        "deleteConfirm": t("doc.action.delete.confirm"),
+    }
+    return {"documents": documents, "lang": lang, "labels": labels}
 
 
 @cl.on_message
@@ -934,6 +1509,16 @@ async def on_message(message: cl.Message) -> None:
     user_content = message.content or ""
 
     if message.elements:
+        # Resolve the current thread id + user identifier once for the
+        # document-registry uploads below. ``cl.context.session.thread_id``
+        # is the same id Chainlit assigns to ``response_msg.thread_id``
+        # (constructed later in this handler); reading it here lets us
+        # register uploads before the assistant message exists.
+        try:
+            _thread_id = cl.context.session.thread_id
+        except Exception:  # noqa: BLE001 — older Chainlit / no context
+            _thread_id = None
+        _user_id = cl.user_session.get("user_identifier")
         for element in message.elements:
             if hasattr(element, "path") and element.path:
                 dest = ORIGINALS_DIR / element.name
@@ -952,6 +1537,35 @@ async def on_message(message: cl.Message) -> None:
                 if dest not in uploaded:
                     uploaded.append(dest)
                 cl.user_session.set("uploaded_files", uploaded)
+                # Register the upload in the document-management registry
+                # (single source of truth for the sidebar). Compute the
+                # checksum lazily so a missing file or read error can't
+                # break the chat — register_upload swallows its own errors
+                # too, so this is best-effort tracking.
+                try:
+                    from falkordb_harness.document_registry import (
+                        checksum_file,
+                        register_upload,
+                    )
+
+                    _mime = getattr(element, "mime", None) or None
+                    _bytes = dest.stat().st_size if dest.exists() else None
+                    _checksum = None
+                    try:
+                        _checksum = checksum_file(dest)
+                    except OSError:
+                        _checksum = None
+                    await register_upload(
+                        thread_id=_thread_id,
+                        user_identifier=_user_id,
+                        name=element.name,
+                        original_path=str(dest),
+                        mime=_mime,
+                        bytes_size=_bytes,
+                        checksum=_checksum,
+                    )
+                except Exception as exc:  # noqa: BLE001 — never block the chat
+                    logger.debug("register_upload failed: %s", exc)
 
     if message.elements:
         selection = cl.user_session.get("graph_selection") or {}
@@ -976,9 +1590,36 @@ async def on_message(message: cl.Message) -> None:
                     ),
                 ],
             ).send()
+            # Refresh the document sidebar so the newly-uploaded files
+            # appear immediately.
+            await _refresh_sidebar()
 
     response_msg = cl.Message(content="")
     await response_msg.send()
+
+    # Register the in-flight stream so on_chat_resume can replay its
+    # accumulated content if the UI reconnects (page reload / thread
+    # switch-back) while the agent is still generating. The message id
+    # is stable across the stream; the registry entry is cleared in the
+    # finally below once the stream concludes.
+    _stream_thread_id = response_msg.thread_id
+    register_stream(_stream_thread_id, response_msg)
+
+    # Install the ingestion-progress factory so the agent's
+    # ``extract_and_write`` tool (which runs inside LangGraph's tool
+    # coroutine, where it can't reach this handler's locals) can build a
+    # live ``cl.TaskList`` panel via ``cl.user_session``. The factory is
+    # lazy — the TaskList is only created if/when ``extract_and_write`` is
+    # invoked this turn — and is cleared after the stream to avoid leaking
+    # across turns. Shared with the action-button path via
+    # ``make_ingestion_progress`` so both ingestion entry points render
+    # identical per-stage / per-file progress UI.
+    from falkordb_harness.chainlit_progress import make_ingestion_progress
+
+    async def _ingest_progress_factory():
+        return await make_ingestion_progress()
+
+    cl.user_session.set("ingest_progress_factory", _ingest_progress_factory)
 
     active_steps: dict[str, cl.Step] = {}
     full_response = ""
@@ -1046,10 +1687,21 @@ async def on_message(message: cl.Message) -> None:
                     # Lazily create the collapsed "Tool calls" wrapper,
                     # anchored to the assistant message, on the first tool
                     # of the turn. Subsequent tools nest inside it.
+                    #
+                    # Why type="tool": Chainlit's frontend (cot="tool_call"
+                    # mode in .chainlit/config.toml) hides every non-message
+                    # step whose type != "tool" — including "run" and the
+                    # invalid "tools". A hidden step only renders its
+                    # children, never its own header, so it can't act as a
+                    # visible collapsible container. "tool" is the only
+                    # non-message StepType that stays visible in this mode,
+                    # and the Step panel (lKn) renders nested children
+                    # (t.steps) inside a collapsible accordion — exactly
+                    # the container we need.
                     if tool_calls_step is None:
                         tool_calls_step = cl.Step(
                             name="tool_calls",
-                            type="tools",
+                            type="tool",
                             parent_id=response_msg.id,
                             default_open=False,
                         )
@@ -1107,7 +1759,9 @@ async def on_message(message: cl.Message) -> None:
                     output = event.get("data", {}).get("output", "")
                     if step:
                         try:
-                            from falkordb_harness.chainlit_formatting import format_tool_output
+                            from falkordb_harness.chainlit_formatting import (
+                                format_tool_output,
+                            )
                             step.output = format_tool_output(tool_name, output)
                         except Exception:
                             step.output = str(output)[:2000]
@@ -1119,13 +1773,46 @@ async def on_message(message: cl.Message) -> None:
                     # pandas/plotly. We collect rather than send immediately
                     # to keep the conversation compact — the Step already
                     # shows the formatted output.
-                    _collect_visual_elements(
+                    await _collect_visual_elements(
                         tool_name, output, pending_elements
                     )
                     if tool_name == "get_schema":
                         last_schema_raw = (
                             output if isinstance(output, str) else str(output)
                         )
+                    # Register preprocessed documents in the registry when
+                    # the agent ran preprocess_document directly (not via
+                    # the Ingest button / extract_and_write, which register
+                    # inside run_ingestion). The tool's JSON output carries
+                    # ``output_path`` (preprocessed .md) and ``source``
+                    # (the original). Best-effort: parse, register, refresh
+                    # the sidebar so the new preprocessed file shows up.
+                    if tool_name == "preprocess_document":
+                        await _register_preprocessed_from_tool_output(output)
+                        await _refresh_sidebar()
+                    # extract_and_write registers ingested rows inside
+                    # run_ingestion; refresh the sidebar now so they appear.
+                    if tool_name == "extract_and_write":
+                        await _refresh_sidebar()
+                    # reset_graph wipes the graph data; clear the
+                    # registry's ingested rows for the active graph so the
+                    # sidebar matches, then refresh. Best-effort.
+                    if tool_name == "reset_graph":
+                        try:
+                            selection = cl.user_session.get(
+                                "graph_selection"
+                            ) or {}
+                            active = selection.get(
+                                "active_graph", _DEFAULT_GRAPH
+                            )
+                            from falkordb_harness.document_registry import (
+                                clear_ingested_for_graph,
+                            )
+
+                            await clear_ingested_for_graph(active)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.debug("clear_ingested failed: %s", exc)
+                        await _refresh_sidebar()
     except GraphRecursionError:
         # The agent exhausted the recursion budget without reaching a stop
         # condition (the repeat-guard middleware should normally prevent
@@ -1139,7 +1826,7 @@ async def on_message(message: cl.Message) -> None:
         if not full_response:
             full_response = t("error.recursion")
             await response_msg.stream_token(full_response)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.error("Unexpected error in agent streaming: %s", exc, exc_info=True)
         if full_response:
             await response_msg.stream_token(t("error.interrupted.partial"))
@@ -1158,6 +1845,16 @@ async def on_message(message: cl.Message) -> None:
                 await tool_calls_step.update()
             except Exception as exc:  # noqa: BLE001 — never block cleanup
                 logger.debug("tool_calls_step expand failed: %s", exc)
+    finally:
+        # The streaming loop ended (success, error, or recursion limit).
+        # Remove the in-flight stream from the recovery registry so a
+        # reconnecting client doesn't replay an already-finished message.
+        # The response_msg.update() call below (outside this try) then
+        # persists + emits the complete text, so the step row carries the
+        # full answer and a normal resume renders it verbatim. Using
+        # finally (rather than a trailing line) guarantees deregistration
+        # even if an except handler itself raised.
+        deregister_stream(_stream_thread_id)
 
     await response_msg.update()
 
@@ -1185,3 +1882,6 @@ async def on_message(message: cl.Message) -> None:
         chat_history[:] = chat_history[-(MAX_HISTORY_PAIRS * 2) :]
 
     cl.user_session.set("chat_history", chat_history)
+    # Drop the per-turn ingestion-progress factory so a stale closure can't
+    # be reused on a later turn (each turn installs its own above).
+    cl.user_session.set("ingest_progress_factory", None)

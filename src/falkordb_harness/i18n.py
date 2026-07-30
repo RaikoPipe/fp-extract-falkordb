@@ -309,6 +309,85 @@ STRINGS: dict[str, dict[str, str]] = {
         "en": "Schema — {active}",
         "de": "Schema — {active}",
     },
+    # --- Document manager sidebar title (chainlit_app.py) -----------------
+    "sidebar.title": {
+        "en": "Documents — {active}",
+        "de": "Dokumente — {active}",
+    },
+    # --- Persistent "open document sidebar" button (OpenDocsButton.jsx) ---
+    "sidebar.open_button.label": {
+        "en": "Documents",
+        "de": "Dokumente",
+    },
+    "sidebar.open_button.title": {
+        "en": "Open document sidebar",
+        "de": "Dokumenten-Seitenleiste öffnen",
+    },
+
+    # --- Document manager row actions (DocumentManager.jsx + callbacks) ---
+    "doc.action.open.label": {"en": "Open", "de": "Öffnen"},
+    "doc.action.open.tooltip": {
+        "en": "Preview this document inline",
+        "de": "Dieses Dokument als Vorschau öffnen",
+    },
+    "doc.action.preprocess.label": {"en": "Preprocess", "de": "Vorverarbeiten"},
+    "doc.action.preprocess.tooltip": {
+        "en": "Convert this document to Markdown via docprep",
+        "de": "Dieses Dokument per docprep nach Markdown umwandeln",
+    },
+    "doc.action.delete.label": {"en": "Delete", "de": "Löschen"},
+    "doc.action.delete.tooltip": {
+        "en": "Delete this document and its on-disk file",
+        "de": "Dieses Dokument und die zugehörige Datei löschen",
+    },
+    "doc.action.delete.confirm": {
+        "en": "Delete this document? The on-disk file will be removed. Ingested rows are permanent and cannot be deleted.",
+        "de": "Dieses Dokument löschen? Die Datei wird entfernt. Ingestierte Einträge sind dauerhaft und können nicht gelöscht werden.",
+    },
+    "doc.open.not_found": {
+        "en": "Document not found. It may have already been deleted.",
+        "de": "Dokument nicht gefunden. Möglicherweise wurde es bereits gelöscht.",
+    },
+    "doc.open.ingested_hint": {
+        "en": "Ingested files live in the knowledge graph. Ask the assistant to read an excerpt via the chat.",
+        "de": "Ingestierte Dateien liegen im Wissensgraphen. Bitte die Assistentin im Chat, einen Auszug zu lesen.",
+    },
+    "doc.open.success": {
+        "en": "Showing **{name}**.",
+        "de": "Zeige **{name}**.",
+    },
+    "doc.open.failed": {
+        "en": "Could not open **{name}**: {err}",
+        "de": "**{name}** konnte nicht geöffnet werden: {err}",
+    },
+    "doc.preprocess.starting": {
+        "en": "Preprocessing `{name}`…",
+        "de": "Verarbeite `{name}` vor…",
+    },
+    "doc.preprocess.done": {
+        "en": "Preprocessed `{name}` → `{out}`.",
+        "de": "`{name}` vorverarbeitet → `{out}`.",
+    },
+    "doc.preprocess.already_exists": {
+        "en": "`{name}` is already preprocessed (`{out}`). Set the overwrite setting to re-run.",
+        "de": "`{name}` ist bereits vorverarbeitet (`{out}`). Aktiviere die Überschreiben-Einstellung, um erneut zu starten.",
+    },
+    "doc.preprocess.failed": {
+        "en": "Preprocessing `{name}` failed: {err}",
+        "de": "Vorverarbeitung von `{name}` fehlgeschlagen: {err}",
+    },
+    "doc.preprocess.wrong_stage": {
+        "en": "Only uploaded originals can be preprocessed.",
+        "de": "Nur hochgeladene Originale können vorverarbeitet werden.",
+    },
+    "doc.delete.done": {
+        "en": "Deleted `{name}`.",
+        "de": "`{name}` gelöscht.",
+    },
+    "doc.delete.not_deletable": {
+        "en": "Ingested files are permanent and cannot be deleted from the sidebar. Reset the graph to clear its data.",
+        "de": "Ingestierte Dateien sind dauerhaft und können nicht aus der Seitenleiste gelöscht werden. Setze den Graphen zurück, um seine Daten zu leeren.",
+    },
 
     # --- Formatting helpers (chainlit_formatting.py) ----------------------
     "fmt.no_results": {"en": "*No results.*", "de": "*Keine Ergebnisse.*"},
