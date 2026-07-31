@@ -6,9 +6,11 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # System deps required by some Python wheels (e.g. unstructured, lxml).
+# gosu is used by the entrypoint to drop from root to appuser at runtime.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
+        gosu \
         libxml2 \
         libxslt1.1 \
         libpq5 \
@@ -30,13 +32,20 @@ RUN pip install --no-cache-dir ".[chainlit]"
 COPY .chainlit/ .chainlit/
 COPY chainlit.md chainlit_en-US.md chainlit_de-DE.md ./
 
-# Chainlit UI.
-EXPOSE 8000
+# Entrypoint: chowns the bind-mounted /app/data to appuser (the image's
+# own chown is shadowed by the host-owned bind mount), then drops to
+# appuser via gosu and execs the CMD. Image runs as root only during
+# entrypoint; the long-running chainlit process runs as appuser.
+COPY docker-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-# Run as a non-root user for defense in depth.
+# Create the non-root user the entrypoint drops to.
 RUN useradd --create-home --uid 1001 appuser \
     && mkdir -p /app/data \
     && chown -R appuser:appuser /app
-USER appuser
 
+# Chainlit UI.
+EXPOSE 8000
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["chainlit", "run", "src/falkordb_harness/chainlit_app.py", "--host", "0.0.0.0", "--port", "8000"]
