@@ -1,0 +1,44 @@
+# VCS / metadata
+.git/
+.gitmodules
+.idea/
+.vscode/
+.ruff_cache/
+.pytest_cache/
+.langgraph_api/
+
+# Virtualenvs / build artifacts
+.venv/
+.venv13/
+venv/
+build/
+dist/
+*.egg-info/
+**/__pycache__/
+
+# Local runtime state — never ship a populated DB or uploads into the image.
+.env
+data/
+.files/
+laundry_wash/
+
+# Tests + docs + media not needed at runtime.
+tests/
+*.md
+!chainlit.md
+!chainlit_en-US.md
+!chainlit_de-DE.md
+conceptual_showcase.mp4
+README.md
+docprep.example.yaml
+
+# Docker files themselves (not needed inside the image).
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Local docprep build artifacts inside the submodule.
+src/document-to-markdown/build/
+src/document-to-markdown/dist/
+src/document-to-markdown/**/__pycache__/
+src/document-to-markdown/.pytest_cache/

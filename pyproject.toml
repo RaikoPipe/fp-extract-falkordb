@@ -39,8 +39,10 @@ chainlit = [
     "pandas>=2.0.0",
     "plotly>=5.20.0",
     # User management & chat persistence (SQLite-backed data layer +
-    # password auth). sqlalchemy is already pulled in by chainlit; the
-    # async SQLite driver and the password-hashing lib are not.
+    # password auth). sqlalchemy is used directly by the harness's auth
+    # and document_registry modules; the async SQLite driver and the
+    # password-hashing lib are not pulled in by chainlit alone.
+    "sqlalchemy>=2.0.0",
     "aiosqlite>=0.19.0",
     "bcrypt>=4.0.0",
     # Public-deployment auth: async SMTP for email verification / password

@@ -6,6 +6,12 @@ services:
       - "3000:3000"
     volumes:
       - falkordb_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
 
   chainlit:
     build: .
@@ -23,7 +29,18 @@ services:
     volumes:
       - ./data:/app/data
     depends_on:
-      - falkordb
+      falkordb:
+        condition: service_healthy
+    healthcheck:
+      # Chainlit serves the UI on /. A 200 from the root path means the
+      # HTTP server is up and serving. Use --fail so curl exits non-zero
+      # on any non-2xx response.
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/', timeout=5).read()\""]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    restart: unless-stopped
 
 volumes:
   falkordb_data:
