@@ -460,3 +460,133 @@ def test_on_chat_start_does_not_send_open_docs_button(monkeypatch):
     assert "_send_open_docs_button()" not in cleaned, (
         "on_chat_start must not eagerly call _send_open_docs_button"
     )
+
+
+# ---------------------------------------------------------------------------
+# _send_welcome_modal (startup-screen preservation via element sidebar)
+# ---------------------------------------------------------------------------
+# The welcome modal must be delivered via cl.ElementSidebar.set_elements,
+# NOT a cl.Message. Sending a cl.Message (even with empty content) emits a
+# ``new_message`` socket event whose step type is ``assistant_message``;
+# Chainlit's frontend unmounts the starter/startup view as soon as any such
+# message lands. Routing through the element sidebar emits only
+# ``set_sidebar_elements`` + ``element`` events, which do not touch the
+# message list, so the starter view stays while the modal overlays it.
+
+
+class _FakeElementSidebar:
+    """Captures cl.ElementSidebar.set_title / set_elements calls."""
+
+    def __init__(self):
+        self.titles = []
+        self.elements_calls = []
+
+    async def set_title(self, title):
+        self.titles.append(title)
+
+    async def set_elements(self, elements, key=None):
+        self.elements_calls.append({"elements": list(elements), "key": key})
+
+
+def _install_welcome_stubs(monkeypatch):
+    """Stub cl.user_session / cl.context / cl.Message / cl.ElementSidebar.
+
+    Returns (session, message_recorder, sidebar_recorder).
+    """
+    import chainlit as cl
+
+    session, recorder = _install_cl_stubs(monkeypatch)
+    sidebar = _FakeElementSidebar()
+    monkeypatch.setattr(cl, "ElementSidebar", sidebar)
+    return session, recorder, sidebar
+
+
+def test_send_welcome_modal_uses_sidebar_not_message(monkeypatch):
+    """_send_welcome_modal routes through ElementSidebar, not cl.Message.
+
+    Asserts:
+    - cl.ElementSidebar.set_elements is called once with a WelcomeModal
+      CustomElement (and a non-None key).
+    - cl.ElementSidebar.set_title is called.
+    - cl.Message.send is NOT invoked (no chat message emitted, so the
+      starter/startup view is preserved).
+    """
+    _session, recorder, sidebar = _install_welcome_stubs(monkeypatch)
+
+    import falkordb_harness.chainlit_app as app
+
+    # cl.CustomElement reads the chainlit contextvar at construction time,
+    # so the context must be set inside the running loop.
+    _run_with_ctx(app._send_welcome_modal())
+
+    # Sidebar channel used.
+    assert len(sidebar.elements_calls) == 1, (
+        "WelcomeModal must be delivered via ElementSidebar.set_elements"
+    )
+    call = sidebar.elements_calls[0]
+    assert call["key"] == "welcome"
+    assert len(call["elements"]) == 1
+    el = call["elements"][0]
+    # cl.CustomElement stores its name/props as attributes.
+    assert getattr(el, "name", None) == "WelcomeModal"
+    props = getattr(el, "props", None) or {}
+    assert props.get("dismissedKey") == "fp_welcome_ack_v1"
+    assert "risks" in props and isinstance(props["risks"], list)
+    # A title is set (used as the sidebar header behind the modal backdrop).
+    assert len(sidebar.titles) == 1
+    # No chat message emitted -> starter view preserved.
+    assert recorder.sent == [], (
+        "_send_welcome_modal must not send a cl.Message (would swap the "
+        "starter screen for an empty active chat)"
+    )
+
+
+def test_on_chat_start_does_not_send_welcome_message(monkeypatch):
+    """on_chat_start must not emit a cl.Message for the welcome modal.
+
+    Asserted at the source level: on_chat_start's executable code must not
+    construct a cl.Message whose elements include a WelcomeModal
+    CustomElement. The modal is delivered via _send_welcome_modal, which
+    routes through cl.ElementSidebar (verified by
+    test_send_welcome_modal_uses_sidebar_not_message). We strip
+    comments/docstrings and the delegated _send_welcome_modal() call, then
+    confirm no inline WelcomeModal cl.Message remains.
+    """
+    import inspect
+    import re
+
+    import falkordb_harness.chainlit_app as app
+
+    src = inspect.getsource(app.on_chat_start)
+    cleaned = re.sub(r"#.*", "", src)
+    cleaned = re.sub(r'""".*?"""', "", cleaned, flags=re.DOTALL)
+    # The delegated call is allowed (it uses the sidebar channel).
+    cleaned = cleaned.replace("await _send_welcome_modal()", "")
+    assert "WelcomeModal" not in cleaned, (
+        "on_chat_start must not inline a WelcomeModal cl.Message; the modal "
+        "is delivered via _send_welcome_modal -> ElementSidebar"
+    )
+    assert 'cl.Message(' not in cleaned, (
+        "on_chat_start must not send any cl.Message (would leave the "
+        "starter/startup screen)"
+    )
+
+
+def test_on_chat_start_still_calls_welcome_modal(monkeypatch):
+    """on_chat_start must still call _send_welcome_modal.
+
+    Guards against the welcome modal being accidentally dropped during
+    refactoring. The call is required so first-time users see the test-build
+    warning (delivered via the element sidebar, preserving the starter view).
+    """
+    import inspect
+    import re
+
+    import falkordb_harness.chainlit_app as app
+
+    src = inspect.getsource(app.on_chat_start)
+    cleaned = re.sub(r"#.*", "", src)
+    cleaned = re.sub(r'""".*?"""', "", cleaned, flags=re.DOTALL)
+    assert "_send_welcome_modal()" in cleaned, (
+        "on_chat_start must still call _send_welcome_modal"
+    )
