@@ -32,7 +32,7 @@ RUN pip install --no-cache-dir ".[chainlit]"
 COPY .chainlit/ .chainlit/
 COPY chainlit.md chainlit_en-US.md chainlit_de-DE.md ./
 
-# Custom Chainlit elements (WelcomeModal, OpenDocsButton, DocumentManager).
+# Custom Chainlit elements (OpenDocsButton, DocumentManager).
 # Without this, CustomElement props are sent from the backend but the JSX
 # components are absent from the image, so the elements render nothing on the
 # frontend (the try/except around the Python send only catches server-side

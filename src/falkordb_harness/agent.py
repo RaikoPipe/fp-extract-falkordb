@@ -152,7 +152,13 @@ You can:
 - Inspect the graph schema, nodes, edges, and node count \
 (get_schema, list_nodes, list_edges, node_count)
 - Discover which knowledge graphs exist in the FalkorDB instance (list_graphs) \
-and switch the active graph among the user's enabled set (use_graph)
+and switch the active graph among the user's enabled set — switching requires \
+prior user confirmation via request_graph_switch followed by use_graph
+- Create a new knowledge graph (create_graph) when no graph is selected and \
+the user wants to ingest data — no confirmation needed, decide on user sentiment
+- Read graph descriptions (describe_graph) — the first-contact point for \
+understanding existing KGs — and revise the active graph's description after \
+every ingestion (update_graph_description)
 - Manage merge conflicts via cypher_query: list nodes with a non-null \
 ``conflicts`` property, and resolve a specific conflict entry by rewriting \
 its JSON string to set ``resolved: true`` and ``resolved_at`` and SETting \
@@ -195,6 +201,24 @@ PRE-INGESTION REVIEW ROUTINE (mandatory before extract_and_write):
 This routine is a soft guardrail that prevents large amounts of data noise from \
 entering the knowledge graph. Follow it every time the user asks to ingest from \
 a directory or names files to ingest.
+0. CREATE OR SELECT GRAPH (only if no graph is selected — see preamble): \
+if the preamble says NO graph is active, your FIRST step before anything else \
+is to determine whether the user wants to ingest into an EXISTING graph or a \
+NEW one. Do this by calling ``list_graphs`` (and ``describe_graph()`` with no \
+arguments to read every graph's description), then ask the user via ``ask_user`` \
+whether they want to reuse an existing graph (name one) or create a new one. \
+Base your suggestion on the user's intent and the existing descriptions \
+(e.g. if a graph's description matches the data domain, suggest reusing it). \
+Only after the user chooses:
+- If they name an existing graph, call ``request_graph_switch(name)`` and wait \
+for confirmation, then ``use_graph(name)``.
+- If they want a new one, call ``create_graph(name, description)`` where \
+``name`` is derived from the user's ingestion intent (a short, stable \
+identifier for the domain) and ``description`` is a concise 1-3 sentence \
+summary of the graph's intended scope. Do NOT ask for further confirmation \
+for creation — decide the name/description from user sentiment.
+Only after a graph is active do you proceed to the review routine. If a graph \
+IS already active, skip this step.
 1. DISCOVER: call ls (or glob) on ``originals/<session_id>/`` to list \
 candidate files for THIS session. The filesystem root is DATA_DIR; both \
 ``originals/`` (raw uploaded sources) and ``preprocessed/`` (Markdown output) \
@@ -232,6 +256,11 @@ it at ``originals/`` if the user explicitly wants to ingest raw text sources \
 directly. When passing a data_dir to extract_and_write/chunk_documents, prefer \
 your session's subdirectory (``preprocessed/<session_id>``) so you do not \
 pick up another session's files.
+6b. UPDATE DESCRIPTION: after every successful ingestion, call \
+``update_graph_description(description)`` with a revised 1-3 sentence summary \
+of the graph's contents (entities, source documents, scope) so the description \
+stays accurate. The description is the first thing read when understanding \
+the graph.
 Err on the side of showing the user too much summary rather than too little.
 
 Guidelines:
@@ -243,6 +272,18 @@ reconciliation links.
 - Reconciliation applies to Resources only and never auto-merges duplicates; \
 always leave adjudication to the human via clear_reconciliations.
 - Never reset the graph without explicit user confirmation.
+- To switch the active graph: (1) call list_graphs to see what exists, (2) \
+call request_graph_switch(name) — this asks the user to confirm via a \
+Confirm/Cancel prompt, (3) only AFTER the user confirms, call use_graph(name). \
+Never call use_graph without a prior confirmed request_graph_switch for the \
+same name; use_graph will refuse and return an error otherwise. You may read \
+graph descriptions via describe_graph (with no name argument) to help the \
+user choose.
+- When you need to learn about the existing knowledge graphs (e.g. before \
+switching, or to answer "what's in this graph?"), call ``describe_graph()`` \
+with NO arguments FIRST — it returns every graph's description in one call. \
+Only fall back to get_schema / list_nodes on the active graph if the \
+description is empty or you need structural detail.
 - You are restricted to the user's enabled knowledge graphs. \
 use_graph(name) will reject any graph the user has not enabled. \
 When asked "which knowledge graphs are available?", answer with the session's \
@@ -255,6 +296,7 @@ def _build_graph_context_prefix(
     active_graph: str | None,
     allowed_graphs: list[str] | None,
     thread_id: str | None = None,
+    graph_description: str | None = None,
 ) -> str:
     """Build the dynamic preamble appended to SYSTEM_PROMPT for graph selection.
 
@@ -266,6 +308,12 @@ def _build_graph_context_prefix(
     this drives the SESSION FILE ISOLATION rule in SYSTEM_PROMPT. Returns an
     empty string when no per-session selection is configured (the CLI /
     default path), preserving the original prompt.
+
+    When ``active_graph`` is falsy (the no-graph sentinel state), the
+    preamble explicitly says NO graph is active and directs the agent to
+    create one before ingestion (see PRE-INGESTION REVIEW ROUTINE step 0).
+    When ``graph_description`` is provided for an active graph, it is
+    included so the agent sees the graph's description without a tool call.
     """
     if not active_graph and not allowed_graphs and not thread_id:
         return ""
@@ -275,6 +323,17 @@ def _build_graph_context_prefix(
     ]
     if active_graph:
         parts.append(f"- Active graph (all queries/ingestion target this): '{active_graph}'")
+        if graph_description:
+            parts.append(f"- Active graph description: {graph_description}")
+    else:
+        parts.append(
+            "- NO knowledge graph is currently selected. You cannot query or "
+            "ingest until a graph is active. If the user wants to ingest data, "
+            "your FIRST step is to determine whether to reuse an EXISTING graph "
+            "or create a NEW one: call list_graphs and describe_graph() to see "
+            "what exists, then ask the user via ask_user which they want. See "
+            "PRE-INGESTION REVIEW ROUTINE step 0 for the full procedure."
+        )
     if allowed_graphs:
         parts.append(
             "- Enabled graphs (the only ones you may switch to via use_graph): "
@@ -282,11 +341,13 @@ def _build_graph_context_prefix(
         )
     else:
         parts.append("- Enabled graphs: unrestricted (any graph name is accepted)")
-    parts.append(
-        "- To switch the active graph, call use_graph(name) with one of the "
-        "enabled names. The user selected these via the UI; do not question "
-        "or expand the set."
-    )
+    if active_graph:
+        parts.append(
+            "- To switch the active graph: call request_graph_switch(name) to "
+            "ask the user to confirm, then call use_graph(name) only after "
+            "confirmation. Never call use_graph without a prior confirmed "
+            "request_graph_switch for the same name."
+        )
     if thread_id:
         parts.append(
             f"- Your current session id is '{thread_id}'. Only files under "
@@ -531,8 +592,21 @@ def build_agent(
         )
         set_session_backend(session_backend)
 
+    # Fetch the active graph's description (if any) so the preamble can
+    # surface it without a tool call. Uses the SYNC sqlite reader because
+    # build_agent runs inside the already-running Chainlit event loop and
+    # cannot await. Best-effort: a fetch failure degrades to no description.
+    graph_description: str | None = None
+    if active_graph:
+        try:
+            from falkordb_harness.graph_descriptions import get_description_sync
+
+            graph_description = get_description_sync(active_graph) or None
+        except Exception:  # noqa: BLE001 — never block agent build on desc fetch
+            graph_description = None
+
     system_prompt = SYSTEM_PROMPT + _build_graph_context_prefix(
-        active_graph, allowed_graphs, thread_id
+        active_graph, allowed_graphs, thread_id, graph_description
     )
 
     # Role-based tool gating: the destructive reset_graph tool is only

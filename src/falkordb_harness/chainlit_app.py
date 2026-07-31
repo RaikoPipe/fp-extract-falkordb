@@ -106,8 +106,16 @@ def _history_from_thread(thread: dict) -> list:
 
 # Default graph, used to seed the sidebar widgets when no FalkorDB instance is
 # reachable yet (e.g. starting before `docker-compose up`). Resolved from the
-# same env var the backend reads.
+# same env var the backend reads. NOTE: this is only a listing-failure fallback
+# and the CLI default — a new chat in the UI no longer auto-selects it. Instead
+# the user's last-used graph is preselected, or the no-graph sentinel when none.
 _DEFAULT_GRAPH = os.getenv("FALKORDB_GRAPH", "factory_planning")
+
+# Sentinel for the "no knowledge graph selected" state. When active_graph is
+# this value, the agent cannot query/ingest and must create a graph first
+# (create_graph tool) when the user wants to ingest. Rendered as a localized
+# "(no graph selected)" entry in the active_graph Select widget.
+_NO_GRAPH = ""
 
 logger = logging.getLogger("falkordb_harness.chainlit")
 
@@ -188,13 +196,20 @@ def _list_available_graphs() -> list[str]:
     return [_DEFAULT_GRAPH]
 
 
-def _build_settings_widgets(graphs: list[str]) -> cl.ChatSettings:
+def _build_settings_widgets(
+    graphs: list[str],
+    initial_active: str | None = None,
+    initial_allowed: list[str] | None = None,
+) -> cl.ChatSettings:
     """Construct the tabbed chat-settings widgets.
 
     Two tabs:
 
-    **Graph** — graph selection (unchanged behaviour):
-    - ``active_graph`` (Select): the single graph the agent targets.
+    **Graph** — graph selection:
+    - ``active_graph`` (Select): the single graph the agent targets. A
+      localized "(no graph selected)" entry (value ``""``) is always
+      prepended so the no-graph state is selectable. ``initial_active``
+      defaults to the no-graph sentinel when not provided.
     - ``allowed_graphs`` (MultiSelect): the checkbox set of graphs the agent
       may switch among at runtime via ``use_graph``.
     - ``new_graph_name`` (TextInput): type a name and hit Save to create a
@@ -210,9 +225,16 @@ def _build_settings_widgets(graphs: list[str]) -> cl.ChatSettings:
       exists.
     - ``merge_mode`` (Select): overwrite | conflict | skip.
     """
-    # Ensure the default is present in the list even if FalkorDB returned it.
-    if _DEFAULT_GRAPH not in graphs:
-        graphs = [*_graphs_unique(graphs), _DEFAULT_GRAPH]
+    graphs = _graphs_unique(graphs)
+    # Prepend the no-graph sentinel entry so the empty state is selectable.
+    # The label is localized; the value is the empty string.
+    no_graph_entry = {"label": t("graph.none"), "value": _NO_GRAPH}
+    select_values: list = [no_graph_entry, *graphs]
+
+    init_active = initial_active if initial_active is not None else _NO_GRAPH
+    init_allowed = initial_allowed if initial_allowed is not None else (
+        [_DEFAULT_GRAPH] if _DEFAULT_GRAPH in graphs else []
+    )
 
     graph_tab = input_widget.Tab(
         id="graph",
@@ -221,15 +243,15 @@ def _build_settings_widgets(graphs: list[str]) -> cl.ChatSettings:
             input_widget.Select(
                 id="active_graph",
                 label=t("settings.active_graph.label"),
-                values=graphs,
-                initial_value=_DEFAULT_GRAPH,
+                values=select_values,
+                initial_value=init_active,
                 description=t("settings.active_graph.desc"),
             ),
             input_widget.MultiSelect(
                 id="allowed_graphs",
                 label=t("settings.allowed_graphs.label"),
                 values=graphs,
-                initial=[_DEFAULT_GRAPH],
+                initial=init_allowed,
                 description=t("settings.allowed_graphs.desc"),
             ),
             input_widget.TextInput(
@@ -362,16 +384,24 @@ def _coerce_ingestion_settings(settings: dict) -> dict:
 def _normalize_selection(
     active_graph: str | None,
     allowed_graphs: list[str] | None,
-) -> tuple[str | None, list[str] | None]:
+) -> tuple[str, list[str]]:
     """Coerce raw settings-dict values into (active, allowed) and repair state.
 
-    - ``active_graph`` must be a non-empty string; falls back to the default.
-    - ``allowed_graphs`` must be a list; if empty/None it becomes
-      ``[active_graph]``.
-    - The active graph is always inserted into the allowed set.
+    - ``active_graph`` may be a graph name OR the empty-string no-graph
+      sentinel (``_NO_GRAPH``); None falls back to the no-graph sentinel.
+    - ``allowed_graphs`` must be a list; when the active graph is a real
+      graph name, an empty/None allowed set becomes ``[active_graph]``.
+      When the active graph is the no-graph sentinel, the allowed set is
+      forced to ``[]`` (nothing enabled).
+    - A real (non-sentinel) active graph is always inserted into the
+      allowed set.
     """
-    if not active_graph or not isinstance(active_graph, str):
-        active_graph = _DEFAULT_GRAPH
+    if active_graph is None or not isinstance(active_graph, str):
+        active_graph = _NO_GRAPH
+    active_graph = active_graph.strip() if active_graph else _NO_GRAPH
+    # No-graph sentinel state: empty active graph, empty allowed set.
+    if not active_graph:
+        return _NO_GRAPH, []
     if not allowed_graphs or not isinstance(allowed_graphs, (list, tuple)):
         allowed_graphs = [active_graph]
     else:
@@ -379,6 +409,21 @@ def _normalize_selection(
         if active_graph not in allowed_graphs:
             allowed_graphs = [active_graph, *allowed_graphs]
     return active_graph, allowed_graphs
+
+
+async def _persist_last_graph_for_user(graph: str) -> None:
+    """Persist ``graph`` as the current user's last-used graph (best-effort)."""
+    if not graph:
+        return
+    ident = cl.user_session.get("user_identifier")
+    if not ident:
+        return
+    try:
+        from falkordb_harness.graph_descriptions import set_last_graph
+
+        await set_last_graph(ident, graph)
+    except Exception:  # noqa: BLE001 — never block on persistence
+        pass
 
 
 def _rebuild_agent_for_selection(
@@ -582,11 +627,35 @@ async def on_chat_start() -> None:
         cl.user_session.set("user_identifier", None)
 
     graphs = _list_available_graphs()
-    settings = _build_settings_widgets(graphs)
+
+    # Preselect the user's last-used graph (per-user, persisted in
+    # users.metadata). Falls to the no-graph sentinel when the user has no
+    # last-used graph OR the last-used graph no longer exists on the
+    # instance. This runs entirely within on_chat_start (no cl.Message is
+    # sent) so the starter view is preserved.
+    identifier = cl.user_session.get("user_identifier")
+    initial_active = _NO_GRAPH
+    initial_allowed: list[str] = []
+    if identifier:
+        try:
+            from falkordb_harness.graph_descriptions import get_last_graph
+
+            last = await get_last_graph(identifier)
+        except Exception:  # noqa: BLE001 — never block chat start
+            last = None
+        if last and last in graphs:
+            initial_active = last
+            initial_allowed = [last]
+        # else: fall to no-graph state (not factory_planning)
+
+    settings = _build_settings_widgets(graphs, initial_active, initial_allowed)
     await settings.send()
 
-    active, allowed = _normalize_selection(_DEFAULT_GRAPH, [_DEFAULT_GRAPH])
+    active, allowed = _normalize_selection(initial_active, initial_allowed)
     _rebuild_agent_for_selection(active, allowed)
+    # Seed the graph-switch approval stamp so the preselected graph (if any)
+    # is already "approved" — the user chose it by having used it last.
+    cl.user_session.set("graph_switch_approved", active or None)
     cl.user_session.set("chat_history", [])
     # Track uploaded file paths across the session so the Ingest button can
     # pick them up. Each upload appends to this list (see on_message).
@@ -625,14 +694,16 @@ async def on_chat_start() -> None:
     # Sending it would emit an assistant chat message, swapping the
     # startup/starter screen for an empty active chat. The button is
     # injected lazily on the first user turn where documents exist.
-
-    # Send the startup welcome / acknowledgement popup (test-build warning).
-    # Unlike the open-docs button, the welcome modal is a blocking overlay
-    # that MUST appear on startup; it renders above any view via
-    # position:fixed and is dismissed only by the "I understand and
-    # acknowledge." button. Re-show is suppressed per-browser via
-    # localStorage, so returning users don't see it again.
-    await _send_welcome_modal()
+    #
+    # NOTE: the startup welcome / acknowledgement warning is intentionally
+    # NOT sent from here. Sending any assistant message (even an empty one
+    # carrying only a CustomElement) transitions Chainlit's frontend out of
+    # the starter view into the active chat view — a regression that
+    # persisted even after the modal was dismissed. The warning is instead
+    # embedded in the /register page (see auth.py _register_html), which is
+    # server-rendered HTML outside Chainlit's view machine, so it cannot
+    # trigger the transition and guarantees acknowledgement before the user
+    # ever reaches the chat.
 
 
 @cl.on_chat_resume
@@ -692,17 +763,31 @@ async def on_chat_resume(thread: ThreadDict) -> None:
             metadata = {}
 
     graph_selection = metadata.get("graph_selection") or {}
-    active_graph = graph_selection.get("active_graph", _DEFAULT_GRAPH)
-    allowed_graphs = graph_selection.get("allowed_graphs") or [active_graph]
+    active_graph = graph_selection.get("active_graph") or _NO_GRAPH
+    allowed_graphs = graph_selection.get("allowed_graphs") or (
+        [active_graph] if active_graph else []
+    )
 
     # Re-send the settings widgets so the sidebar reflects the resumed
     # thread's graph selection (not the default).
     graphs = _list_available_graphs()
-    settings = _build_settings_widgets(graphs)
+    settings = _build_settings_widgets(graphs, active_graph, allowed_graphs)
     await settings.send()
 
     active, allowed = _normalize_selection(active_graph, allowed_graphs)
     _rebuild_agent_for_selection(active, allowed)
+    # Seed the approval stamp for the resumed graph (the user chose it by
+    # reopening this thread) and persist it as the last-used graph.
+    cl.user_session.set("graph_switch_approved", active or None)
+    if active:
+        ident = cl.user_session.get("user_identifier")
+        if ident:
+            try:
+                from falkordb_harness.graph_descriptions import set_last_graph
+
+                await set_last_graph(ident, active)
+            except Exception:  # noqa: BLE001 — never block resume
+                pass
 
     # --- reconstruct chat_history from persisted steps ---
     cl.user_session.set("chat_history", _history_from_thread(thread))
@@ -809,16 +894,26 @@ async def on_settings_update(settings: dict) -> None:
     if new_graph_name:
         # Creation succeeded — make the new graph the active graph and ensure
         # it's in the enabled set, then refresh the widgets so the dropdowns
-        # reflect the new graph and the text field is cleared.
+        # reflect the new graph and the text field is cleared. Seed an empty
+        # description row (the LLM will revise it after the first ingestion,
+        # or the user may ingest via the button which auto-derives one).
+        try:
+            from falkordb_harness.graph_descriptions import set_description
+
+            await set_description(new_graph_name, "")
+        except Exception:  # noqa: BLE001 — never block creation on desc seed
+            pass
         active, allowed = _normalize_selection(new_graph_name, list(allowed_raw or []))
         if new_graph_name not in allowed:
             allowed = [new_graph_name, *allowed]
         _rebuild_agent_for_selection(active, allowed)
+        cl.user_session.set("graph_switch_approved", active)
+        await _persist_last_graph_for_user(active)
 
         graphs = _list_available_graphs()
         if active not in graphs:
             graphs = [active, *graphs]
-        refreshed = _build_settings_widgets(graphs)
+        refreshed = _build_settings_widgets(graphs, active, allowed)
         # Clear the text field on the refreshed panel so the user sees the
         # creation took effect and can't accidentally re-submit the same name.
         # Tabs are stored in ChatSettings.inputs (the ``tabs=`` kwarg is
@@ -844,12 +939,18 @@ async def on_settings_update(settings: dict) -> None:
 
     active, allowed = _normalize_selection(active_raw, allowed_raw)
     _rebuild_agent_for_selection(active, allowed)
+    # The UI dropdown is a direct user action, so it counts as confirmation:
+    # set the approval stamp so a subsequent LLM use_graph to the same graph
+    # isn't blocked. Persist the new active graph as the user's last-used.
+    cl.user_session.set("graph_switch_approved", active or None)
+    if active:
+        await _persist_last_graph_for_user(active)
 
     await cl.Message(
         content=t(
             "settings.update.success",
-            active=active,
-            allowed=", ".join(allowed),
+            active=active or t("graph.none"),
+            allowed=", ".join(allowed) if allowed else t("graph.none"),
         ),
     ).send()
     # Refresh the document sidebar so ingested rows for the newly-active
@@ -970,6 +1071,24 @@ async def on_ingest_documents(action: Action) -> None:
     ).send()
     # Refresh the document sidebar so the newly-ingested files appear.
     await _refresh_sidebar()
+    # Auto-derive a concise description revision for the active graph and
+    # append it to the existing description. The button path bypasses the
+    # agent, so there is no LLM turn to author a description; this template
+    # merges a one-line stats summary so describe_graph still reflects the
+    # ingestion. Best-effort: never blocks on a description write failure.
+    if active_graph and not errors:
+        try:
+            from falkordb_harness.graph_descriptions import append_description
+
+            addition = (
+                f"Ingested {result['files_staged']} file(s), "
+                f"{result['chunks_processed']} chunk(s), "
+                f"{result['nodes_in_graph']} nodes "
+                f"({result['conflicts_detected']} conflict(s))."
+            )
+            await append_description(active_graph, addition)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _step_meta(tool_name: str) -> tuple[str | None, str | None, bool]:
@@ -1125,9 +1244,9 @@ async def _refresh_sidebar() -> None:
         return
     try:
         selection = cl.user_session.get("graph_selection") or {}
-        active = selection.get("active_graph", _DEFAULT_GRAPH)
+        active = selection.get("active_graph") or _NO_GRAPH
         await cl.ElementSidebar.set_title(
-            t("sidebar.title", active=active)
+            t("sidebar.title", active=active or t("graph.none"))
         )
         await cl.ElementSidebar.set_elements(elements, key="main")
     except Exception as exc:  # noqa: BLE001 — older Chainlit lacks ElementSidebar
@@ -1164,84 +1283,6 @@ async def _send_open_docs_button() -> None:
         ).send()
     except Exception as exc:  # noqa: BLE001 — never break the chat on UI
         logger.debug("OpenDocsButton send failed: %s", exc)
-
-
-async def _send_welcome_modal() -> None:
-    """Send the startup welcome / acknowledgement popup (test-build warning).
-
-    Renders the ``WelcomeModal`` CustomElement as a centered modal overlay
-    via a low-key assistant message. The modal lists the compliance risks of
-    this test build (hardcoded Ollama Cloud LLM provider -> no DSGVO/GDPR
-    conformity, no DPA/AVV, unknown provider-side retention/logging, no
-    audit logging, not security-hardened) and can only be closed by clicking
-    "I understand and acknowledge." Re-show is suppressed per-browser via
-    ``localStorage`` (key ``fp_welcome_ack_v1``); bump the version in the
-    props to re-show after a future edit of the warning text.
-
-    Only sent from :func:`on_chat_start` (new chats), NOT from
-    :func:`on_chat_resume`. The per-browser localStorage guard means a user
-    who already acknowledged won't see it again anyway, and resumed threads
-    are active chats that should not be interrupted.
-
-    Best-effort: silently no-ops on older Chainlit without CustomElement
-    support, so the chat still works.
-    """
-    try:
-        import chainlit as cl
-    except ImportError:
-        return
-    try:
-        lang = cl.user_session.get("lang") or "de"
-        risks = [
-            {
-                "title": t("welcome.risk.cloud.title"),
-                "body": t("welcome.risk.cloud.body"),
-            },
-            {
-                "title": t("welcome.risk.compliance.title"),
-                "body": t("welcome.risk.compliance.body"),
-            },
-            {
-                "title": t("welcome.risk.retention.title"),
-                "body": t("welcome.risk.retention.body"),
-            },
-            {
-                "title": t("welcome.risk.no_audit.title"),
-                "body": t("welcome.risk.no_audit.body"),
-            },
-            {
-                "title": t("welcome.risk.not_hardened.title"),
-                "body": t("welcome.risk.not_hardened.body"),
-            },
-        ]
-        props = {
-            "lang": lang,
-            "title": t("welcome.title"),
-            "intro": t("welcome.intro"),
-            "risks": risks,
-            "closing": t("welcome.closing"),
-            "ackLabel": t("welcome.ack.label"),
-            "dismissedKey": "fp_welcome_ack_v1",
-        }
-        await cl.Message(
-            content="",
-            elements=[cl.CustomElement(name="WelcomeModal", props=props)],
-        ).send()
-    except Exception as exc:  # noqa: BLE001 — never break the chat on UI
-        logger.debug("WelcomeModal send failed: %s", exc)
-
-
-@cl.action_callback("acknowledge_welcome")
-async def on_acknowledge_welcome(action: Action) -> None:
-    """Acknowledge callback for the welcome popup's "I understand" button.
-
-    The ``WelcomeModal`` JSX already hides itself client-side and persists
-    the dismissal in ``localStorage`` before calling this action, so this
-    handler is effectively a no-op. It exists so ``callAction`` has a
-    server-side target and to provide a hook for future server-side
-    acknowledgement logging.
-    """
-    return
 
 
 async def _maybe_send_open_docs_button() -> None:
@@ -1769,7 +1810,7 @@ async def on_message(message: cl.Message) -> None:
 
     if message.elements:
         selection = cl.user_session.get("graph_selection") or {}
-        active_graph = selection.get("active_graph", _DEFAULT_GRAPH)
+        active_graph = selection.get("active_graph") or _NO_GRAPH
         uploaded = cl.user_session.get("uploaded_files") or []
         n_new = sum(1 for el in message.elements if hasattr(el, "path") and el.path)
         if n_new:

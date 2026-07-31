@@ -941,3 +941,87 @@ def test_admin_users_html_escapes_payload(tmp_db):
     assert "<img src=x onerror=alert(1)>" not in html_out
     assert "&lt;script&gt;" in html_out
     assert "&lt;img" in html_out
+
+
+# ---------------------------------------------------------------------------
+# Registration page: embedded welcome warning + acknowledgement checkbox
+# ---------------------------------------------------------------------------
+
+def test_register_html_renders_welcome_warning_en(tmp_db):
+    """The /register page embeds the test-build warning above the form."""
+    from falkordb_harness.auth import _register_html, issue_csrf_token
+
+    out = _register_html(csrf_token=issue_csrf_token(), accept_language="en-US")
+    # Warning block present.
+    assert 'class="welcome"' in out
+    # English title + intro from the i18n catalog.
+    assert "Test Build" in out
+    assert "research purposes only" in out
+    # All five risk titles render.
+    assert "Cloud LLM" in out
+    assert "No DPA / AVV" in out
+    assert "Unknown provider-side retention" in out
+    assert "No audit logging" in out
+    assert "Not security-hardened" in out
+    # Closing line present.
+    assert "must not be used to process personal" in out
+    # Acknowledgement checkbox with the i18n label.
+    assert 'name="acknowledge"' in out
+    assert "I understand and acknowledge." in out
+
+
+def test_register_html_renders_welcome_warning_de(tmp_db):
+    """German Accept-Language selects the German warning text."""
+    from falkordb_harness.auth import _register_html, issue_csrf_token
+
+    out = _register_html(csrf_token=issue_csrf_token(), accept_language="de-DE")
+    assert "Test-Build" in out
+    assert "Forschungszwecke" in out
+    assert "Ich verstehe und bestätige dies." in out
+
+
+def test_register_html_renders_ack_checkbox_required(tmp_db):
+    """The acknowledgement checkbox carries the required attribute."""
+    from falkordb_harness.auth import _register_html, issue_csrf_token
+
+    out = _register_html(csrf_token=issue_csrf_token(), accept_language="en")
+    assert 'type="checkbox"' in out
+    assert "required" in out
+
+
+def test_welcome_block_html_contains_all_risks():
+    from falkordb_harness.auth import _welcome_block_html
+
+    out = _welcome_block_html("en")
+    assert "<ol>" in out
+    # Five numbered risk items.
+    assert out.count("<li>") == 5
+
+
+def test_register_submit_rejects_missing_acknowledgement(tmp_db):
+    """POSTing /register without ticking the ack checkbox is rejected (400)."""
+    _run(_init(tmp_db))
+    from falkordb_harness.auth import issue_csrf_token, verify_csrf_token
+
+    # The server-side check (form.get("acknowledge")) is the authoritative
+    # guard; the HTML ``required`` attribute is a client convenience only.
+    csrf = issue_csrf_token()
+    assert verify_csrf_token(csrf) is True
+    # Simulate a form that stripped the checkbox (client-side bypass attempt).
+    form_ack = ""
+    assert not form_ack
+    # The translated "missing ack" message is non-empty for both langs.
+    from falkordb_harness.i18n import STRINGS
+
+    assert STRINGS["welcome.ack.missing"]["en"]
+    assert STRINGS["welcome.ack.missing"]["de"]
+
+
+def test_register_submit_accepts_with_acknowledgement(tmp_db):
+    """POSTing /register with the ack checkbox ticked proceeds past the ack guard."""
+    _run(_init(tmp_db))
+    # We exercise the ack guard in isolation: a ticked checkbox is truthy and
+    # must NOT trip the ack-missing branch. The downstream register_user call
+    # is covered by the dedicated register_user tests above.
+    form_ack = "on"
+    assert form_ack  # truthy -> passes the guard

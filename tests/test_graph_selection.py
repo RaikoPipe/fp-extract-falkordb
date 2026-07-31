@@ -354,7 +354,10 @@ def test_use_graph_tool_allowed_switch():
     backend.graph_name = "g2"
     backend.allowed_graphs = ["g1", "g2"]
 
-    with patch("falkordb_harness.tools.admin_tools.get_backend", return_value=backend):
+    with patch("falkordb_harness.tools.admin_tools.get_backend", return_value=backend), \
+         patch("falkordb_harness.tools.graph_admin_tools.get_switch_approval", return_value="g2"), \
+         patch("chainlit.user_session") as _us:
+        _us.get.return_value = None
         out = _use_graph_impl("g2")
     payload = json.loads(out)
     assert payload == {"active_graph": "g2", "allowed_graphs": ["g1", "g2"]}
@@ -371,7 +374,8 @@ def test_use_graph_tool_disallowed_returns_error_and_keeps_active():
         "Graph 'secret' is not in the allowed set (['g1', 'g2'])."
     )
 
-    with patch("falkordb_harness.tools.admin_tools.get_backend", return_value=backend):
+    with patch("falkordb_harness.tools.admin_tools.get_backend", return_value=backend), \
+         patch("falkordb_harness.tools.graph_admin_tools.get_switch_approval", return_value="secret"):
         out = _use_graph_impl("secret")
 
     payload = json.loads(out)
@@ -381,6 +385,24 @@ def test_use_graph_tool_disallowed_returns_error_and_keeps_active():
     # set_active_graph was attempted (and raised), but the backend's active
     # graph is unchanged because the validation rejected it.
     backend.set_active_graph.assert_called_once_with("secret")
+
+
+def test_use_graph_tool_blocked_without_confirmation():
+    """use_graph refuses to switch when no approval stamp is set."""
+    from falkordb_harness.tools.admin_tools import _use_graph_impl
+
+    backend = MagicMock()
+    backend.graph_name = "g1"
+    backend.allowed_graphs = ["g1", "g2"]
+
+    with patch("falkordb_harness.tools.admin_tools.get_backend", return_value=backend), \
+         patch("falkordb_harness.tools.graph_admin_tools.get_switch_approval", return_value=None):
+        out = _use_graph_impl("g2")
+    payload = json.loads(out)
+    assert payload["error_type"] == "NotConfirmed"
+    assert "not confirmed" in payload["error"].lower()
+    assert payload["active_graph"] == "g1"
+    backend.set_active_graph.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -493,9 +515,10 @@ def test_session_backend_isolated_across_contextvars():
 def test_normalize_selection_defaults_when_empty():
     from falkordb_harness.chainlit_app import _normalize_selection
 
+    # Empty/None inputs now fall to the no-graph sentinel (not factory_planning).
     active, allowed = _normalize_selection(None, None)
-    assert active == "factory_planning"
-    assert allowed == ["factory_planning"]
+    assert active == ""
+    assert allowed == []
 
 
 def test_normalize_selection_inserts_active_into_allowed():
@@ -675,3 +698,211 @@ def test_build_graph_context_prefix_no_context_empty():
     from falkordb_harness.agent import _build_graph_context_prefix
 
     assert _build_graph_context_prefix(None, None, thread_id=None) == ""
+
+
+# ---------------------------------------------------------------------------
+# create_graph tool
+# ---------------------------------------------------------------------------
+def test_create_graph_refuses_when_graph_already_active():
+    """create_graph refuses when a graph is already active (no-graph-only rule)."""
+
+    from falkordb_harness.tools.graph_admin_tools import _create_graph_impl
+
+    backend = MagicMock()
+    backend.graph_name = "existing"
+
+    with patch("falkordb_harness.tools.graph_admin_tools.get_backend", return_value=backend):
+        out = asyncio.run(_create_graph_impl("new", "desc"))
+    payload = json.loads(out)
+    assert payload["created"] is False
+    assert "already active" in payload["error"]
+    backend.create_graph.assert_not_called()
+
+
+def test_create_graph_empty_name_rejected():
+
+    from falkordb_harness.tools.graph_admin_tools import _create_graph_impl
+
+    backend = MagicMock()
+    backend.graph_name = ""
+    with patch("falkordb_harness.tools.graph_admin_tools.get_backend", return_value=backend):
+        out = asyncio.run(_create_graph_impl("", "desc"))
+    payload = json.loads(out)
+    assert payload["created"] is False
+    assert "non-empty" in payload["error"]
+
+
+def test_create_graph_succeeds_when_no_graph_active():
+    """create_graph creates + activates + seeds description when no graph active."""
+
+    from falkordb_harness.tools.graph_admin_tools import _create_graph_impl
+
+    backend = MagicMock()
+    backend.graph_name = ""  # no graph active initially
+    backend.allowed_graphs = ["orders"]
+
+    def fake_set_active(name):
+        backend.graph_name = name
+
+    backend.set_active_graph.side_effect = fake_set_active
+
+    async def fake_set_desc(name, desc):
+        return None
+
+    async def fake_persist(graph):
+        return None
+
+    with patch("falkordb_harness.tools.graph_admin_tools.get_backend", return_value=backend), \
+         patch("falkordb_harness.graph_descriptions.set_description", new=fake_set_desc), \
+         patch("falkordb_harness.tools.graph_admin_tools._persist_last_graph", new=fake_persist), \
+         patch("chainlit.user_session") as _us:
+        _us.get.return_value = None
+        out = asyncio.run(_create_graph_impl("orders", "Order processing docs"))
+    payload = json.loads(out)
+    assert payload["created"] is True
+    assert payload["active_graph"] == "orders"
+    assert payload["description"] == "Order processing docs"
+    backend.create_graph.assert_called_once_with("orders")
+    backend.set_active_graph.assert_called_once_with("orders")
+
+
+# ---------------------------------------------------------------------------
+# request_graph_switch tool
+# ---------------------------------------------------------------------------
+def test_request_graph_switch_nonexistent_graph_rejected():
+
+    from falkordb_harness.tools.graph_admin_tools import _request_graph_switch_impl
+
+    backend = MagicMock()
+    backend.list_graphs.return_value = ["a", "b"]
+    with patch("falkordb_harness.tools.graph_admin_tools.get_backend", return_value=backend):
+        out = asyncio.run(_request_graph_switch_impl("nope"))
+    payload = json.loads(out)
+    assert payload["confirmed"] is False
+    assert "does not exist" in payload["error"]
+
+
+def test_request_graph_switch_confirmed_sets_stamp():
+
+    from falkordb_harness.tools.graph_admin_tools import _request_graph_switch_impl
+
+    backend = MagicMock()
+    backend.list_graphs.return_value = ["a", "b"]
+
+    async def fake_confirm(summary):
+        return "confirmed"
+
+    with patch("falkordb_harness.tools.graph_admin_tools.get_backend", return_value=backend), \
+         patch("falkordb_harness.ui_prompts.prompt_confirm", new=fake_confirm), \
+         patch("falkordb_harness.tools.graph_admin_tools._set_switch_approval") as set_stamp:
+        out = asyncio.run(_request_graph_switch_impl("a"))
+    payload = json.loads(out)
+    assert payload["confirmed"] is True
+    set_stamp.assert_called_once_with("a")
+
+
+def test_request_graph_switch_cancelled_does_not_set_stamp():
+
+    from falkordb_harness.tools.graph_admin_tools import _request_graph_switch_impl
+
+    backend = MagicMock()
+    backend.list_graphs.return_value = ["a", "b"]
+
+    async def fake_confirm(summary):
+        return "cancelled"
+
+    with patch("falkordb_harness.tools.graph_admin_tools.get_backend", return_value=backend), \
+         patch("falkordb_harness.ui_prompts.prompt_confirm", new=fake_confirm), \
+         patch("falkordb_harness.tools.graph_admin_tools._set_switch_approval") as set_stamp:
+        out = asyncio.run(_request_graph_switch_impl("a"))
+    payload = json.loads(out)
+    assert payload["confirmed"] is False
+    set_stamp.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# describe_graph + update_graph_description tools
+# ---------------------------------------------------------------------------
+def test_describe_graph_single_name():
+
+    from falkordb_harness.tools.graph_admin_tools import _describe_graph_impl
+
+    async def fake_row(name):
+        return {"name": name, "description": "desc", "updatedAt": "t"}
+
+    with patch("falkordb_harness.graph_descriptions.get_description_row", new=fake_row):
+        out = asyncio.run(_describe_graph_impl("g1"))
+    payload = json.loads(out)
+    assert payload["name"] == "g1"
+    assert payload["description"] == "desc"
+
+
+def test_describe_graph_all():
+
+    from falkordb_harness.tools.graph_admin_tools import _describe_graph_impl
+
+    async def fake_list():
+        return [{"name": "g1", "description": "d1", "updatedAt": "t1"}]
+
+    with patch("falkordb_harness.graph_descriptions.list_descriptions", new=fake_list):
+        out = asyncio.run(_describe_graph_impl(""))
+    payload = json.loads(out)
+    assert isinstance(payload, list)
+    assert payload[0]["name"] == "g1"
+
+
+def test_update_graph_description_requires_active_graph():
+
+    from falkordb_harness.tools.graph_admin_tools import _update_graph_description_impl
+
+    backend = MagicMock()
+    backend.graph_name = ""
+    with patch("falkordb_harness.tools.graph_admin_tools.get_backend", return_value=backend):
+        out = asyncio.run(
+            _update_graph_description_impl("desc")
+        )
+    payload = json.loads(out)
+    assert payload["updated"] is False
+    assert "No active graph" in payload["error"]
+
+
+def test_update_graph_description_succeeds():
+
+    from falkordb_harness.tools.graph_admin_tools import _update_graph_description_impl
+
+    backend = MagicMock()
+    backend.graph_name = "orders"
+
+    async def fake_set(name, desc):
+        return None
+
+    with patch("falkordb_harness.tools.graph_admin_tools.get_backend", return_value=backend), \
+         patch("falkordb_harness.graph_descriptions.set_description", new=fake_set):
+        out = asyncio.run(
+            _update_graph_description_impl("new desc")
+        )
+    payload = json.loads(out)
+    assert payload["updated"] is True
+    assert payload["active_graph"] == "orders"
+    assert payload["description"] == "new desc"
+
+
+# ---------------------------------------------------------------------------
+# No-graph preamble
+# ---------------------------------------------------------------------------
+def test_build_graph_context_prefix_no_graph_state():
+    """The preamble says NO graph is selected and directs to the create-or-select procedure."""
+    from falkordb_harness.agent import _build_graph_context_prefix
+
+    prefix = _build_graph_context_prefix("", [], thread_id="t1")
+    assert "NO knowledge graph is currently selected" in prefix
+    assert "list_graphs" in prefix
+    assert "describe_graph" in prefix
+    assert "ask_user" in prefix
+
+
+def test_build_graph_context_prefix_includes_description():
+    from falkordb_harness.agent import _build_graph_context_prefix
+
+    prefix = _build_graph_context_prefix("orders", ["orders"], "t1", "Order docs")
+    assert "Active graph description: Order docs" in prefix

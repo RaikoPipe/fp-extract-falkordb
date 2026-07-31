@@ -447,7 +447,7 @@ STRINGS: dict[str, dict[str, str]] = {
     "lang.name.en": {"en": "English", "de": "Englisch"},
     "lang.name.de": {"en": "German", "de": "Deutsch"},
 
-    # --- Welcome / acknowledgement popup (chainlit_app.py + WelcomeModal.jsx) ---
+    # --- Welcome / acknowledgement warning (auth.py registration form) ---
     "welcome.title": {
         "en": "Test Build — Please Read",
         "de": "Test-Build — Bitte lesen",
@@ -503,6 +503,42 @@ STRINGS: dict[str, dict[str, str]] = {
     "welcome.ack.label": {
         "en": "I understand and acknowledge.",
         "de": "Ich verstehe und bestätige dies.",
+    },
+    "welcome.ack.missing": {
+        "en": "You must acknowledge the warning to register.",
+        "de": "Sie müssen den Hinweis bestätigen, um sich zu registrieren.",
+    },
+
+    # --- Graph lifecycle policy (graph_admin_tools / chainlit_app) ---------
+    "graph.none": {
+        "en": "(no graph selected)",
+        "de": "(kein Graph ausgewählt)",
+    },
+    "graph.switch.confirm": {
+        "en": (
+            "Switch the active knowledge graph to `{name}`? Queries and "
+            "ingestion will target `{name}` from now on."
+        ),
+        "de": (
+            "Aktiven Wissensgraph auf `{name}` wechseln? Anfragen und "
+            "Ingestion zielen ab jetzt auf `{name}`."
+        ),
+    },
+    "graph.badge.label": {
+        "en": "Knowledge graph: {name}",
+        "de": "Wissensgraph: {name}",
+    },
+    "graph.badge.none": {
+        "en": "No knowledge graph selected",
+        "de": "Kein Wissensgraph ausgewählt",
+    },
+    "graph.badge.fetch_error": {
+        "en": "Knowledge graph unavailable",
+        "de": "Wissensgraph nicht verfügbar",
+    },
+    "graph.description.empty": {
+        "en": "(no description yet)",
+        "de": "(noch keine Beschreibung)",
     },
 }
 

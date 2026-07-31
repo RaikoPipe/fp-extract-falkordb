@@ -270,6 +270,23 @@ _DDL_STATEMENTS: tuple[str, ...] = (
     CREATE INDEX IF NOT EXISTS idx_documents_checksum
         ON documents ("checksum")
     """,
+    # graph_descriptions — one row per knowledge graph, holding the
+    # LLM-maintained human-readable description of the graph's contents.
+    # Seeded at graph creation (create_graph tool) and revised after every
+    # ingestion (update_graph_description tool / button-path auto-derive).
+    # The LLM reads these as the first-contact point for understanding
+    # existing graphs (describe_graph tool). Keyed by graph name (the same
+    # name used by FalkorDB's GRAPH.LIST); rows are created on demand and
+    # never automatically deleted (a graph reset does NOT clear its
+    # description — only an explicit graph deletion would, which is out of
+    # scope here).
+    """
+    CREATE TABLE IF NOT EXISTS graph_descriptions (
+        "name"        TEXT PRIMARY KEY,
+        "description" TEXT NOT NULL DEFAULT '',
+        "updatedAt"   TEXT NOT NULL
+    )
+    """,
 )
 
 

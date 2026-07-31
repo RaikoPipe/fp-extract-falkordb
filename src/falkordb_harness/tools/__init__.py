@@ -2,6 +2,12 @@
 
 from falkordb_harness.tools.admin_tools import reset_graph, use_graph
 from falkordb_harness.tools.file_inspection_tools import file_metadata, read_excerpt
+from falkordb_harness.tools.graph_admin_tools import (
+    create_graph,
+    describe_graph,
+    request_graph_switch,
+    update_graph_description,
+)
 from falkordb_harness.tools.ingest_tools import chunk_documents, extract_and_write
 from falkordb_harness.tools.inspect_tools import (
     get_schema,
@@ -50,6 +56,11 @@ all_tools = [
     list_edges,
     node_count,
     list_graphs,
+    # Graph lifecycle (create / switch-with-confirm / describe)
+    create_graph,
+    request_graph_switch,
+    describe_graph,
+    update_graph_description,
     # Reconciliation
     get_reconciliations,
     clear_reconciliations,

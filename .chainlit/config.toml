@@ -134,5 +134,12 @@ logo_file_url = "https://genai4ffd.de/wp-content/uploads/2025/05/GenAI4FFD_LogoO
 # Load assistant avatar image directly from URL.
 default_avatar_file_url = "https://genai4ffd.de/wp-content/uploads/2025/05/GenAI4FFD_LogoOnly_neu.svg"
 
+# Custom JavaScript for the KG badge in the header (visible in both the
+# starter view and the chat view). Fetches /api/graph-info (an authenticated
+# endpoint registered in auth.register_routes) for the user's last-used
+# graph + its description, and renders a small badge in the top-right header.
+# Runs with ``defer`` so it loads after the DOM without blocking startup.
+custom_js = "/public/kg_badge.js"
+
 [meta]
 generated_by = "2.11.0"

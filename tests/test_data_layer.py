@@ -56,7 +56,7 @@ def test_init_db_creates_all_tables(tmp_layer):
         return [r[0] for r in rows]
 
     tables = _run(fetch_tables())
-    assert set(tables) == {"documents", "elements", "feedbacks", "steps", "threads", "users"}
+    assert set(tables) == {"documents", "elements", "feedbacks", "graph_descriptions", "steps", "threads", "users"}
 
 
 def test_init_db_is_idempotent(tmp_layer):
@@ -79,7 +79,7 @@ def test_init_db_is_idempotent(tmp_layer):
         return rows
 
     tables = _run(count_tables())
-    assert len(tables) == 6
+    assert len(tables) == 7  # users, threads, steps, elements, feedbacks, documents, graph_descriptions
 
 
 def test_init_db_steps_table_has_all_stepdict_columns(tmp_layer):
