@@ -6,6 +6,9 @@ build/
 .eggs/
 *.egg
 .env
+.env.*
+!.env.example
+!.env.secrets.example
 .venv/
 venv/
 laundry_wash/

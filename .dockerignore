@@ -17,7 +17,9 @@ dist/
 **/__pycache__/
 
 # Local runtime state — never ship a populated DB or uploads into the image.
+# .env* excludes .env, .env.secrets, and any other env files from the image.
 .env
+.env.*
 data/
 .files/
 laundry_wash/
