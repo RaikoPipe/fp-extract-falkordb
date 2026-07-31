@@ -17,7 +17,10 @@ services:
     build: .
     command: chainlit run src/falkordb_harness/chainlit_app.py --host 0.0.0.0 --port 8000
     ports:
-      - "8000:8000"
+      # Host port 8000 is occupied by another service on the deploy host;
+      # publish chainlit on 8001 instead. The container still listens on
+      # 8000 internally (EXPOSE 8000). Update APP_BASE_URL below to match.
+      - "8001:8000"
     # Secrets are loaded literally (no ${} interpolation) from .env.secrets
     # via env_file, so values containing $, /, @, etc. survive intact.
     # Create .env.secrets from .env.example (secret vars marked below) and
@@ -92,7 +95,7 @@ services:
       - SMTP_USER=${SMTP_USER:-}
       - SMTP_USE_TLS=${SMTP_USE_TLS:-1}
       - SMTP_FROM=${SMTP_FROM:-}
-      - APP_BASE_URL=${APP_BASE_URL:-http://localhost:8000}
+      - APP_BASE_URL=${APP_BASE_URL:-http://localhost:8001}
 
       # --- First admin bootstrap (idempotent on every restart) ---
       # FIRST_ADMIN_PASSWORD is loaded via env_file (.env.secrets).
