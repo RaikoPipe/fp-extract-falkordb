@@ -20,8 +20,11 @@ mask_user_env = false
 # Authorized origins
 # For production, replace with your exact deployment origin(s), e.g.
 #   ["https://kg.example.com"]
-# Wildcard is left here for local dev convenience; tighten before going public.
-allow_origins = ["*"]
+# Wildcard would let any malicious site drive the agent over a victim's
+# authenticated WebSocket. The placeholder below is intentionally over-strict
+# (the app won't load) until you set the real FQDN, so a forgotten edit fails
+# closed rather than shipping a vulnerable wildcard.
+allow_origins = ["https://REPLACE_WITH_YOUR_PRODUCTION_ORIGIN"]
 
 [features]
 # Process and display HTML in messages. This can be a security risk (see https://stackoverflow.com/questions/19603097/why-is-it-dangerous-to-render-user-generated-html-or-javascript)

@@ -22,10 +22,29 @@ is touched. ``DATABASE_URL`` is set per-test via monkeypatch.
 import asyncio
 import sys
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+
+@pytest.fixture(autouse=True)
+def _mock_smtp_send():
+    """Block every test in this module from making a real SMTP connection.
+
+    ``falkordb_harness.email_service._send`` calls ``aiosmtplib.send`` when
+    ``SMTP_HOST``/``SMTP_FROM`` are set, and the on-disk ``.env`` carries
+    live SMTP credentials that chainlit loads at import time. Any test that
+    ends up calling ``approve_user`` / ``request_password_reset`` /
+    ``resend_verification_email`` would therefore try to contact a real
+    mail server. Replacing ``aiosmtplib.send`` with a no-op ``AsyncMock``
+    keeps the auth-flow coverage without ever sending mail.
+    """
+    import falkordb_harness.email_service as email_service
+
+    with patch.object(email_service.aiosmtplib, "send", new=AsyncMock()):
+        yield
 
 
 @pytest.fixture
@@ -761,9 +780,11 @@ def test_verify_password_handles_malformed_hash():
 # CSRF token round-trip
 # ---------------------------------------------------------------------------
 def test_csrf_token_roundtrip(monkeypatch):
-    monkeypatch.setenv("CHAINLIT_AUTH_SECRET", "csrf-test-secret")
+    # Import before setenv: chainlit's load_dotenv(override=True) runs at
+    # import and would overwrite our monkeypatched value from the on-disk .env.
     from falkordb_harness.auth import issue_csrf_token, verify_csrf_token
 
+    monkeypatch.setenv("CHAINLIT_AUTH_SECRET", "csrf-test-secret")
     token = issue_csrf_token()
     assert verify_csrf_token(token) is True
     assert verify_csrf_token("garbage") is False
@@ -771,9 +792,9 @@ def test_csrf_token_roundtrip(monkeypatch):
 
 
 def test_csrf_token_rejects_wrong_secret(monkeypatch):
-    monkeypatch.setenv("CHAINLIT_AUTH_SECRET", "secret-a")
     from falkordb_harness.auth import issue_csrf_token
 
+    monkeypatch.setenv("CHAINLIT_AUTH_SECRET", "secret-a")
     token = issue_csrf_token()
     monkeypatch.setenv("CHAINLIT_AUTH_SECRET", "secret-b")
     from falkordb_harness.auth import verify_csrf_token
@@ -796,3 +817,127 @@ def test_registration_disabled(monkeypatch):
 
     monkeypatch.setenv("REGISTER_ENABLED", "0")
     assert _registration_enabled() is False
+
+
+# ---------------------------------------------------------------------------
+# C5: CSRF signer fails fast on missing secret
+# ---------------------------------------------------------------------------
+def test_csrf_signer_raises_without_secret(monkeypatch):
+    # Import before deleting the env var: importing falkordb_harness.auth
+    # triggers chainlit's load_dotenv(override=True), which would re-set
+    # the secret from the on-disk .env and defeat the monkeypatch.
+    from falkordb_harness.auth import _csrf_secret
+
+    monkeypatch.delenv("CHAINLIT_AUTH_SECRET", raising=False)
+    with pytest.raises(RuntimeError, match="CHAINLIT_AUTH_SECRET"):
+        _csrf_secret()
+
+
+def test_csrf_signer_raises_on_empty_secret(monkeypatch):
+    from falkordb_harness.auth import _csrf_secret
+
+    monkeypatch.setenv("CHAINLIT_AUTH_SECRET", "")
+    with pytest.raises(RuntimeError, match="CHAINLIT_AUTH_SECRET"):
+        _csrf_secret()
+
+
+# ---------------------------------------------------------------------------
+# C7: CSRF tokens bound to session identifier
+# ---------------------------------------------------------------------------
+def test_csrf_token_bound_to_identifier(monkeypatch):
+    # Import before setenv: chainlit's load_dotenv(override=True) runs at
+    # import and would overwrite our monkeypatched value from the on-disk .env.
+    from falkordb_harness.auth import issue_csrf_token, verify_csrf_token
+
+    monkeypatch.setenv("CHAINLIT_AUTH_SECRET", "bind-test-secret")
+    token = issue_csrf_token("admin-alice")
+    # Correct identifier → valid
+    assert verify_csrf_token(token, expected_identifier="admin-alice") is True
+    # Wrong identifier → rejected
+    assert verify_csrf_token(token, expected_identifier="admin-bob") is False
+    # No expected_identifier → rejected (bound token requires a match)
+    assert verify_csrf_token(token) is False
+
+
+def test_csrf_anonymous_token_accepted_without_identifier(monkeypatch):
+    from falkordb_harness.auth import issue_csrf_token, verify_csrf_token
+
+    monkeypatch.setenv("CHAINLIT_AUTH_SECRET", "bind-test-secret")
+    # Anonymous token (no identifier) — used by /register, /reset-password
+    token = issue_csrf_token()
+    assert verify_csrf_token(token) is True
+    assert verify_csrf_token(token, expected_identifier="someone") is True
+
+
+# ---------------------------------------------------------------------------
+# C6b: charset validation on username / display_name
+# ---------------------------------------------------------------------------
+def test_register_rejects_html_in_username(tmp_db):
+    user, err, _ = _register(tmp_db, username="<img src=x>")
+    assert user is None
+    assert "letters" in err or "may only" in err
+
+
+def test_register_rejects_newline_in_username(tmp_db):
+    user, err, _ = _register(tmp_db, username="evil\nuser")
+    assert user is None
+    assert "letters" in err or "may only" in err
+
+
+def test_register_rejects_html_in_display_name(tmp_db):
+    _run(_init(tmp_db))
+    from falkordb_harness.auth import register_user
+
+    user, err, _ = _run(
+        register_user("bob", "Supersecret1", "bob@example.com", "<script>alert(1)</script>")
+    )
+    assert user is None
+    assert "display" in err.lower() or "may only" in err.lower()
+
+
+def test_register_rejects_oversized_display_name(tmp_db):
+    _run(_init(tmp_db))
+    from falkordb_harness.auth import MAX_DISPLAY_NAME_LEN, register_user
+
+    user, err, _ = _run(
+        register_user("bob", "Supersecret1", "bob@example.com", "A" * (MAX_DISPLAY_NAME_LEN + 1))
+    )
+    assert user is None
+    assert "display" in err.lower() and "most" in err.lower()
+
+
+def test_register_accepts_safe_display_name(tmp_db):
+    user, err, _ = _register(tmp_db, username="bob", display="Bob_O.v2")
+    assert user is not None
+    assert err is None
+    assert user.display_name == "Bob_O.v2"
+
+
+def test_register_allows_empty_display_name(tmp_db):
+    user, err, _ = _register(tmp_db, username="bob", display="")
+    assert user is not None
+    assert err is None
+
+
+# ---------------------------------------------------------------------------
+# C6a: HTML escaping in admin users page
+# ---------------------------------------------------------------------------
+def test_admin_users_html_escapes_payload(tmp_db):
+    _run(_init(tmp_db))
+    from falkordb_harness.auth import _admin_users_html, issue_csrf_token
+
+    # Simulate a malicious user row that slipped through (defense-in-depth:
+    # charset validation should block this, but escaping must still neutralize
+    # any HTML metacharacters if a row contains them).
+    malicious = {
+        "identifier": "<script>alert(1)</script>",
+        "displayName": '<img src=x onerror=alert(1)>',
+        "email": "x@y.com<script>",
+        "role": "user",
+        "accountStatus": "pending",
+    }
+    html_out = _admin_users_html([malicious], csrf_token=issue_csrf_token("admin"))
+    assert "<script>alert(1)</script>" not in html_out
+    assert "<img src=x onerror=alert(1)>" not in html_out
+    assert "&lt;script&gt;" in html_out
+    assert "&lt;img" in html_out

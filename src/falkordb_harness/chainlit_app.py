@@ -626,6 +626,14 @@ async def on_chat_start() -> None:
     # startup/starter screen for an empty active chat. The button is
     # injected lazily on the first user turn where documents exist.
 
+    # Send the startup welcome / acknowledgement popup (test-build warning).
+    # Unlike the open-docs button, the welcome modal is a blocking overlay
+    # that MUST appear on startup; it renders above any view via
+    # position:fixed and is dismissed only by the "I understand and
+    # acknowledge." button. Re-show is suppressed per-browser via
+    # localStorage, so returning users don't see it again.
+    await _send_welcome_modal()
+
 
 @cl.on_chat_resume
 async def on_chat_resume(thread: ThreadDict) -> None:
@@ -1156,6 +1164,83 @@ async def _send_open_docs_button() -> None:
         ).send()
     except Exception as exc:  # noqa: BLE001 — never break the chat on UI
         logger.debug("OpenDocsButton send failed: %s", exc)
+
+
+async def _send_welcome_modal() -> None:
+    """Send the startup welcome / acknowledgement popup (test-build warning).
+
+    Renders the ``WelcomeModal`` CustomElement as a centered modal overlay
+    via a low-key assistant message. The modal lists the compliance risks of
+    this test build (hardcoded Ollama Cloud LLM provider -> no DSGVO/GDPR
+    conformity, no DPA/AVV, unknown provider-side retention/logging, no
+    audit logging, not security-hardened) and can only be closed by clicking
+    "I understand and acknowledge." Re-show is suppressed per-browser via
+    ``localStorage`` (key ``fp_welcome_ack_v1``); bump the version in the
+    props to re-show after a future edit of the warning text.
+
+    Only sent from :func:`on_chat_start` (new chats), NOT from
+    :func:`on_chat_resume`. The per-browser localStorage guard means a user
+    who already acknowledged won't see it again anyway, and resumed threads
+    are active chats that should not be interrupted.
+
+    Best-effort: silently no-ops on older Chainlit without CustomElement
+    support, so the chat still works.
+    """
+    try:
+        import chainlit as cl
+    except ImportError:
+        return
+    try:
+        lang = cl.user_session.get("lang") or "de"
+        risks = [
+            {
+                "title": t("welcome.risk.cloud.title"),
+                "body": t("welcome.risk.cloud.body"),
+            },
+            {
+                "title": t("welcome.risk.compliance.title"),
+                "body": t("welcome.risk.compliance.body"),
+            },
+            {
+                "title": t("welcome.risk.retention.title"),
+                "body": t("welcome.risk.retention.body"),
+            },
+            {
+                "title": t("welcome.risk.no_audit.title"),
+                "body": t("welcome.risk.no_audit.body"),
+            },
+            {
+                "title": t("welcome.risk.not_hardened.title"),
+                "body": t("welcome.risk.not_hardened.body"),
+            },
+        ]
+        props = {
+            "lang": lang,
+            "title": t("welcome.title"),
+            "intro": t("welcome.intro"),
+            "risks": risks,
+            "ackLabel": t("welcome.ack.label"),
+            "dismissedKey": "fp_welcome_ack_v1",
+        }
+        await cl.Message(
+            content="",
+            elements=[cl.CustomElement(name="WelcomeModal", props=props)],
+        ).send()
+    except Exception as exc:  # noqa: BLE001 — never break the chat on UI
+        logger.debug("WelcomeModal send failed: %s", exc)
+
+
+@cl.action_callback("acknowledge_welcome")
+async def on_acknowledge_welcome(action: Action) -> None:
+    """Acknowledge callback for the welcome popup's "I understand" button.
+
+    The ``WelcomeModal`` JSX already hides itself client-side and persists
+    the dismissal in ``localStorage`` before calling this action, so this
+    handler is effectively a no-op. It exists so ``callAction`` has a
+    server-side target and to provide a hook for future server-side
+    acknowledgement logging.
+    """
+    return
 
 
 async def _maybe_send_open_docs_button() -> None:

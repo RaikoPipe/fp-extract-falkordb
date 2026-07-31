@@ -446,6 +446,60 @@ STRINGS: dict[str, dict[str, str]] = {
     # --- Language switcher (chainlit_app.py) -------------------------------
     "lang.name.en": {"en": "English", "de": "Englisch"},
     "lang.name.de": {"en": "German", "de": "Deutsch"},
+
+    # --- Welcome / acknowledgement popup (chainlit_app.py + WelcomeModal.jsx) ---
+    "welcome.title": {
+        "en": "Test Build — Please Read",
+        "de": "Test-Build — Bitte lesen",
+    },
+    "welcome.intro": {
+        "en": "This is a **test build**, not a production system. Please read the following points before continuing.",
+        "de": "Dies ist ein **Test-Build**, kein Produktivsystem. Bitte lesen Sie die folgenden Hinweise, bevor Sie fortfahren.",
+    },
+    "welcome.risk.cloud.title": {
+        "en": "Cloud LLM provider (no DSGVO / GDPR conformity)",
+        "de": "Cloud-LLM-Anbieter (keine DSGVO-Konformität)",
+    },
+    "welcome.risk.cloud.body": {
+        "en": "Ollama Cloud is hardcoded as the LLM provider for this test build. All input you send to the chat is processed by Ollama Cloud services. This means your data leaves the controlled environment and is processed by a third-party cloud provider, so there is **no DSGVO / GDPR conformity** (incl. Art. 44 cross-border and Art. 28 processor concerns).",
+        "de": "Ollama Cloud ist für diesen Test-Build fest als LLM-Anbieter konfiguriert. Sämtliche Eingaben, die Sie im Chat tätigen, werden von den Cloud-Diensten von Ollama verarbeitet. Ihre Daten verlassen dabei die kontrollierte Umgebung und werden durch einen Drittanbieter verarbeitet — es besteht **keine DSGVO-/GDPR-Konformität** (inkl. Art. 44 Datenübermittlung in Drittländer und Art. 28 Auftragsverarbeitung).",
+    },
+    "welcome.risk.compliance.title": {
+        "en": "No data-processing agreement (DPA / AVV)",
+        "de": "Keine Auftragsverarbeitungsvereinbarung (AVV)",
+    },
+    "welcome.risk.compliance.body": {
+        "en": "No data-processing agreement (DPA / AVV) with the cloud provider is in place for this test build. Processing of personal data is therefore not compliant and must not be used for such data.",
+        "de": "Für diesen Test-Build liegt keine Auftragsverarbeitungsvereinbarung (AVV) mit dem Cloud-Anbieter vor. Die Verarbeitung personenbezogener Daten ist daher nicht konform und darf für solche Daten nicht verwendet werden.",
+    },
+    "welcome.risk.retention.title": {
+        "en": "Unknown retention / logging on the provider side",
+        "de": "Unbekannte Speicher- und Protokollierungsdauer beim Anbieter",
+    },
+    "welcome.risk.retention.body": {
+        "en": "There are no guarantees regarding retention, deletion, or logging on the provider side. Inputs may be stored, logged, or used for model improvement by the cloud service.",
+        "de": "Es gibt keine Garantien bezüglich Speicherung, Löschung oder Protokollierung auf Seiten des Anbieters. Eingaben können durch den Cloud-Dienst gespeichert, protokolliert oder zur Modellverbesserung verwendet werden.",
+    },
+    "welcome.risk.no_audit.title": {
+        "en": "No prompt / reply audit logging",
+        "de": "Keine Protokollierung von Anfragen und Antworten",
+    },
+    "welcome.risk.no_audit.body": {
+        "en": "This test build does not keep an audit log of what is sent to or received from the provider. There is no transparency over the data transmitted.",
+        "de": "Dieser Test-Build führt kein Audit-Log über die an den Anbieter gesendeten oder von ihm empfangenen Daten. Es gibt keine Transparenz über die übermittelten Daten.",
+    },
+    "welcome.risk.not_hardened.title": {
+        "en": "Not security-hardened",
+        "de": "Nicht sicherheitstechnisch gehärtet",
+    },
+    "welcome.risk.not_hardened.body": {
+        "en": "This is a test build: it is not security-hardened, has no rate limiting, and is not intended for processing personal or confidential data.",
+        "de": "Dies ist ein Test-Build: nicht sicherheitstechnisch gehärtet, ohne Rate-Limiting und nicht für die Verarbeitung personenbezogener oder vertraulicher Daten vorgesehen.",
+    },
+    "welcome.ack.label": {
+        "en": "I understand and acknowledge.",
+        "de": "Ich verstehe und bestätige dies.",
+    },
 }
 
 

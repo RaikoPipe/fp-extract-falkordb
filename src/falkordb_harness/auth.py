@@ -25,7 +25,16 @@ Security measures:
   blocklist)
 - per-IP + per-username rate limiting on auth endpoints (slowapi)
 - signed CSRF tokens on every state-changing form (itsdangerous, keyed
-  off ``CHAINLIT_AUTH_SECRET``)
+  off ``CHAINLIT_AUTH_SECRET``); admin-form tokens are bound to the
+  admin's session identifier so a stolen/XSS-exfiltrated token cannot be
+  replayed by a different session
+- fail-fast on missing ``CHAINLIT_AUTH_SECRET`` (refuses to register
+  routes rather than falling back to a hardcoded insecure key)
+- HTML-escaping of every user-controlled field rendered in the
+  server-rendered pages (admin table, error/info banners, form values),
+  plus a strict Content-Security-Policy header on every HTMLResponse
+- charset validation on usernames and display names (letters, digits,
+  ``_ . @ -``) to prevent stored XSS and log injection
 - role-based access control (``user`` / ``admin``); only admins reach
   ``/admin/*`` and only admins get the destructive ``reset_graph`` tool
 - email enumeration resistance on forgot-password (always returns success)
@@ -41,8 +50,10 @@ Env vars:
 
 from __future__ import annotations
 
+import html
 import logging
 import os
+import re
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -66,7 +77,19 @@ logger = logging.getLogger("falkordb_harness.auth")
 # Password / username policy.
 MIN_PASSWORD_LEN = 10
 MAX_USERNAME_LEN = 64
+MAX_DISPLAY_NAME_LEN = 64
 MAX_EMAIL_LEN = 254
+
+# Usernames and display names are restricted to a safe charset to prevent
+# stored XSS (they are rendered unescaped-free in the admin page after
+# escaping, but a charset guard is defense-in-depth) and log injection via
+# newlines/control characters.
+NAME_CHARSET = re.compile(r"^[A-Za-z0-9_.@-]+$")
+
+# Content-Security-Policy applied to every server-rendered HTML response.
+# Blocks inline scripts / event-handler injection even if an escaping gap is
+# ever introduced. Inline styles are allowed (the page shell uses them).
+_CSP_HEADER = "default-src 'self'; style-src 'unsafe-inline'"
 
 # Token lifetimes.
 EMAIL_VERIFY_TTL = timedelta(hours=24)
@@ -155,30 +178,66 @@ def _validate_email(email: str) -> str | None:
 
 # --- CSRF token signer -----------------------------------------------------
 
-def _csrf_signer() -> URLSafeTimedSerializer:
-    """Return a timed serializer keyed off the Chainlit JWT secret.
+def _csrf_secret() -> str:
+    """Return the CSRF/JWT signing secret, failing fast if unset.
 
     CSRF tokens are signed with the same secret that signs login JWTs so a
     single rotation covers both. Tokens expire after 1 hour.
+
+    A missing/empty secret is a fatal misconfiguration: falling back to a
+    hardcoded key would silently disable CSRF protection. Raise instead of
+    letting the app start in an insecure state.
     """
-    secret = os.getenv("CHAINLIT_AUTH_SECRET") or "dev-insecure-csrf-key"
-    return URLSafeTimedSerializer(secret, salt="csrf")
+    secret = os.getenv("CHAINLIT_AUTH_SECRET")
+    if not secret:
+        raise RuntimeError(
+            "CHAINLIT_AUTH_SECRET is required for CSRF protection. "
+            "Generate one with `chainlit create-secret`."
+        )
+    return secret
 
 
-def issue_csrf_token() -> str:
-    """Return a fresh signed CSRF token for embedding in a form."""
-    return _csrf_signer().dumps({"t": "csrf"})
+def _csrf_signer() -> URLSafeTimedSerializer:
+    """Return a timed serializer keyed off the Chainlit JWT secret."""
+    return URLSafeTimedSerializer(_csrf_secret(), salt="csrf")
 
 
-def verify_csrf_token(token: str | None, max_age: int = 3600) -> bool:
-    """Return True if ``token`` is a valid, unexpired CSRF token."""
+def issue_csrf_token(identifier: str | None = None) -> str:
+    """Return a fresh signed CSRF token for embedding in a form.
+
+    When ``identifier`` is provided (an authenticated admin's username), it is
+    stamped into the signed payload so :func:`verify_csrf_token` can confirm
+    the token was issued to the same session. Anonymous forms (registration,
+    password reset) pass ``None`` and the token carries no identity binding.
+    """
+    payload: dict[str, str] = {"t": "csrf"}
+    if identifier:
+        payload["u"] = identifier
+    return _csrf_signer().dumps(payload)
+
+
+def verify_csrf_token(
+    token: str | None,
+    expected_identifier: str | None = None,
+    max_age: int = 3600,
+) -> bool:
+    """Return True if ``token`` is valid, unexpired, and bound to the session.
+
+    If the token carries an ``u`` (user identifier) claim, it must match
+    ``expected_identifier``; otherwise the token is rejected. Anonymous tokens
+    (no ``u``) are accepted regardless of ``expected_identifier`` so the
+    registration / password-reset flows continue to work.
+    """
     if not token:
         return False
     try:
-        _csrf_signer().loads(token, max_age=max_age)
-        return True
+        payload = _csrf_signer().loads(token, max_age=max_age)
     except (BadSignature, SignatureExpired):
         return False
+    bound = payload.get("u") if isinstance(payload, dict) else None
+    if bound is not None and bound != expected_identifier:
+        return False
+    return True
 
 
 async def _get_engine():
@@ -211,6 +270,19 @@ async def register_user(
         return None, "Username is required.", None
     if len(username) > MAX_USERNAME_LEN:
         return None, f"Username must be at most {MAX_USERNAME_LEN} characters.", None
+    if not NAME_CHARSET.match(username):
+        return None, "Usernames may only contain letters, digits, _, ., @, -.", None
+    if display_name is not None:
+        display_name = display_name.strip()
+        if display_name:
+            if len(display_name) > MAX_DISPLAY_NAME_LEN:
+                return None, (
+                    f"Display name must be at most {MAX_DISPLAY_NAME_LEN} characters."
+                ), None
+            if not NAME_CHARSET.match(display_name):
+                return None, (
+                    "Display names may only contain letters, digits, _, ., @, -."
+                ), None
     email = (email or "").strip()
     if not email:
         return None, "Email is required.", None
@@ -649,6 +721,12 @@ async def bootstrap_admin_from_env() -> None:
     if not (username and email and password):
         logger.info("FIRST_ADMIN_* env vars not set — skipping admin bootstrap.")
         return
+    if not NAME_CHARSET.match(username):
+        logger.error(
+            "FIRST_ADMIN_USERNAME invalid (allowed: letters, digits, _, ., @, -): %r",
+            username,
+        )
+        return
     normalized, email_err = _validate_email(email)
     if email_err is not None or normalized is None:
         logger.error("FIRST_ADMIN_EMAIL invalid: %s", email_err)
@@ -740,13 +818,13 @@ async def migrate_legacy_accounts() -> None:
 
 def _page_shell(title: str, body: str, error: str | None = None) -> str:
     """Return a styled HTML page wrapping ``body`` (shared CSS)."""
-    error_banner = f'<div class="error">{error}</div>' if error else ""
+    error_banner = f'<div class="error">{html.escape(error, quote=True)}</div>' if error else ""
     return f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{title} — FalkorDB KG Agent</title>
+  <title>{html.escape(title, quote=True)} — FalkorDB KG Agent</title>
   <style>
     body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
             background: #0f0f12; color: #e8e8ea; display: flex;
@@ -803,12 +881,13 @@ def _register_html(error: str | None = None, csrf_token: str | None = None) -> s
     receive an email to verify your address, then an administrator will approve
     your account.</p>
     <form method="post" action="/register">
-      <input type="hidden" name="csrf_token" value="{csrf_token or ''}" />
+      <input type="hidden" name="csrf_token" value="{html.escape(csrf_token or '', quote=True)}" />
       <label for="username">Username</label>
       <input id="username" name="username" type="text" required autofocus
              maxlength="{MAX_USERNAME_LEN}" autocomplete="username" />
       <label for="display_name">Display name (optional)</label>
-      <input id="display_name" name="display_name" type="text" autocomplete="name" />
+      <input id="display_name" name="display_name" type="text"
+             maxlength="{MAX_DISPLAY_NAME_LEN}" autocomplete="name" />
       <label for="email">Email</label>
       <input id="email" name="email" type="email" required autocomplete="email" />
       <label for="password">Password (min {MIN_PASSWORD_LEN} chars, incl. a letter and a digit)</label>
@@ -833,7 +912,7 @@ def _register_disabled_html() -> str:
 
 def _verify_email_html(message: str, success: bool) -> str:
     banner_cls = "success" if success else "error"
-    body = f'<h1>Email verification</h1><div class="{banner_cls}">{message}</div>'
+    body = f'<h1>Email verification</h1><div class="{banner_cls}">{html.escape(message, quote=True)}</div>'
     if success:
         body += '<a class="link" href="/login">Go to login</a>'
     body += '<a class="link" href="/resend-verification">Resend verification email</a>'
@@ -845,9 +924,9 @@ def _resend_verification_html(error: str | None = None, csrf_token: str | None =
     body = f"""
     <h1>Resend verification email</h1>
     <p class="sub">Enter your email and we'll send a new verification link.</p>
-    {f'<div class="success">{info}</div>' if info else ''}
+    {f'<div class="success">{html.escape(info, quote=True)}</div>' if info else ''}
     <form method="post" action="/resend-verification">
-      <input type="hidden" name="csrf_token" value="{csrf_token or ''}" />
+      <input type="hidden" name="csrf_token" value="{html.escape(csrf_token or '', quote=True)}" />
       <label for="email">Email</label>
       <input id="email" name="email" type="email" required autocomplete="email" />
       <button type="submit">Send</button>
@@ -861,9 +940,9 @@ def _forgot_password_html(error: str | None = None, csrf_token: str | None = Non
     body = f"""
     <h1>Reset your password</h1>
     <p class="sub">Enter your account email and we'll send a reset link.</p>
-    {f'<div class="success">{info}</div>' if info else ''}
+    {f'<div class="success">{html.escape(info, quote=True)}</div>' if info else ''}
     <form method="post" action="/forgot-password">
-      <input type="hidden" name="csrf_token" value="{csrf_token or ''}" />
+      <input type="hidden" name="csrf_token" value="{html.escape(csrf_token or '', quote=True)}" />
       <label for="email">Email</label>
       <input id="email" name="email" type="email" required autocomplete="email" />
       <button type="submit">Send reset link</button>
@@ -877,8 +956,8 @@ def _reset_password_html(token: str, error: str | None = None, csrf_token: str |
     <h1>Set a new password</h1>
     <p class="sub">Choose a new password (min {MIN_PASSWORD_LEN} chars, incl. a letter and a digit).</p>
     <form method="post" action="/reset-password">
-      <input type="hidden" name="token" value="{token}" />
-      <input type="hidden" name="csrf_token" value="{csrf_token or ''}" />
+      <input type="hidden" name="token" value="{html.escape(token, quote=True)}" />
+      <input type="hidden" name="csrf_token" value="{html.escape(csrf_token or '', quote=True)}" />
       <label for="password">New password</label>
       <input id="password" name="password" type="password" required
              minlength="{MIN_PASSWORD_LEN}" autocomplete="new-password" autofocus />
@@ -905,47 +984,49 @@ def _admin_users_html(users: list[dict], csrf_token: str, message: str | None = 
             '<span class="badge b-admin">admin</span>' if u["role"] == ROLE_ADMIN else ""
         )
         status = _status_badge(u["accountStatus"])
+        ident = html.escape(u["identifier"], quote=True)
+        token = html.escape(csrf_token, quote=True)
         actions = ""
         if u["accountStatus"] in (STATUS_PENDING, STATUS_EMAIL_VERIFIED):
             actions += (
-                f'<form class="inline" method="post" action="/admin/users/{u["identifier"]}/approve">'
-                f'<input type="hidden" name="csrf_token" value="{csrf_token}" />'
+                f'<form class="inline" method="post" action="/admin/users/{ident}/approve">'
+                f'<input type="hidden" name="csrf_token" value="{token}" />'
                 f'<button type="submit">Approve</button></form>'
             )
         if u["accountStatus"] != STATUS_DISABLED:
             actions += (
-                f'<form class="inline" method="post" action="/admin/users/{u["identifier"]}/disable">'
-                f'<input type="hidden" name="csrf_token" value="{csrf_token}" />'
+                f'<form class="inline" method="post" action="/admin/users/{ident}/disable">'
+                f'<input type="hidden" name="csrf_token" value="{token}" />'
                 f'<button type="submit" class="secondary">Disable</button></form>'
             )
         if u["accountStatus"] == STATUS_DISABLED:
             actions += (
-                f'<form class="inline" method="post" action="/admin/users/{u["identifier"]}/enable">'
-                f'<input type="hidden" name="csrf_token" value="{csrf_token}" />'
+                f'<form class="inline" method="post" action="/admin/users/{ident}/enable">'
+                f'<input type="hidden" name="csrf_token" value="{token}" />'
                 f'<button type="submit">Enable</button></form>'
             )
         if u["role"] != ROLE_ADMIN:
             actions += (
-                f'<form class="inline" method="post" action="/admin/users/{u["identifier"]}/promote">'
-                f'<input type="hidden" name="csrf_token" value="{csrf_token}" />'
+                f'<form class="inline" method="post" action="/admin/users/{ident}/promote">'
+                f'<input type="hidden" name="csrf_token" value="{token}" />'
                 f'<button type="submit" class="secondary">Make admin</button></form>'
             )
         else:
             actions += (
-                f'<form class="inline" method="post" action="/admin/users/{u["identifier"]}/demote">'
-                f'<input type="hidden" name="csrf_token" value="{csrf_token}" />'
+                f'<form class="inline" method="post" action="/admin/users/{ident}/demote">'
+                f'<input type="hidden" name="csrf_token" value="{token}" />'
                 f'<button type="submit" class="secondary">Make user</button></form>'
             )
         rows += (
-            f"<tr><td>{u['identifier']}</td><td>{u['displayName'] or ''}</td>"
-            f"<td>{u['email'] or ''}</td><td>{role_badge}</td><td>{status}</td>"
-            f"<td>{actions}</td></tr>"
+            f"<tr><td>{ident}</td><td>{html.escape(u['displayName'] or '', quote=True)}</td>"
+            f"<td>{html.escape(u['email'] or '', quote=True)}</td>"
+            f"<td>{role_badge}</td><td>{status}</td><td>{actions}</td></tr>"
         )
     msg = ""
     if message:
-        msg = f'<div class="success">{message}</div>'
+        msg = f'<div class="success">{html.escape(message, quote=True)}</div>'
     if error:
-        msg = f'<div class="error">{error}</div>'
+        msg = f'<div class="error">{html.escape(error, quote=True)}</div>'
     body = f"""
     {msg}
     <h1>User administration</h1>
@@ -1008,6 +1089,11 @@ def register_routes() -> None:
 
     from falkordb_harness.data_layer import _elements_dir
 
+    # Fail fast if the JWT/CSRF signing secret is missing — a missing secret
+    # would otherwise silently disable CSRF protection (and Chainlit's own
+    # JWT signing). Refuse to register routes rather than running insecure.
+    _csrf_secret()
+
     limiter = Limiter(key_func=get_remote_address, storage_uri="memory://")
     app.state.limiter = limiter
 
@@ -1022,6 +1108,10 @@ def register_routes() -> None:
 
     def _csrf_from_form(form) -> str | None:
         return str(form.get("csrf_token", "")) or None
+
+    def _html(content: str, status_code: int = 200) -> HTMLResponse:
+        """Return an HTMLResponse with the Content-Security-Policy header set."""
+        return HTMLResponse(content, status_code=status_code, headers={"Content-Security-Policy": _CSP_HEADER})
 
     async def _require_admin(request: Request) -> str | None:
         """Return the identifier of the authenticated admin, or ``None``.
@@ -1052,16 +1142,16 @@ def register_routes() -> None:
 
     async def register_page(request: Request) -> HTMLResponse:
         if not _registration_enabled():
-            return HTMLResponse(_register_disabled_html())
-        return HTMLResponse(_register_html(csrf_token=issue_csrf_token()))
+            return _html(_register_disabled_html())
+        return _html(_register_html(csrf_token=issue_csrf_token()))
 
     @limiter.limit("5/minute")
     async def register_submit(request: Request) -> HTMLResponse | RedirectResponse:
         if not _registration_enabled():
-            return HTMLResponse(_register_disabled_html())
+            return _html(_register_disabled_html())
         form = await request.form()
         if not verify_csrf_token(_csrf_from_form(form)):
-            return HTMLResponse(_register_html(error="Invalid form submission."), status_code=403)
+            return _html(_register_html(error="Invalid form submission."), status_code=403)
         username = str(form.get("username", "")).strip()
         password = str(form.get("password", ""))
         email = str(form.get("email", "")).strip()
@@ -1070,8 +1160,8 @@ def register_routes() -> None:
         user, error, verify_token = await register_user(username, password, email, display_name)
         if user is None:
             assert error is not None
-            return HTMLResponse(_register_html(error=error, csrf_token=issue_csrf_token()),
-                                status_code=400)
+            return _html(_register_html(error=error, csrf_token=issue_csrf_token()),
+                         status_code=400)
         # Send the verification email (best-effort; failures are logged).
         if verify_token and email:
             await send_verification_email(email, verify_token)
@@ -1082,37 +1172,37 @@ def register_routes() -> None:
     async def verify_email_page(request: Request) -> HTMLResponse:
         token = request.query_params.get("token", "")
         ok, message = await verify_email_token(token)
-        return HTMLResponse(_verify_email_html(message, ok), status_code=200 if ok else 400)
+        return _html(_verify_email_html(message, ok), status_code=200 if ok else 400)
 
     # --- /resend-verification ---------------------------------------------
 
     async def resend_verification_page(request: Request) -> HTMLResponse:
-        return HTMLResponse(_resend_verification_html(csrf_token=issue_csrf_token()))
+        return _html(_resend_verification_html(csrf_token=issue_csrf_token()))
 
     @limiter.limit("3/minute")
     async def resend_verification_submit(request: Request) -> HTMLResponse:
         form = await request.form()
         if not verify_csrf_token(_csrf_from_form(form)):
-            return HTMLResponse(_resend_verification_html(error="Invalid form submission."),
-                                status_code=403)
+            return _html(_resend_verification_html(error="Invalid form submission."),
+                         status_code=403)
         email = str(form.get("email", "")).strip()
         _ok, info = await resend_verification_email(email)
-        return HTMLResponse(_resend_verification_html(info=info, csrf_token=issue_csrf_token()))
+        return _html(_resend_verification_html(info=info, csrf_token=issue_csrf_token()))
 
     # --- /forgot-password --------------------------------------------------
 
     async def forgot_password_page(request: Request) -> HTMLResponse:
-        return HTMLResponse(_forgot_password_html(csrf_token=issue_csrf_token()))
+        return _html(_forgot_password_html(csrf_token=issue_csrf_token()))
 
     @limiter.limit("3/minute")
     async def forgot_password_submit(request: Request) -> HTMLResponse:
         form = await request.form()
         if not verify_csrf_token(_csrf_from_form(form)):
-            return HTMLResponse(_forgot_password_html(error="Invalid form submission."),
-                                status_code=403)
+            return _html(_forgot_password_html(error="Invalid form submission."),
+                         status_code=403)
         email = str(form.get("email", "")).strip()
         await request_password_reset(email)
-        return HTMLResponse(
+        return _html(
             _forgot_password_html(
                 info="If that email is registered, a reset link has been sent.",
                 csrf_token=issue_csrf_token(),
@@ -1124,44 +1214,44 @@ def register_routes() -> None:
     async def reset_password_page(request: Request) -> HTMLResponse:
         token = request.query_params.get("token", "")
         if not token:
-            return HTMLResponse(_page_shell("Reset password",
-                                             '<h1>Reset password</h1>'
-                                             '<div class="error">Invalid reset link.</div>'),
-                                status_code=400)
-        return HTMLResponse(_reset_password_html(token, csrf_token=issue_csrf_token()))
+            return _html(_page_shell("Reset password",
+                                      '<h1>Reset password</h1>'
+                                      '<div class="error">Invalid reset link.</div>'),
+                         status_code=400)
+        return _html(_reset_password_html(token, csrf_token=issue_csrf_token()))
 
     @limiter.limit("3/minute")
     async def reset_password_submit(request: Request) -> HTMLResponse:
         form = await request.form()
         if not verify_csrf_token(_csrf_from_form(form)):
-            return HTMLResponse(_reset_password_html(
+            return _html(_reset_password_html(
                 str(form.get("token", "")), error="Invalid form submission."), status_code=403)
         token = str(form.get("token", ""))
         password = str(form.get("password", ""))
         ok, message = await reset_password(token, password)
         if ok:
-            return HTMLResponse(_page_shell("Reset password",
-                                             f'<h1>Reset password</h1>'
-                                             f'<div class="success">{message}</div>'
-                                             f'<a class="link" href="/login">Go to login</a>'))
-        return HTMLResponse(_reset_password_html(token, error=message,
-                                                 csrf_token=issue_csrf_token()), status_code=400)
+            return _html(_page_shell("Reset password",
+                                      f'<h1>Reset password</h1>'
+                                      f'<div class="success">{html.escape(message, quote=True)}</div>'
+                                      f'<a class="link" href="/login">Go to login</a>'))
+        return _html(_reset_password_html(token, error=message,
+                                          csrf_token=issue_csrf_token()), status_code=400)
 
     # --- /admin/users ------------------------------------------------------
 
     async def admin_users_page(request: Request) -> HTMLResponse:
         admin_id = await _require_admin(request)
         if admin_id is None:
-            return HTMLResponse(_forbidden_html(), status_code=403)
+            return _html(_forbidden_html(), status_code=403)
         users = await list_users()
-        return HTMLResponse(_admin_users_html(users, csrf_token=issue_csrf_token()))
+        return _html(_admin_users_html(users, csrf_token=issue_csrf_token(admin_id)))
 
     async def _admin_action(request: Request) -> HTMLResponse | RedirectResponse:
         admin_id = await _require_admin(request)
         if admin_id is None:
-            return HTMLResponse(_forbidden_html(), status_code=403)
+            return _html(_forbidden_html(), status_code=403)
         form = await request.form()
-        if not verify_csrf_token(_csrf_from_form(form)):
+        if not verify_csrf_token(_csrf_from_form(form), expected_identifier=admin_id):
             return RedirectResponse(url="/admin/users?error=invalid", status_code=303)
         # Path: /admin/users/{identifier}/{action}
         path = request.url.path
