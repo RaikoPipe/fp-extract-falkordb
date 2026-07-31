@@ -1219,6 +1219,7 @@ async def _send_welcome_modal() -> None:
             "title": t("welcome.title"),
             "intro": t("welcome.intro"),
             "risks": risks,
+            "closing": t("welcome.closing"),
             "ackLabel": t("welcome.ack.label"),
             "dismissedKey": "fp_welcome_ack_v1",
         }

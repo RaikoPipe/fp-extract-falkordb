@@ -453,48 +453,52 @@ STRINGS: dict[str, dict[str, str]] = {
         "de": "Test-Build — Bitte lesen",
     },
     "welcome.intro": {
-        "en": "This is a **test build**, not a production system. Please read the following points before continuing.",
-        "de": "Dies ist ein **Test-Build**, kein Produktivsystem. Bitte lesen Sie die folgenden Hinweise, bevor Sie fortfahren.",
+        "en": "This is a test build for research purposes only, not a production system. The following is provided in good faith to ensure informed use. Use is permitted for consortial partners in full compliance with the cooperation contract of 13 June 2025 and the open-source software agreement of 18 August 2025.",
+        "de": "Dies ist ein Test-Build ausschließlich für Forschungszwecke, kein Produktivsystem. Das Folgende wird nach Treu und Glauben bereitgestellt, um eine informierte Nutzung zu gewährleisten. Die Nutzung ist Konsortialpartnern gestattet, sofern sie vollständig dem Kooperationsvertrag vom 13. Juni 2025 und der Open-Source-Softwarevereinbarung vom 18. August 2025 entspricht.",
     },
     "welcome.risk.cloud.title": {
-        "en": "Cloud LLM provider (no DSGVO / GDPR conformity)",
-        "de": "Cloud-LLM-Anbieter (keine DSGVO-Konformität)",
+        "en": "Cloud LLM; no GDPR / DSGVO conformity",
+        "de": "Cloud-LLM; keine GDPR-/DSGVO-Konformität",
     },
     "welcome.risk.cloud.body": {
-        "en": "Ollama Cloud is hardcoded as the LLM provider for this test build. All input you send to the chat is processed by Ollama Cloud services. This means your data leaves the controlled environment and is processed by a third-party cloud provider, so there is **no DSGVO / GDPR conformity** (incl. Art. 44 cross-border and Art. 28 processor concerns).",
-        "de": "Ollama Cloud ist für diesen Test-Build fest als LLM-Anbieter konfiguriert. Sämtliche Eingaben, die Sie im Chat tätigen, werden von den Cloud-Diensten von Ollama verarbeitet. Ihre Daten verlassen dabei die kontrollierte Umgebung und werden durch einen Drittanbieter verarbeitet — es besteht **keine DSGVO-/GDPR-Konformität** (inkl. Art. 44 Datenübermittlung in Drittländer und Art. 28 Auftragsverarbeitung).",
+        "en": "All input is processed by a third-party cloud provider (Ollama Cloud), so data leaves the controlled environment. No transfer mechanism (Art. 44) or processor agreement (Art. 28) is in place. GDPR conformity cannot be guaranteed.",
+        "de": "Sämtliche Eingaben werden von einem Drittanbieter-Cloud-Dienst (Ollama Cloud) verarbeitet, sodass die Daten die kontrollierte Umgebung verlassen. Es liegt kein Übermittlungsmechanismus (Art. 44) und keine Auftragsverarbeitungsvereinbarung (Art. 28) vor. Eine DSGVO-/GDPR-Konformität kann nicht gewährleistet werden.",
     },
     "welcome.risk.compliance.title": {
-        "en": "No data-processing agreement (DPA / AVV)",
-        "de": "Keine Auftragsverarbeitungsvereinbarung (AVV)",
+        "en": "No DPA / AVV",
+        "de": "Kein DPA / AVV",
     },
     "welcome.risk.compliance.body": {
-        "en": "No data-processing agreement (DPA / AVV) with the cloud provider is in place for this test build. Processing of personal data is therefore not compliant and must not be used for such data.",
-        "de": "Für diesen Test-Build liegt keine Auftragsverarbeitungsvereinbarung (AVV) mit dem Cloud-Anbieter vor. Die Verarbeitung personenbezogener Daten ist daher nicht konform und darf für solche Daten nicht verwendet werden.",
+        "en": "No data-processing agreement with the cloud provider exists. Processing of personal data is non-compliant and must not be undertaken.",
+        "de": "Es besteht keine Auftragsverarbeitungsvereinbarung mit dem Cloud-Anbieter. Die Verarbeitung personenbezogener Daten ist nicht konform und darf nicht vorgenommen werden.",
     },
     "welcome.risk.retention.title": {
-        "en": "Unknown retention / logging on the provider side",
-        "de": "Unbekannte Speicher- und Protokollierungsdauer beim Anbieter",
+        "en": "Unknown provider-side retention",
+        "de": "Unbekannte Anbieter-Speicherdauer",
     },
     "welcome.risk.retention.body": {
-        "en": "There are no guarantees regarding retention, deletion, or logging on the provider side. Inputs may be stored, logged, or used for model improvement by the cloud service.",
-        "de": "Es gibt keine Garantien bezüglich Speicherung, Löschung oder Protokollierung auf Seiten des Anbieters. Eingaben können durch den Cloud-Dienst gespeichert, protokolliert oder zur Modellverbesserung verwendet werden.",
+        "en": "No guarantees exist regarding retention, deletion, or logging. Inputs may be stored, logged, or used for model improvement by the provider.",
+        "de": "Es bestehen keine Garantien bezüglich Speicherung, Löschung oder Protokollierung. Eingaben können durch den Anbieter gespeichert, protokolliert oder zur Modellverbesserung verwendet werden.",
     },
     "welcome.risk.no_audit.title": {
-        "en": "No prompt / reply audit logging",
-        "de": "Keine Protokollierung von Anfragen und Antworten",
+        "en": "No audit logging",
+        "de": "Keine Audit-Protokollierung",
     },
     "welcome.risk.no_audit.body": {
-        "en": "This test build does not keep an audit log of what is sent to or received from the provider. There is no transparency over the data transmitted.",
-        "de": "Dieser Test-Build führt kein Audit-Log über die an den Anbieter gesendeten oder von ihm empfangenen Daten. Es gibt keine Transparenz über die übermittelten Daten.",
+        "en": "This build keeps no log of content sent to or received from the provider. Transparency over transmitted data is limited.",
+        "de": "Dieser Build führt kein Protokoll über Inhalte, die an den Anbieter gesendet oder von ihm empfangen werden. Die Transparenz über übermittelte Daten ist eingeschränkt.",
     },
     "welcome.risk.not_hardened.title": {
         "en": "Not security-hardened",
         "de": "Nicht sicherheitstechnisch gehärtet",
     },
     "welcome.risk.not_hardened.body": {
-        "en": "This is a test build: it is not security-hardened, has no rate limiting, and is not intended for processing personal or confidential data.",
-        "de": "Dies ist ein Test-Build: nicht sicherheitstechnisch gehärtet, ohne Rate-Limiting und nicht für die Verarbeitung personenbezogener oder vertraulicher Daten vorgesehen.",
+        "en": "No rate limiting, access controls, or production-grade security measures are implemented.",
+        "de": "Es sind kein Rate-Limiting, keine Zugriffskontrollen oder produktionsgradige Sicherheitsmaßnahmen implementiert.",
+    },
+    "welcome.closing": {
+        "en": "This build must not be used to process personal, confidential, or otherwise sensitive data.",
+        "de": "Dieser Build darf nicht zur Verarbeitung personenbezogener, vertraulicher oder anderweitig sensibler Daten verwendet werden.",
     },
     "welcome.ack.label": {
         "en": "I understand and acknowledge.",

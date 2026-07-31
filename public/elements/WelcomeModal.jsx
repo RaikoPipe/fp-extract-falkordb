@@ -1,6 +1,7 @@
 import { Button } from "@/components/ui/button"
 import { Card, CardHeader, CardTitle, CardContent, CardFooter } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
+import { Markdown } from "@/components/markdown"
 import { ShieldAlert } from "lucide-react"
 import { useEffect, useState } from "react"
 
@@ -17,6 +18,7 @@ export default function WelcomeModal() {
   const title = props.title || (props.lang === "en" ? "Test Build — Please Read" : "Test-Build — Bitte lesen")
   const intro = props.intro || ""
   const risks = Array.isArray(props.risks) ? props.risks : []
+  const closing = props.closing || ""
   const ackLabel =
     props.ackLabel || (props.lang === "en" ? "I understand and acknowledge." : "Ich verstehe und bestätige dies.")
   const dismissedKey = props.dismissedKey || "fp_welcome_ack_v1"
@@ -76,7 +78,11 @@ export default function WelcomeModal() {
           </CardTitle>
         </CardHeader>
         <CardContent className="overflow-y-auto space-y-4 text-sm">
-          {intro && <p className="text-muted-foreground">{intro}</p>}
+          {intro && (
+            <Markdown className="text-muted-foreground prose prose-sm max-w-none">
+              {intro}
+            </Markdown>
+          )}
           <ul className="space-y-3">
             {risks.map((risk, i) => (
               <li key={i} className="space-y-1">
@@ -86,12 +92,19 @@ export default function WelcomeModal() {
                   </Badge>
                   <div className="space-y-1">
                     <div className="font-medium">{risk.title}</div>
-                    <div className="text-muted-foreground">{risk.body}</div>
+                    <Markdown className="text-muted-foreground prose prose-sm max-w-none">
+                      {risk.body}
+                    </Markdown>
                   </div>
                 </div>
               </li>
             ))}
           </ul>
+          {closing && (
+            <Markdown className="font-medium prose prose-sm max-w-none pt-2 border-t">
+              {closing}
+            </Markdown>
+          )}
         </CardContent>
         <CardFooter className="shrink-0 pt-2 flex justify-end">
           <Button onClick={handleAck} className="gap-2">
