@@ -627,11 +627,11 @@ async def on_chat_start() -> None:
     # injected lazily on the first user turn where documents exist.
 
     # Send the startup welcome / acknowledgement popup (test-build warning).
-    # The modal is delivered via cl.ElementSidebar.set_elements (see
-    # _send_welcome_modal), NOT a cl.Message, so it overlays the starter
-    # view without making Chainlit's frontend leave the startup screen.
-    # Re-show is suppressed per-browser via localStorage, so returning users
-    # don't see it again.
+    # Unlike the open-docs button, the welcome modal is a blocking overlay
+    # that MUST appear on startup; it renders above any view via
+    # position:fixed and is dismissed only by the "I understand and
+    # acknowledge." button. Re-show is suppressed per-browser via
+    # localStorage, so returning users don't see it again.
     await _send_welcome_modal()
 
 
@@ -1170,31 +1170,21 @@ async def _send_welcome_modal() -> None:
     """Send the startup welcome / acknowledgement popup (test-build warning).
 
     Renders the ``WelcomeModal`` CustomElement as a centered modal overlay
-    via the element sidebar (``cl.ElementSidebar.set_elements``), NOT via a
-    ``cl.Message``. The modal lists the compliance risks of this test build
-    (hardcoded Ollama Cloud LLM provider -> no DSGVO/GDPR conformity, no
-    DPA/AVV, unknown provider-side retention/logging, no audit logging, not
-    security-hardened) and can only be closed by clicking "I understand and
-    acknowledge." Re-show is suppressed per-browser via ``localStorage``
-    (key ``fp_welcome_ack_v1``); bump the version in the props to re-show
-    after a future edit of the warning text.
-
-    The sidebar channel is used because sending a ``cl.Message`` (even with
-    empty content) emits a ``new_message`` event that makes Chainlit's
-    frontend leave the starter/startup screen. ``set_elements`` emits only
-    ``set_sidebar_elements`` + ``element`` events, which do not touch the
-    message list, so the starter view stays while the modal's
-    ``position: fixed`` overlay (see WelcomeModal.jsx) sits above it. The
-    sidebar drawer that opens behind the modal is hidden by the modal's
-    dimmed backdrop.
+    via a low-key assistant message. The modal lists the compliance risks of
+    this test build (hardcoded Ollama Cloud LLM provider -> no DSGVO/GDPR
+    conformity, no DPA/AVV, unknown provider-side retention/logging, no
+    audit logging, not security-hardened) and can only be closed by clicking
+    "I understand and acknowledge." Re-show is suppressed per-browser via
+    ``localStorage`` (key ``fp_welcome_ack_v1``); bump the version in the
+    props to re-show after a future edit of the warning text.
 
     Only sent from :func:`on_chat_start` (new chats), NOT from
     :func:`on_chat_resume`. The per-browser localStorage guard means a user
     who already acknowledged won't see it again anyway, and resumed threads
     are active chats that should not be interrupted.
 
-    Best-effort: silently no-ops on older Chainlit without
-    ``ElementSidebar`` / ``CustomElement`` support, so the chat still works.
+    Best-effort: silently no-ops on older Chainlit without CustomElement
+    support, so the chat still works.
     """
     try:
         import chainlit as cl
@@ -1233,26 +1223,10 @@ async def _send_welcome_modal() -> None:
             "ackLabel": t("welcome.ack.label"),
             "dismissedKey": "fp_welcome_ack_v1",
         }
-        # Deliver the modal via the element sidebar, NOT a cl.Message.
-        # Sending a cl.Message (even with empty content) emits a
-        # ``new_message`` socket event whose step type is
-        # ``assistant_message``; Chainlit's frontend unmounts the
-        # starter/startup view as soon as any such message lands (the
-        # welcome screen is gated on the message list containing no
-        # user/assistant/tool steps). Routing through
-        # ``cl.ElementSidebar.set_elements`` instead emits only
-        # ``set_sidebar_elements`` + ``element`` events, which do not
-        # touch the message list, so the starter view stays put while
-        # the modal overlays it. The sidebar drawer that opens behind
-        # the modal is hidden by the modal's fixed-position dimmed
-        # backdrop (see WelcomeModal.jsx). The welcome-keyed sidebar is
-        # naturally supplanted on the first on_message / on_chat_resume
-        # when _refresh_sidebar() re-keys to "main".
-        await cl.ElementSidebar.set_title(t("welcome.title"))
-        await cl.ElementSidebar.set_elements(
-            [cl.CustomElement(name="WelcomeModal", props=props)],
-            key="welcome",
-        )
+        await cl.Message(
+            content="",
+            elements=[cl.CustomElement(name="WelcomeModal", props=props)],
+        ).send()
     except Exception as exc:  # noqa: BLE001 — never break the chat on UI
         logger.debug("WelcomeModal send failed: %s", exc)
 
