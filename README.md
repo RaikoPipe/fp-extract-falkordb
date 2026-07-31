@@ -582,7 +582,7 @@ The Chainlit app supports **user accounts** and **per-user chat history** out of
 - **Self-service registration** is exposed at the `/register` route (a small server-rendered HTML form). On success the user is redirected to the login page. Registration can be disabled with `REGISTER_ENABLED=0` (admin-only account creation).
 - **Passwords** are hashed with bcrypt and stored in the `passwordHash` column of the `users` table.
 - **Chat history** is persisted by Chainlit's `SQLAlchemyDataLayer`: every thread, message (step), element (uploaded file), and feedback entry is written to the SQLite DB at `DATABASE_URL`. Logged-in users see their past threads in the sidebar and can resume any of them.
-- **Uploaded files** in persisted threads are written to `ELEMENTS_DIR` (default `./data/elements`) by a `LocalStorageClient` and served back via a `/public/elements/...` static mount — no S3/Azure/GCS needed.
+- **Uploaded files** in persisted threads are written to `ELEMENTS_DIR` (default `./data/elements`) by a `LocalStorageClient` and served back via a `/public/files/...` static mount — no S3/Azure/GCS needed.
 
 ### Setup
 

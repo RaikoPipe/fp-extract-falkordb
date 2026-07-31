@@ -109,12 +109,12 @@ class LocalStorageClient(BaseStorageClient):
 
         The Chainlit frontend fetches elements by the ``url`` stored on
         the element row. We expose elements under the app's
-        ``/public/elements/<object_key>`` path; a static-file route is
+        ``/public/files/<object_key>`` path; a static-file route is
         mounted on this prefix by the auth module at startup. If the
         object key is not under our root (defensive), fall back to the
         absolute file path so the blob is at least discoverable.
         """
-        return f"/public/elements/{object_key}"
+        return f"/public/files/{object_key}"
 
 
 _DDL_STATEMENTS: tuple[str, ...] = (

@@ -136,7 +136,7 @@ async def _on_app_startup() -> None:
        in the SQLite database if missing — Chainlit's SQLAlchemy layer
        does not auto-create them. Idempotent.
     2. Register the custom auth routes (register, verify-email, password
-       reset, admin UI) and the ``/public/elements`` static mount.
+       reset, admin UI) and the ``/public/files`` static mount.
     3. Migrate legacy pre-auth accounts (no password hash) into a disabled
        state so they can't be accidentally approved into a passwordless
        active state.

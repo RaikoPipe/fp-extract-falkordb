@@ -1071,7 +1071,7 @@ def register_routes() -> None:
     - ``/forgot-password`` (GET/POST) — request a password-reset email
     - ``/reset-password`` (GET/POST) — set a new password from a reset token
     - ``/admin/users`` (GET) + ``/admin/users/<id>/<action>`` (POST) — admin UI
-    - ``/public/elements`` static mount for persisted uploaded-file blobs
+    - ``/public/files`` static mount for persisted uploaded-file blobs
 
     Route ordering: Chainlit registers a catch-all
     ``/{full_path:path}`` for its SPA shell. We insert our routes at the
@@ -1097,13 +1097,18 @@ def register_routes() -> None:
     limiter = Limiter(key_func=get_remote_address, storage_uri="memory://")
     app.state.limiter = limiter
 
-    # Mount the elements directory so LocalStorageClient's /public/elements/...
-    # URLs serve the actual files.
+    # Mount the elements directory so LocalStorageClient's /public/files/...
+    # URLs serve the actual files. NOTE: the mount path must NOT be
+    # ``/public/elements`` — Chainlit's ``serve_public_file`` route
+    # (``/public/{filename:path}``) serves custom-element JSX source from
+    # ``/public/elements/<Name>.jsx``. A StaticFiles mount at
+    # ``/public/elements`` shadows that route and makes WelcomeModal /
+    # DocumentManager / OpenDocsButton silently 404 on the frontend.
     elements_root = _elements_dir()
     app.mount(
-        "/public/elements",
+        "/public/files",
         StaticFiles(directory=str(elements_root)),
-        name="elements",
+        name="files",
     )
 
     def _csrf_from_form(form) -> str | None:

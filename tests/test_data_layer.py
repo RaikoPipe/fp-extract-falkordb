@@ -312,7 +312,7 @@ def test_storage_upload_writes_file_and_returns_url(tmp_path):
 
     res = _run(client.upload_file("u1/e1/file.txt", b"hello", mime="text/plain"))
     assert res["object_key"] == "u1/e1/file.txt"
-    assert res["url"] == "/public/elements/u1/e1/file.txt"
+    assert res["url"] == "/public/files/u1/e1/file.txt"
 
     written = (tmp_path / "u1" / "e1" / "file.txt").read_bytes()
     assert written == b"hello"
