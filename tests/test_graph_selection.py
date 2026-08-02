@@ -703,20 +703,38 @@ def test_build_graph_context_prefix_no_context_empty():
 # ---------------------------------------------------------------------------
 # create_graph tool
 # ---------------------------------------------------------------------------
-def test_create_graph_refuses_when_graph_already_active():
-    """create_graph refuses when a graph is already active (no-graph-only rule)."""
+def test_create_graph_succeeds_when_graph_already_active():
+    """create_graph creates + activates + seeds description even when a graph
+    is already active (creation is allowed at any time)."""
 
     from falkordb_harness.tools.graph_admin_tools import _create_graph_impl
 
     backend = MagicMock()
-    backend.graph_name = "existing"
+    backend.graph_name = "existing"  # a graph is already active
+    backend.allowed_graphs = ["existing", "new"]
 
-    with patch("falkordb_harness.tools.graph_admin_tools.get_backend", return_value=backend):
+    def fake_set_active(name):
+        backend.graph_name = name
+
+    backend.set_active_graph.side_effect = fake_set_active
+
+    async def fake_set_desc(name, desc):
+        return None
+
+    async def fake_persist(graph):
+        return None
+
+    with patch("falkordb_harness.tools.graph_admin_tools.get_backend", return_value=backend), \
+         patch("falkordb_harness.graph_descriptions.set_description", new=fake_set_desc), \
+         patch("falkordb_harness.tools.graph_admin_tools._persist_last_graph", new=fake_persist), \
+         patch("chainlit.user_session") as _us:
+        _us.get.return_value = None
         out = asyncio.run(_create_graph_impl("new", "desc"))
     payload = json.loads(out)
-    assert payload["created"] is False
-    assert "already active" in payload["error"]
-    backend.create_graph.assert_not_called()
+    assert payload["created"] is True
+    assert payload["active_graph"] == "new"
+    backend.create_graph.assert_called_once_with("new")
+    backend.set_active_graph.assert_called_once_with("new")
 
 
 def test_create_graph_empty_name_rejected():

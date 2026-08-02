@@ -35,16 +35,16 @@ STRINGS: dict[str, dict[str, str]] = {
         "de": "Graph",
     },
     "settings.tab.ingestion.label": {
-        "en": "Ingestion (Expert Settings)",
-        "de": "Ingestion (Experten-Einstellungen)",
+        "en": "Developer Settings",
+        "de": "Entwickler-Einstellungen",
     },
     "settings.active_graph.label": {
         "en": "Active knowledge graph",
         "de": "Aktiver Wissensgraph",
     },
     "settings.active_graph.desc": {
-        "en": "The graph all queries and ingestion target. Use the checkboxes below to enable more graphs for switching.",
-        "de": "Der Graph, auf den alle Anfragen und die Ingestion abzielen. Aktivieren Sie weitere Graphen über die Kontrollkästchen unten, um zwischen ihnen wechseln zu können.",
+        "en": "The graph all queries and ingestion target.",
+        "de": "Der Graph, auf den alle Anfragen und die Ingestion abzielen.",
     },
     "settings.allowed_graphs.label": {
         "en": "Enabled knowledge graphs (in scope for the assistant)",
@@ -65,6 +65,18 @@ STRINGS: dict[str, dict[str, str]] = {
     "settings.new_graph_name.desc": {
         "en": "Type a name and hit Save to create a new empty graph on the FalkorDB instance. It will be added to the dropdowns and set as the active graph. Leave blank to skip.",
         "de": "Geben Sie einen Namen ein und klicken Sie auf Speichern, um einen neuen leeren Graphen auf der FalkorDB-Instanz anzulegen. Er wird zu den Dropdowns hinzugefügt und als aktiver Graph gesetzt. Leer lassen, um zu überspringen.",
+    },
+    "settings.new_graph_description.label": {
+        "en": "Knowledge graph description",
+        "de": "Beschreibung des Wissensgraphen",
+    },
+    "settings.new_graph_description.placeholder": {
+        "en": "optional short description",
+        "de": "optionale Kurzbeschreibung",
+    },
+    "settings.new_graph_description.desc": {
+        "en": "Optional 1-3 sentence summary seeded as the new graph's description (the agent can revise it later). Leave blank to skip.",
+        "de": "Optionale 1-3 Sätze Zusammenfassung, die als Beschreibung des neuen Graphen gesetzt wird (der Assistent kann sie später überarbeiten). Leer lassen, um zu überspringen.",
     },
     "settings.label_filter.label": {
         "en": "Default node-label filter (for list_nodes / search)",

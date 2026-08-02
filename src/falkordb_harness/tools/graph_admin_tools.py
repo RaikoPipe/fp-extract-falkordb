@@ -3,9 +3,9 @@
 These tools implement the revised KG policy:
 
 - ``create_graph(name, description)`` — create a new KG and make it active.
-  Only allowed when the session started with no graph selected. The LLM
-  picks both the name and an initial 1-3 sentence description from the
-  user's ingestion intent. No user confirmation (decided on user sentiment).
+  Allowed at any time, regardless of whether a graph is currently active.
+  The LLM picks both the name and an initial 1-3 sentence description from
+  the user's ingestion intent. No user confirmation (decided on user sentiment).
 - ``request_graph_switch(name)`` — ask the user to confirm switching the
   active graph via an AskActionMessage (reuses the ui_prompts bridge).
   Sets a per-session approval stamp that ``use_graph`` checks before
@@ -48,12 +48,13 @@ logger = logging.getLogger("falkordb_harness.tools.graph_admin")
 async def create_graph(name: str, description: str) -> str:
     """Create a new knowledge graph and make it the active graph.
 
-    Only allowed when NO graph is currently selected for the session (the
-    preamble will say so). ``name`` is the new graph's name (must not
-    already exist on the FalkorDB instance). ``description`` is a concise
-    1-3 sentence summary of the graph's intended scope, derived from the
-    user's ingestion intent — this is stored as the graph's description
-    and refined after each ingestion via ``update_graph_description``.
+    Allowed at any time, regardless of whether a graph is currently active
+    for the session (the preamble will say which, if any). ``name`` is the
+    new graph's name (must not already exist on the FalkorDB instance).
+    ``description`` is a concise 1-3 sentence summary of the graph's
+    intended scope, derived from the user's ingestion intent — this is
+    stored as the graph's description and refined after each ingestion via
+    ``update_graph_description``.
 
     No user confirmation is requested — decide from user sentiment. After
     this call succeeds, the new graph is active and ingestion can proceed.
@@ -70,21 +71,6 @@ async def _create_graph_impl(name: str, description: str) -> str:
             ensure_ascii=False,
         )
     backend = get_backend()
-    # Enforce the no-graph-only rule: refuse if a graph is already active.
-    active = backend.graph_name
-    if active:
-        return json.dumps(
-            {
-                "error": (
-                    f"A graph is already active ('{active}'). create_graph is "
-                    "only allowed when no graph is selected. Use "
-                    "request_graph_switch + use_graph to switch instead."
-                ),
-                "created": False,
-                "active_graph": active,
-            },
-            ensure_ascii=False,
-        )
     # Materialize the graph on the instance (rejects duplicates).
     backend.create_graph(name)
     # Activate it and ensure it's in the allowlist (create_graph appends).

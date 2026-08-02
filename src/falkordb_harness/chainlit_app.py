@@ -210,14 +210,20 @@ def _build_settings_widgets(
       localized "(no graph selected)" entry (value ``""``) is always
       prepended so the no-graph state is selectable. ``initial_active``
       defaults to the no-graph sentinel when not provided.
-    - ``allowed_graphs`` (MultiSelect): the checkbox set of graphs the agent
-      may switch among at runtime via ``use_graph``.
     - ``new_graph_name`` (TextInput): type a name and hit Save to create a
       new empty knowledge graph on the FalkorDB instance.
+    - ``new_graph_description`` (TextInput, multi-line): optional 1-3
+      sentence description seeded for the new graph (the agent can revise
+      it later via ``update_graph_description``).
 
-    **Ingestion** — pipeline parameters (previously env-var only). These
+    **Developer Settings** (formerly Ingestion) — graph scope + pipeline
+    parameters (previously env-var only). The graph-scope widgets are read
+    by ``on_settings_update`` to rebuild the agent; the pipeline params
     are read by the Ingest action callback and fall back to the env vars
     when unset, so the CLI path is unaffected:
+    - ``label_filter`` (Tags): default node-label filter for browsing.
+    - ``allowed_graphs`` (MultiSelect): the checkbox set of graphs the
+      agent may switch among at runtime via ``use_graph``.
     - ``chunk_size`` (Slider): chunk size in characters.
     - ``overlap`` (Slider): overlap between chunks.
     - ``concurrency`` (Slider): parallel LLM extraction calls.
@@ -226,10 +232,13 @@ def _build_settings_widgets(
     - ``merge_mode`` (Select): overwrite | conflict | skip.
     """
     graphs = _graphs_unique(graphs)
-    # Prepend the no-graph sentinel entry so the empty state is selectable.
-    # The label is localized; the value is the empty string.
-    no_graph_entry = {"label": t("graph.none"), "value": _NO_GRAPH}
-    select_values: list = [no_graph_entry, *graphs]
+    # Build a value->label mapping for the active_graph Select so the
+    # no-graph sentinel (value "") shows a localized "(no graph selected)"
+    # label. Chainlit's Select accepts ``items: Dict[str, str]`` (value ->
+    # label); plain ``values`` is a list of strings with no labels.
+    select_items: dict[str, str] = {_NO_GRAPH: t("graph.none")}
+    for g in graphs:
+        select_items[g] = g
 
     init_active = initial_active if initial_active is not None else _NO_GRAPH
     init_allowed = initial_allowed if initial_allowed is not None else (
@@ -243,16 +252,9 @@ def _build_settings_widgets(
             input_widget.Select(
                 id="active_graph",
                 label=t("settings.active_graph.label"),
-                values=select_values,
+                items=select_items,
                 initial_value=init_active,
                 description=t("settings.active_graph.desc"),
-            ),
-            input_widget.MultiSelect(
-                id="allowed_graphs",
-                label=t("settings.allowed_graphs.label"),
-                values=graphs,
-                initial=init_allowed,
-                description=t("settings.allowed_graphs.desc"),
             ),
             input_widget.TextInput(
                 id="new_graph_name",
@@ -260,11 +262,12 @@ def _build_settings_widgets(
                 placeholder=t("settings.new_graph_name.placeholder"),
                 description=t("settings.new_graph_name.desc"),
             ),
-            input_widget.Tags(
-                id="label_filter",
-                label=t("settings.label_filter.label"),
-                initial=[],
-                description=t("settings.label_filter.desc"),
+            input_widget.TextInput(
+                id="new_graph_description",
+                label=t("settings.new_graph_description.label"),
+                placeholder=t("settings.new_graph_description.placeholder"),
+                description=t("settings.new_graph_description.desc"),
+                multi=True,
             ),
         ],
     )
@@ -273,6 +276,19 @@ def _build_settings_widgets(
         id="ingestion",
         label=t("settings.tab.ingestion.label"),
         inputs=[
+            input_widget.Tags(
+                id="label_filter",
+                label=t("settings.label_filter.label"),
+                initial=[],
+                description=t("settings.label_filter.desc"),
+            ),
+            input_widget.MultiSelect(
+                id="allowed_graphs",
+                label=t("settings.allowed_graphs.label"),
+                values=graphs,
+                initial=init_allowed,
+                description=t("settings.allowed_graphs.desc"),
+            ),
             input_widget.Slider(
                 id="chunk_size",
                 label=t("settings.chunk_size.label"),
@@ -853,6 +869,7 @@ async def on_settings_update(settings: dict) -> None:
     active_raw = settings.get("active_graph")
     allowed_raw = settings.get("allowed_graphs")
     new_graph_name = (settings.get("new_graph_name") or "").strip()
+    new_graph_desc = (settings.get("new_graph_description") or "").strip()
 
     # Persist ingestion-tab settings into the session regardless of whether
     # the graph selection changed — the user may have only edited chunk size.
@@ -894,13 +911,14 @@ async def on_settings_update(settings: dict) -> None:
     if new_graph_name:
         # Creation succeeded — make the new graph the active graph and ensure
         # it's in the enabled set, then refresh the widgets so the dropdowns
-        # reflect the new graph and the text field is cleared. Seed an empty
-        # description row (the LLM will revise it after the first ingestion,
-        # or the user may ingest via the button which auto-derives one).
+        # reflect the new graph and the text field is cleared. Seed the
+        # user-supplied description (empty string when blank); the LLM will
+        # revise it after the first ingestion, or the user may ingest via the
+        # button which auto-derives one.
         try:
             from falkordb_harness.graph_descriptions import set_description
 
-            await set_description(new_graph_name, "")
+            await set_description(new_graph_name, new_graph_desc)
         except Exception:  # noqa: BLE001 — never block creation on desc seed
             pass
         active, allowed = _normalize_selection(new_graph_name, list(allowed_raw or []))
@@ -920,7 +938,10 @@ async def on_settings_update(settings: dict) -> None:
         # silently dropped on Chainlit 2.11); walk both for safety.
         for tab in getattr(refreshed, "tabs", None) or refreshed.inputs:
             for widget in getattr(tab, "inputs", []) or []:
-                if getattr(widget, "id", None) == "new_graph_name":
+                if getattr(widget, "id", None) in {
+                    "new_graph_name",
+                    "new_graph_description",
+                }:
                     widget.initial = ""
         await refreshed.send()
 

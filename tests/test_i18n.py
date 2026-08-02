@@ -120,14 +120,14 @@ def test_get_lang_defaults_to_german_without_session():
 def test_set_lang_persists_for_subsequent_get():
     set_lang("en")
     assert get_lang() == "en"
-    assert t("settings.tab.ingestion.label") == "Ingestion (Expert Settings)"
+    assert t("settings.tab.ingestion.label") == "Developer Settings"
 
 
 def test_set_lang_back_to_de_after_en():
     set_lang("en")
     set_lang("de")
     assert get_lang() == "de"
-    assert t("settings.tab.ingestion.label") == "Ingestion (Experten-Einstellungen)"
+    assert t("settings.tab.ingestion.label") == "Entwickler-Einstellungen"
 
 
 def test_set_lang_rejects_unknown_language():
