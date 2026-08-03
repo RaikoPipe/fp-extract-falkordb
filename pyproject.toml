@@ -1,5 +1,5 @@
 [project]
-name = "fp-extract-falkordb"
+name = "factory-kg-agent"
 version = "0.1.0"
 description = "Factory-planning knowledge graph extraction pipeline using FalkorDB, with a LangChain deep-agent harness"
 requires-python = ">=3.10"

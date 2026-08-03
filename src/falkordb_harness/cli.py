@@ -124,7 +124,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         description="FalkorDB deep-agent harness — LangGraph agent "
-        "over fp-extract-falkordb",
+        "over factory-kg-agent",
     )
     # Agent-mode options (used only when no subcommand is given).
     parser.add_argument(
