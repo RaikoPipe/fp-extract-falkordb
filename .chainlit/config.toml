@@ -24,7 +24,7 @@ mask_user_env = false
 # authenticated WebSocket. The placeholder below is intentionally over-strict
 # (the app won't load) until you set the real FQDN, so a forgotten edit fails
 # closed rather than shipping a vulnerable wildcard.
-allow_origins = ["https://REPLACE_WITH_YOUR_PRODUCTION_ORIGIN"]
+allow_origins = ["http://localhost:8001"]
 
 [features]
 # Process and display HTML in messages. This can be a security risk (see https://stackoverflow.com/questions/19603097/why-is-it-dangerous-to-render-user-generated-html-or-javascript)
@@ -134,12 +134,17 @@ logo_file_url = "https://genai4ffd.de/wp-content/uploads/2025/05/GenAI4FFD_LogoO
 # Load assistant avatar image directly from URL.
 default_avatar_file_url = "https://genai4ffd.de/wp-content/uploads/2025/05/GenAI4FFD_LogoOnly_neu.svg"
 
-# Custom JavaScript for the KG badge in the header (visible in both the
-# starter view and the chat view). Fetches /api/graph-info (an authenticated
-# endpoint registered in auth.register_routes) for the user's last-used
-# graph + its description, and renders a small badge in the top-right header.
-# Runs with ``defer`` so it loads after the DOM without blocking startup.
-custom_js = "/public/kg_badge.js"
+# Custom JavaScript loader. Chainlit's ``custom_js`` field accepts a
+# single file, so /public/custom.js injects the KG badge
+# (public/kg_badge.js — header indicator showing the user's last-used
+# graph + description) and the document-sidebar toggle
+# (public/docs_toggle.js — a floating bottom-right button that
+# opens/closes the ElementSidebar, visibility driven by /api/docs-info).
+# Both run with ``defer`` so they load after the DOM without blocking
+# startup and never send a Chainlit message (so the starter view is
+# preserved). Runs with ``defer`` so it loads after the DOM without
+# blocking startup.
+custom_js = "/public/custom.js"
 
 [meta]
 generated_by = "2.11.0"

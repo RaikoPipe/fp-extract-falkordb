@@ -452,7 +452,78 @@ def _safe_resolve(data_dir: Path, virtual: str) -> Path | None:
     return candidate
 
 
+def build_graph_view_element(raw_output: Any, *, lang: str = "de", max_nodes: int = 500):
+    """Return a ``cl.CustomElement`` (GraphView) for the post-ingestion snapshot.
+
+    Called from :func:`chainlit_app._collect_visual_elements` after the
+    ``extract_and_write`` tool (and the Ingest action button path) so the
+    user gets a persistent, scroll-back-able record of the post-ingestion
+    topology pinned to the assistant message. The live floating panel
+    (public/graph_view.js) is the real-time view; this element is the
+    snapshot attached to the message.
+
+    Parses the tool's JSON output for the active ``graph_name`` (the
+    ``run_ingestion`` summary carries ``nodes_in_graph`` but not the name;
+    we fall back to the session backend's ``graph_name`` via
+    :func:`backend.get_backend` when available, and finally to the
+    ``extract_and_write`` summary's ``merge_mode`` as a presence signal).
+
+    Returns ``None`` when chainlit is unavailable, the output shape is
+    unsuitable, or the snapshot build fails — the caller falls back to the
+    existing Plotly summary chart.
+    """
+    try:
+        import chainlit as cl
+    except ImportError:
+        return None
+
+    data = _try_parse_json(raw_output if isinstance(raw_output, str) else str(raw_output))
+    if not isinstance(data, dict):
+        return None
+    # Only attach when the ingestion actually wrote something. An empty
+    # run (no files / no extractions) leaves the snapshot out so the chat
+    # doesn't get a redundant empty canvas.
+    stmts = data.get("cypher_statements", 0)
+    nodes_in_graph = data.get("nodes_in_graph", 0)
+    if not stmts and not nodes_in_graph:
+        return None
+
+    # Resolve the active graph name. The run_ingestion summary doesn't
+    # carry it; prefer the session backend, then the module-level default.
+    graph_name = ""
+    try:
+        from falkordb_harness.backend import get_backend
+
+        graph_name = get_backend().graph_name
+    except Exception:  # noqa: BLE001 — non-UI / CLI path has no backend
+        graph_name = ""
+
+    from falkordb_harness.auth import build_graph_snapshot
+
+    snapshot = build_graph_snapshot(graph_name, max_nodes=max_nodes)
+    # Skip when the snapshot is empty (graph unreachable / unset) — the
+    # Plotly summary chart already covers the "ingestion ran" message.
+    if not snapshot.get("nodes"):
+        return None
+
+    title = t("chart.ingestion_summary.title")  # reuse the ingestion title key
+    props = {
+        "graph": snapshot.get("graph", graph_name),
+        "nodes": snapshot.get("nodes", []),
+        "edges": snapshot.get("edges", []),
+        "stats": snapshot.get("stats", {}),
+        "lang": lang,
+        "title": title,
+    }
+    try:
+        return cl.CustomElement(name="GraphView", props=props)
+    except Exception as exc:  # noqa: BLE001 — CustomElement may be unavailable
+        logger.debug("GraphView CustomElement build failed: %s", exc)
+        return None
+
+
 __all__ = [
+    "build_graph_view_element",
     "build_ingestion_summary_plot",
     "build_label_distribution_plot",
     "build_rel_distribution_plot",

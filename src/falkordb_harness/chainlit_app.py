@@ -24,6 +24,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from falkordb_harness import auth as _auth_module  # noqa: F401
 from falkordb_harness.auth import register_routes
 from falkordb_harness.chainlit_elements import (
+    build_graph_view_element,
     build_ingestion_summary_plot,
     build_label_distribution_plot,
     build_rel_distribution_plot,
@@ -685,14 +686,6 @@ async def on_chat_start() -> None:
     # Default node-label filter (Tags widget in the Graph tab). Empty by
     # default; the agent reads it as a UI hint when browsing nodes.
     cl.user_session.set("label_filter", [])
-    # Whether the persistent "open document sidebar" floating button has
-    # been sent this session. The button is NOT sent during on_chat_start so
-    # the starter/startup screen is preserved (sending any chat message
-    # transitions Chainlit's frontend out of the starter view). It is sent
-    # lazily — on the first on_message / on_settings_update where there are
-    # documents to show (see _maybe_send_open_docs_button) — and then stays
-    # for the rest of the session.
-    cl.user_session.set("open_docs_button_sent", False)
     # Install the interactive UI prompt callback so the agent's
     # request_ingestion_confirmation / ask_user tools emit Chainlit
     # AskActionMessage / AskUserMessage prompts (and block until the user
@@ -706,10 +699,14 @@ async def on_chat_start() -> None:
     # opened via ElementSidebar.set_elements (not a chat message), so it
     # does NOT transition the frontend out of the starter screen.
     await _refresh_sidebar()
-    # NOTE: _send_open_docs_button() is intentionally NOT called here.
-    # Sending it would emit an assistant chat message, swapping the
-    # startup/starter screen for an empty active chat. The button is
-    # injected lazily on the first user turn where documents exist.
+    # NOTE: the document-sidebar toggle button is a custom_js script
+    # (public/docs_toggle.js), not a Chainlit CustomElement, so it is NOT
+    # sent from here. Sending any assistant message (even an empty one
+    # carrying only a CustomElement) transitions Chainlit's frontend out of
+    # the starter view into the active chat view — a regression. The
+    # custom_js approach sidesteps this entirely: the button is injected
+    # into the page by the browser and polls /api/docs-info for its
+    # visibility, never sending a Chainlit message.
     #
     # NOTE: the startup welcome / acknowledgement warning is intentionally
     # NOT sent from here. Sending any assistant message (even an empty one
@@ -835,14 +832,12 @@ async def on_chat_resume(thread: ThreadDict) -> None:
     # fire-and-forget task for the same reason as the stream replay above
     # — so it lands after the resume_thread socket event.
     asyncio.create_task(_refresh_sidebar())
-    # Re-pin the persistent "open document sidebar" button for the resumed
-    # thread. A resumed thread is always an active chat (it has persisted
-    # messages), so there is no starter/startup screen to disturb — sending
-    # the button here does NOT swap any startup view.
-    asyncio.create_task(_send_open_docs_button())
-    # Mark the button as sent so on_message's _maybe_send_open_docs_button
-    # guard doesn't re-send it on the next turn of this resumed thread.
-    cl.user_session.set("open_docs_button_sent", True)
+    # NOTE: the persistent document-sidebar toggle button is now a custom_js
+    # script (public/docs_toggle.js) injected into every view, NOT a Chainlit
+    # CustomElement sent as a chat message. So there is nothing to re-pin
+    # here — the button reappears on its own after resume via its
+    # /api/docs-info poll. (The old OpenDocsButton CustomElement had to be
+    # re-sent per resumed thread; that machinery has been removed.)
 
 
 @cl.on_settings_update
@@ -952,10 +947,11 @@ async def on_settings_update(settings: dict) -> None:
                 allowed=", ".join(allowed),
             ),
         ).send()
-        # A freshly created graph has no ingested rows, but the thread may
-        # already have uploads — lazily inject the floating Documents button
-        # if there's now something to show.
-        await _maybe_send_open_docs_button()
+        # NOTE: the document-sidebar toggle button is now a custom_js
+        # script (public/docs_toggle.js) whose visibility is driven by the
+        # /api/docs-info endpoint. A freshly created graph has no ingested
+        # rows, so the button stays hidden until ingestion populates it —
+        # no per-session button injection is needed here.
         return
 
     active, allowed = _normalize_selection(active_raw, allowed_raw)
@@ -977,11 +973,9 @@ async def on_settings_update(settings: dict) -> None:
     # Refresh the document sidebar so ingested rows for the newly-active
     # graph appear (and the previous graph's rows disappear).
     await _refresh_sidebar()
-    # The graph switch may have brought ingested rows into view (or the
-    # first message of a session against a populated graph happens here
-    # before any on_message). Lazily inject the floating Documents button
-    # if there's now something to show and it hasn't been sent yet.
-    await _maybe_send_open_docs_button()
+    # NOTE: the toggle button's visibility is driven by /api/docs-info
+    # (ingested-rows proxy); the button polls that endpoint and re-renders
+    # on its own after a graph switch, so no per-session injection here.
 
 
 @cl.action_callback("ingest_documents")
@@ -1223,6 +1217,20 @@ async def _collect_visual_elements(
                 data_dir(),
             )
             pending.extend(elements)
+        # Post-ingestion GraphView snapshot: attaches a Cytoscape canvas of
+        # the current topology to the assistant message after the agent's
+        # extract_and_write tool runs. The live floating panel
+        # (public/graph_view.js) is the real-time view; this CustomElement
+        # is the persistent record pinned to the message. Best-effort: a
+        # FalkorDB failure or a missing chainlit/CustomElement falls back to
+        # the existing Plotly summary chart (which the action-button path
+        # also produces).
+        if tool_name == "extract_and_write":
+            from falkordb_harness.i18n import get_lang
+
+            el = build_graph_view_element(output, lang=get_lang())
+            if el is not None:
+                pending.append(el)
     except Exception as exc:  # noqa: BLE001 — never break the chat on a chart
         logger.debug("visual element build failed for %s: %s", tool_name, exc)
 
@@ -1274,79 +1282,29 @@ async def _refresh_sidebar() -> None:
         logger.debug("ElementSidebar refresh failed: %s", exc)
 
 
-async def _send_open_docs_button() -> None:
-    """Pin the persistent "open document sidebar" button to the viewport.
+@cl.on_window_message
+async def on_window_message(data: Any) -> None:
+    """Handle window.postMessage payloads from custom_js scripts.
 
-    Renders the ``OpenDocsButton`` CustomElement inline in a low-key
-    assistant message. The JSX uses ``position: fixed`` so the button
-    floats over the chat at the bottom-right corner regardless of scroll.
-    Clicking it calls the ``open_document_sidebar`` action
-    (:func:`on_open_document_sidebar`), which re-runs
-    :func:`_refresh_sidebar` to re-open the ElementSidebar.
+    Currently handles the document-sidebar toggle button
+    (``public/docs_toggle.js``), which sends
+    ``{type: "chainlit-toggle-docs-sidebar", open: true}`` when the user
+    clicks the floating toggle to OPEN the sidebar. Closing is handled
+    client-side (the button clicks the sidebar's own close button), so no
+    server round-trip is needed for close.
 
-    Best-effort: silently no-ops on older Chainlit without CustomElement
-    support, so the chat still works.
+    The open path re-runs :func:`_refresh_sidebar`, which re-pushes the
+    current DocumentManager element (Chainlit's ``set_elements`` re-opens
+    the ElementSidebar). No-op when there are no documents to show
+    (``_refresh_sidebar`` returns early). Silently ignores unknown payloads
+    so other window.postMessage consumers are unaffected.
     """
-    try:
-        import chainlit as cl
-    except ImportError:
+    if not isinstance(data, dict):
         return
-    try:
-        lang = cl.user_session.get("lang") or "de"
-        props = {
-            "lang": lang,
-            "label": t("sidebar.open_button.label"),
-            "title": t("sidebar.open_button.title"),
-        }
-        await cl.Message(
-            content="",
-            elements=[cl.CustomElement(name="OpenDocsButton", props=props)],
-        ).send()
-    except Exception as exc:  # noqa: BLE001 — never break the chat on UI
-        logger.debug("OpenDocsButton send failed: %s", exc)
-
-
-async def _maybe_send_open_docs_button() -> None:
-    """Send the floating Documents button iff there are documents to show.
-
-    Guards the once-per-session ``open_docs_button_sent`` flag so the button
-    is injected at most once, and only when the document sidebar would have
-    content (uploaded/preprocessed rows for this thread OR ingested rows for
-    the active graph). Reuses :func:`_build_document_manager_props` as the
-    "is there anything to show?" predicate. Once sent, the flag stays True
-    for the rest of the session — the button persists even if the user
-    later switches to an empty graph (toggling visibility would flicker;
-    reopening an empty sidebar is an acceptable minor state).
-
-    Called from:
-    - :func:`on_message` (first user turn where docs exist)
-    - :func:`on_settings_update` (graph switch to a populated graph)
-
-    NOT called from :func:`on_chat_start` — sending it there would emit a
-    chat message and swap the starter/startup screen for an empty chat.
-    """
-    try:
-        import chainlit as cl
-    except ImportError:
+    if data.get("type") != "chainlit-toggle-docs-sidebar":
         return
-    if cl.user_session.get("open_docs_button_sent"):
+    if not data.get("open"):
         return
-    props = await _build_document_manager_props()
-    if props is None:
-        return
-    await _send_open_docs_button()
-    cl.user_session.set("open_docs_button_sent", True)
-
-
-@cl.action_callback("open_document_sidebar")
-async def on_open_document_sidebar(action: Action) -> None:
-    """Re-open the ElementSidebar from the persistent OpenDocsButton.
-
-    Re-runs :func:`_refresh_sidebar`, which re-pushes the current
-    DocumentManager element (Chainlit's ``set_elements`` re-opens the
-    sidebar). No-op when there are no documents to show (``_refresh_sidebar``
-    returns early).
-    """
     await _refresh_sidebar()
 
 
@@ -1752,16 +1710,19 @@ async def on_message(message: cl.Message) -> None:
     session_backend = cl.user_session.get("session_backend")
     if session_backend is not None:
         set_session_backend(session_backend)
+    logger.error("DBG on_message: entry, session_backend=%r", session_backend)
 
-    # Lazily inject the floating "Documents" button on the first user turn
-    # where there are documents to show (uploaded/preprocessed for this
-    # thread, or ingested for the active graph). Once sent it persists for
-    # the session. NOT sent during on_chat_start to preserve the starter
-    # screen (see _maybe_send_open_docs_button).
-    await _maybe_send_open_docs_button()
+    # NOTE: the document-sidebar toggle button is a custom_js script
+    # (public/docs_toggle.js) injected into every view; its visibility is
+    # driven by the /api/docs-info endpoint, so there is nothing to inject
+    # here per on_message. The old OpenDocsButton CustomElement was sent
+    # lazily on the first turn with documents; that machinery has been
+    # removed (sending a chat message swapped the starter view, which the
+    # custom_js approach avoids).
 
     agent = cl.user_session.get("agent")
     chat_history: list = cl.user_session.get("chat_history")
+    logger.error("DBG on_message: agent=%r chat_history=%r", agent, chat_history)
 
     user_content = message.content or ""
 
@@ -1903,11 +1864,17 @@ async def on_message(message: cl.Message) -> None:
 
     from falkordb_harness.agent import _DEFAULT_RECURSION_LIMIT
 
-    event_stream = agent.astream_events(
-        agent_input,
-        version="v2",
-        config={"recursion_limit": _DEFAULT_RECURSION_LIMIT},
-    )
+    logger.error("DBG on_message: about to call astream_events, agent=%r", agent)
+    try:
+        event_stream = agent.astream_events(
+            agent_input,
+            version="v2",
+            config={"recursion_limit": _DEFAULT_RECURSION_LIMIT},
+        )
+    except Exception as _e:
+        logger.error("DBG on_message: astream_events() raised %r", _e, exc_info=True)
+        raise
+    logger.error("DBG on_message: astream_events returned, entering loop")
     try:
         async with contextlib.aclosing(event_stream):
             async for event in event_stream:

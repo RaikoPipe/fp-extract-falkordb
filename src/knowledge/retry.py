@@ -1,13 +1,5 @@
 """Reusable transient-error retry helpers.
 
-This module centralizes the bespoke retry/backoff pattern first introduced
-in ``knowledge.llm_extract.extract_from_chunk`` so it can be applied at the
-agent-tool boundary (and the FalkorDB backend) without pulling in a new
-dependency. The goal is to let transient errors — a dropped Redis/FalkorDB
-connection, an LLM provider hiccup, a brief rate-limit — resolve themselves
-within a tool call so the calling agent never sees them, while still
-surfacing genuinely non-transient failures immediately.
-
 Public surface:
     - :func:`is_transient`  — classify an exception as transient.
     - :func:`retry_async`    — retry an async callable with backoff + jitter.
@@ -184,23 +176,11 @@ _OPTIONAL_TRANSIENT_TYPES: tuple[type, ...] = _collect_optional_transient_types(
 def is_transient(exc: BaseException) -> bool:
     """Return True if ``exc`` looks like a transient (retryable) failure.
 
-    Classification is deliberately conservative: when in doubt we err on the
-    side of *not* retrying, since retrying a non-transient error burns time
-    and can mask a real bug. Specifically:
-
-    - Known-transient exception *types* (ConnectionError, openai
-      APIConnectionError, etc.) → True.
-    - The FalkorDB "index already exists" error → **False** (it's already
-      handled idempotently by the backend and retrying would just re-hit the
-      same guard).
-    - Otherwise, the exception message is matched against a curated list of
-      transient fragments.
-    - ``ValueError``, ``TypeError``, ``KeyError``, ``AttributeError``,
-      ``SyntaxError`` → always False regardless of message, since these almost
-      always indicate a programming bug rather than a transient fault.
+    Conservative: when in doubt, don't retry. Non-transient types
+    (``ValueError``, ``TypeError``, etc.) and the FalkorDB "index already
+    exists" message always return False; known-transient types and messages
+    matching the curated fragment list return True.
     """
-    # Explicit non-transient types take precedence over message sniffing so a
-    # ``ValueError("connection is bad")`` from a misused API is not retried.
     _NEVER_TRANSIENT_TYPES = (
         ValueError,
         TypeError,
@@ -214,8 +194,6 @@ def is_transient(exc: BaseException) -> bool:
     if isinstance(exc, _NEVER_TRANSIENT_TYPES):
         return False
 
-    # FalkorDB index-already-exists is idempotently handled by the backend;
-    # treat it as a successful no-op, not a retryable transient.
     msg = str(exc).lower()
     if "already exists" in msg or "already indexed" in msg:
         return False

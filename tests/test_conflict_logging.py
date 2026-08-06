@@ -53,6 +53,8 @@ def _make_backend(mode: MergeMode) -> FalkorDBBackend:
     backend._llm_model = None
     backend._embedding_model = None
     backend._api_base = None
+    backend._embedding_api_base = None
+    backend._embedding_api_key = None
     backend._embedding_dim = 1024
     return backend
 
@@ -60,8 +62,14 @@ def _make_backend(mode: MergeMode) -> FalkorDBBackend:
 # --------------------------------------------------------------------------
 # write_extraction: conflict mode
 # --------------------------------------------------------------------------
-def test_backend_write_extraction_conflict_mode_returns_conflict():
+def test_backend_write_extraction_conflict_mode_returns_conflict(monkeypatch):
     backend = _make_backend(MergeMode.CONFLICT)
+
+    # Avoid real LLM coalesce calls for M-old (existing description differs).
+    async def fake_coalesce(existing, incoming, **kwargs):
+        return f"{existing}\n{incoming}"
+
+    monkeypatch.setattr("knowledge.falkordb_backend.coalesce_description", fake_coalesce)
 
     # Fetch results per entity (MATCH queries). Write queries (MERGE) get an
     # empty result — the side_effect discriminates by query prefix.

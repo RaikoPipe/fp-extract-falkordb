@@ -326,125 +326,102 @@ def test_on_open_document_missing_file_posts_failure(tmp_registry, tmp_path, mon
 
 
 # ---------------------------------------------------------------------------
-# _maybe_send_open_docs_button (startup-screen preservation + gating)
+# on_window_message (document-sidebar toggle — open path)
 # ---------------------------------------------------------------------------
-# The floating Documents button must NOT be sent during on_chat_start (it
-# would swap the starter screen for an empty active chat). Instead it's
-# injected lazily by _maybe_send_open_docs_button, gated on the once-per-
-# session ``open_docs_button_sent`` flag AND on the document manager having
-# content (uploaded/preprocessed for the thread OR ingested for the graph).
-# These tests cover the gating logic directly; on_chat_start's contract
-# (not calling the button sender) is asserted by confirming the helper is
-# the only send path and the flag starts False.
+# The floating toggle button (public/docs_toggle.js) is a custom_js script,
+# NOT a Chainlit CustomElement. To OPEN the sidebar it does
+# window.postMessage({type: "chainlit-toggle-docs-sidebar", open: true}),
+# which Chainlit's AppWrapper forwards to the backend ``window_message``
+# socket event, dispatched to the @cl.on_window_message handler in
+# chainlit_app.py. That handler filters on the ``type`` string and re-runs
+# _refresh_sidebar (whose set_elements call re-opens the ElementSidebar).
+# Closing is handled client-side (the button clicks the sidebar's own
+# close button), so no server round-trip is needed for close.
+#
+# These tests cover the handler's payload filtering directly: it must call
+# _refresh_sidebar for the recognized open payload, and ignore everything
+# else (non-dict, wrong type, open:false) so other window.postMessage
+# consumers are unaffected.
 
 
-def _stub_open_docs_sender(monkeypatch):
-    """Replace _send_open_docs_button with a recorder; return (calls, send)."""
+def _stub_refresh_sidebar(monkeypatch):
+    """Replace _refresh_sidebar with a recorder; return the calls list."""
     import falkordb_harness.chainlit_app as app
 
     calls = []
 
-    async def _fake_send():
-        calls.append("sent")
+    async def _fake_refresh():
+        calls.append("refreshed")
 
-    monkeypatch.setattr(app, "_send_open_docs_button", _fake_send)
+    monkeypatch.setattr(app, "_refresh_sidebar", _fake_refresh)
     return calls
 
 
-def _stub_doc_props(monkeypatch, props_value):
-    """Stub _build_document_manager_props to return a fixed value."""
-    import falkordb_harness.chainlit_app as app
-
-    async def _fake_props():
-        return props_value
-
-    monkeypatch.setattr(app, "_build_document_manager_props", _fake_props)
-
-
-def test_maybe_send_no_send_when_no_documents(tmp_registry, monkeypatch):
-    """No documents → props is None → button is NOT sent, flag stays unset/False."""
-    session, _ = _install_cl_stubs(monkeypatch)
-    session.set("open_docs_button_sent", False)  # mirror on_chat_start
-    calls = _stub_open_docs_sender(monkeypatch)
-    _stub_doc_props(monkeypatch, None)  # empty registry
+def test_on_window_message_opens_sidebar_for_recognized_payload(monkeypatch):
+    """{type: 'chainlit-toggle-docs-sidebar', open: true} -> _refresh_sidebar."""
+    _install_cl_stubs(monkeypatch)
+    calls = _stub_refresh_sidebar(monkeypatch)
 
     import falkordb_harness.chainlit_app as app
 
-    _run(app._maybe_send_open_docs_button())
+    _run(app.on_window_message({"type": "chainlit-toggle-docs-sidebar", "open": True}))
 
-    assert calls == []  # nothing sent
-    # Flag must NOT have been flipped to True by this call.
-    assert app.cl.user_session.get("open_docs_button_sent") is False
+    assert calls == ["refreshed"]
 
 
-def test_maybe_send_sends_when_documents_exist(tmp_registry, monkeypatch):
-    """Documents exist → props non-None → button sent once, flag flipped True."""
-    session, _ = _install_cl_stubs(monkeypatch)
-    session.set("open_docs_button_sent", False)
-    calls = _stub_open_docs_sender(monkeypatch)
-    _stub_doc_props(monkeypatch, {"documents": [{"id": "x"}], "lang": "en"})
+def test_on_window_message_ignores_wrong_type(monkeypatch):
+    """A different ``type`` string must NOT trigger _refresh_sidebar."""
+    _install_cl_stubs(monkeypatch)
+    calls = _stub_refresh_sidebar(monkeypatch)
 
     import falkordb_harness.chainlit_app as app
 
-    _run(app._maybe_send_open_docs_button())
-
-    assert calls == ["sent"]
-    assert app.cl.user_session.get("open_docs_button_sent") is True
-
-
-def test_maybe_send_skips_when_already_sent(tmp_registry, monkeypatch):
-    """Flag already True → button is NOT re-sent (persists for the session)."""
-    session, _ = _install_cl_stubs(monkeypatch)
-    session.set("open_docs_button_sent", True)
-    calls = _stub_open_docs_sender(monkeypatch)
-    # Even if documents now exist, the once-per-session guard wins.
-    _stub_doc_props(monkeypatch, {"documents": [{"id": "x"}], "lang": "en"})
-
-    import falkordb_harness.chainlit_app as app
-
-    _run(app._maybe_send_open_docs_button())
-
-    assert calls == []  # already sent this session → skip
-
-
-def test_maybe_send_sends_after_graph_switch_brought_ingested_rows(
-    tmp_registry, monkeypatch
-):
-    """C1: a graph switch can make ingested rows appear; button sends then.
-
-    Models the scenario: first on_message found no docs (flag False, no send);
-    user switches to a populated graph; on_settings_update re-checks and the
-    button now injects. Verified by calling the helper a second time with
-    non-None props while the flag is still False.
-    """
-    session, _ = _install_cl_stubs(monkeypatch)
-    session.set("open_docs_button_sent", False)
-    calls = _stub_open_docs_sender(monkeypatch)
-    _stub_doc_props(monkeypatch, {"documents": [{"id": "ing"}], "lang": "en"})
-
-    import falkordb_harness.chainlit_app as app
-
-    # First call (e.g. on_message against an empty default graph): no docs.
-    _stub_doc_props(monkeypatch, None)
-    _run(app._maybe_send_open_docs_button())
+    _run(app.on_window_message({"type": "some-other-message", "open": True}))
     assert calls == []
 
-    # Second call (e.g. on_settings_update after switching to a populated
-    # graph): docs now present → button sends.
-    _stub_doc_props(monkeypatch, {"documents": [{"id": "ing"}], "lang": "en"})
-    _run(app._maybe_send_open_docs_button())
-    assert calls == ["sent"]
-    assert app.cl.user_session.get("open_docs_button_sent") is True
+
+def test_on_window_message_ignores_open_false(monkeypatch):
+    """open:false (close) is handled client-side; server must not refresh."""
+    _install_cl_stubs(monkeypatch)
+    calls = _stub_refresh_sidebar(monkeypatch)
+
+    import falkordb_harness.chainlit_app as app
+
+    _run(app.on_window_message({"type": "chainlit-toggle-docs-sidebar", "open": False}))
+    assert calls == []
+
+
+def test_on_window_message_ignores_non_dict_payload(monkeypatch):
+    """Non-dict payloads (strings, numbers, None) must be ignored."""
+    _install_cl_stubs(monkeypatch)
+    calls = _stub_refresh_sidebar(monkeypatch)
+
+    import falkordb_harness.chainlit_app as app
+
+    for payload in ("a string", 42, None, [1, 2, 3]):
+        _run(app.on_window_message(payload))
+    assert calls == []
+
+
+def test_on_window_message_ignores_missing_open_key(monkeypatch):
+    """Payload with the right type but no ``open`` key must be ignored."""
+    _install_cl_stubs(monkeypatch)
+    calls = _stub_refresh_sidebar(monkeypatch)
+
+    import falkordb_harness.chainlit_app as app
+
+    _run(app.on_window_message({"type": "chainlit-toggle-docs-sidebar"}))
+    assert calls == []
 
 
 def test_on_chat_start_does_not_send_open_docs_button(monkeypatch):
-    """on_chat_start must not send the floating button (startup preservation).
+    """on_chat_start must not send any chat message that would dismiss the
+    starter screen.
 
-    Asserted at the source level: on_chat_start's executable code must not
-    call _send_open_docs_button (the eager call was removed). The button is
-    injected only via _maybe_send_open_docs_button from on_message /
-    on_settings_update. We verify by stripping comments/docstrings from the
-    source and confirming no eager invocation remains.
+    The floating toggle button is now a custom_js script
+    (public/docs_toggle.js) injected by the browser, never sent as a
+    Chainlit message. Asserted at the source level: on_chat_start's
+    executable code must not reference the removed CustomElement sender.
     """
     import inspect
     import re
@@ -452,11 +429,12 @@ def test_on_chat_start_does_not_send_open_docs_button(monkeypatch):
     import falkordb_harness.chainlit_app as app
 
     src = inspect.getsource(app.on_chat_start)
-    # Drop comments (lines/segments starting with #) and docstrings so only
-    # executable statements are inspected.
+    # Drop comments so only executable statements are inspected.
     cleaned = re.sub(r"#.*", "", src)
     cleaned = re.sub(r'""".*?"""', "", cleaned, flags=re.DOTALL)
-    cleaned = cleaned.replace("_maybe_send_open_docs_button()", "")  # never eager here
-    assert "_send_open_docs_button()" not in cleaned, (
-        "on_chat_start must not eagerly call _send_open_docs_button"
+    assert "_send_open_docs_button" not in cleaned, (
+        "on_chat_start must not reference the removed _send_open_docs_button"
+    )
+    assert "OpenDocsButton" not in cleaned, (
+        "on_chat_start must not reference the removed OpenDocsButton CustomElement"
     )

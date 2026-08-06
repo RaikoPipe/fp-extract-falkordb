@@ -277,6 +277,20 @@ STRINGS: dict[str, dict[str, str]] = {
     "ingest.summary.errors.header": {"en": "- Errors ({n}):", "de": "- Fehler ({n}):"},
     "ingest.summary.errors.more": {"en": "  - …and {n} more", "de": "  - …und {n} weitere"},
 
+    # --- tqdm-style progress line (chainlit_progress.py) -----------------
+    # These build the live progress line shown in the TaskList during long
+    # stages (extract / write). ``{elapsed}`` and ``{eta}`` are pre-formatted
+    # by TimeEstimator (e.g. "1:05", "?" when unknown); ``{rate}`` is a
+    # formatted it/s string. The line is re-rendered on every per-chunk /
+    # per-extraction tick. See :func:`falkordb_harness.chainlit_progress._render_tqdm_line`.
+    "ingest.progress.line": {
+        "en": "{title}  —  {counter} {percent}  [{elapsed} elapsed, ETA {eta}, {rate}]",
+        "de": "{title}  —  {counter} {percent}  [{elapsed} verstrichen, ETA {eta}, {rate}]",
+    },
+    "ingest.progress.eta_unknown": {"en": "?", "de": "?"},
+    "ingest.progress.rate_unknown": {"en": "? it/s", "de": "? it/s"},
+    "ingest.progress.percent_unknown": {"en": "?", "de": "?"},
+
     # --- Upload receipt (chainlit_app.py on_message) ----------------------
     "upload.receipt": {
         "en": "Received **{n_new}** file(s). **{n_total}** total file(s) ready for ingestion into graph `{graph}`.",
@@ -321,15 +335,11 @@ STRINGS: dict[str, dict[str, str]] = {
         "en": "Documents — {active}",
         "de": "Dokumente — {active}",
     },
-    # --- Persistent "open document sidebar" button (OpenDocsButton.jsx) ---
-    "sidebar.open_button.label": {
-        "en": "Documents",
-        "de": "Dokumente",
-    },
-    "sidebar.open_button.title": {
-        "en": "Open document sidebar",
-        "de": "Dokumenten-Seitenleiste öffnen",
-    },
+    # NOTE: the document-sidebar toggle button (public/docs_toggle.js) does
+    # its own localization via <html lang> rather than these keys, so no
+    # sidebar.open_button.* entries are needed here. The DocumentManager
+    # sidebar content itself is driven by _build_document_manager_props,
+    # whose labels come from the doc.action.* keys below.
 
     # --- Document manager row actions (DocumentManager.jsx + callbacks) ---
     "doc.action.open.label": {"en": "Open", "de": "Öffnen"},

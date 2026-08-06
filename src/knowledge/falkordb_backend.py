@@ -4,19 +4,21 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from falkordb import FalkorDB
 from loguru import logger
 
+from knowledge._textutils import utc_now_iso
 from knowledge.cypher_mapper import (
     MergeMode,
+    _iter_entities,
     build_conflict_merge,
     build_reconciliation_link_cypher,
-    extraction_to_cypher,
     extraction_to_cypher_with_mode,
+    model_to_cypher_fetch,
+    model_to_cypher_merge,
 )
 from knowledge.graph_models.factory_graph_model import FactoryPlanningGraph, Resource
 from knowledge.reconciliation import (
@@ -73,11 +75,6 @@ def _serialize_embedding(embedding: list[float]) -> str:
     return json.dumps([float(x) for x in embedding])
 
 
-def _utc_now_iso() -> str:
-    """Return the current UTC time as an ISO-8601 string (seconds precision)."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 def _append_set(query: str, set_clause: str) -> str:
     """Append a SET clause to a Cypher MERGE query, handling the SET keyword."""
     if " SET " in query:
@@ -85,16 +82,14 @@ def _append_set(query: str, set_clause: str) -> str:
     return query + " SET " + set_clause
 
 
-def _iter_resource_entities(
-    graph: FactoryPlanningGraph,
-) -> Iterator[tuple[Resource, str]]:
-    """Yield ``(resource, 'Resource')`` for every Resource in the extraction."""
-    for entity in graph.resources or []:
-        yield entity, "Resource"
-
-
 class FalkorDBBackend:
-    """FalkorDB graph database backend."""
+    """FalkorDB graph database backend.
+
+    Connection is lazy: the FalkorDB client and graph handle are built on
+    first use (``_get_graph``/``_get_db``) and rebuilt on transient errors
+    (``_invalidate_connection``), so a Redis/FalkorDB restart mid-run does
+    not poison the cached backend.
+    """
 
     def __init__(
         self,
@@ -119,18 +114,13 @@ class FalkorDBBackend:
         self._host = host or os.getenv("FALKORDB_HOST", _DEFAULT_HOST)
         self._port = port or int(os.getenv("FALKORDB_PORT", str(_DEFAULT_PORT)))
         self._graph_name = graph_name or os.getenv("FALKORDB_GRAPH", _DEFAULT_GRAPH)
-        # Allowlist of graph names this backend may switch to. ``None`` means
-        # unrestricted (the CLI / default path). Set by the Chainlit UI to
-        # enforce the user's checkbox selection; ``use_graph`` checks this
-        # before switching.
+        # ``None`` means unrestricted (CLI / default path); the Chainlit UI sets
+        # this to enforce the user's checkbox selection.
         self._allowed_graphs: list[str] | None = list(allowed_graphs) if allowed_graphs else None
-        # Connection is established lazily on first use and recreated on a
-        # transient connection failure, so a startup outage or a mid-run blip
-        # does not poison the (cached) backend for the process lifetime.
         self._db: FalkorDB | None = None
         self._graph: Any = None
 
-        # Merge mode: explicit arg > MERGE_MODE env > default (overwrite).
+        # Merge mode: explicit arg > MERGE_MODE env > default.
         if isinstance(merge_mode, MergeMode):
             self._merge_mode = merge_mode
         else:
@@ -186,20 +176,8 @@ class FalkorDBBackend:
             self._embedding_dim = None
 
     def _get_graph(self) -> Any:
-        """Return the live FalkorDB graph handle, (re)connecting as needed.
-
-        The connection is established lazily on first call and rebuilt when a
-        transient connection error has invalidated the previous handle
-        (``self._graph`` is set to ``None`` by the retry wrapper around
-        ``execute``/``_fetch_node_props``/etc. when a ``ConnectionError`` is
-        observed). This means a Redis/FalkorDB restart mid-run does not
-        permanently poison the (cached) backend instance.
-        """
+        """Return the live FalkorDB graph handle, (re)connecting as needed."""
         if self._graph is None:
-            # Reuse an existing DB client when one is still live (e.g. after
-            # set_active_graph invalidated only the graph handle); only build
-            # a fresh FalkorDB connection when the client itself is absent or
-            # was dropped by _invalidate_connection.
             if self._db is None:
                 logger.debug(
                     "FalkorDB connecting to {}:{} graph='{}'",
@@ -210,22 +188,15 @@ class FalkorDBBackend:
         return self._graph
 
     def _invalidate_connection(self) -> None:
-        """Drop the current handle so the next ``_get_graph`` reconnects.
-
-        Called by the retry wrapper when a connection-class error is observed
-        so the retry attempt builds a fresh handle instead of reusing the
-        dead one.
-        """
+        """Drop the cached handles so the next ``_get_graph`` reconnects."""
         self._graph = None
         self._db = None
 
     def _get_db(self) -> FalkorDB:
         """Return the live FalkorDB client, (re)connecting as needed.
 
-        Lazily establishes the connection (mirroring ``_get_graph``'s
-        lazy-connect logic) so ``list_graphs`` — a DB-level command that
-        does not target a specific graph — can run without first selecting
-        a graph handle. Reuses the same client instance ``_get_graph``
+        For DB-level commands (e.g. ``list_graphs``) that don't target a
+        specific graph. Reuses the same client instance ``_get_graph``
         populates, so the two stay consistent.
         """
         if self._db is None:
@@ -234,24 +205,15 @@ class FalkorDBBackend:
                 self._host, self._port,
             )
             self._db = FalkorDB(host=self._host, port=self._port)
-            # If a graph handle was previously cached it is now stale relative
-            # to the fresh client; drop it so ``_get_graph`` reselects.
             self._graph = None
         return self._db
 
     def _query(self, query: str, params: dict[str, Any] | None = None) -> Any:
-        """Run a Cypher query, invalidating the handle on a transient error.
-
-        On a connection-class error the cached graph handle is dropped before
-        re-raising, so the caller's retry loop (see :mod:`knowledge.retry`)
-        builds a fresh connection on its next attempt instead of reusing the
-        dead one. Non-transient errors propagate without touching the handle.
-        """
+        """Run a Cypher query, invalidating the handle on a transient error."""
         try:
             return self._get_graph().query(query, params or {})
         except Exception as exc:
             if _is_index_already_exists_error(exc):
-                # Idempotent no-op; do not invalidate or rewrap.
                 raise
             from knowledge.retry import is_transient
 
@@ -326,21 +288,12 @@ class FalkorDBBackend:
     def create_graph(self, name: str) -> None:
         """Create a new empty knowledge graph named ``name`` on the instance.
 
-        FalkorDB materializes a graph lazily on the first write against its
-        name, so this method selects ``name`` via the DB-level client (without
-        disturbing the cached active-graph handle) and runs a single
-        self-deleting seed-node transaction — enough to register the name in
-        ``GRAPH.LIST`` while leaving the graph truly empty (zero nodes, zero
-        relationships).
-
-        Validates ``name`` (non-empty string) and rejects duplicates (a name
-        already present in ``GRAPH.LIST``) to prevent accidental clobbering.
-        When an allowlist is configured, the new graph is appended to it so
-        subsequent ``use_graph`` calls can target it.
-
-        Does NOT switch the active graph — the caller is expected to follow
-        with ``set_active_graph(name)`` (or rely on the UI rebuild to bind a
-        fresh session backend to the new name).
+        FalkorDB materializes a graph lazily on first write, so this runs a
+        self-deleting seed-node transaction to register the name in
+        ``GRAPH.LIST`` while leaving the graph empty. Validates ``name``
+        (non-empty, not already in ``GRAPH.LIST``) and, when an allowlist is
+        configured, appends the new graph so ``use_graph`` can target it.
+        Does NOT switch the active graph — follow with ``set_active_graph``.
         """
         if not name or not isinstance(name, str):
             raise ValueError(f"Graph name must be a non-empty string, got {name!r}")
@@ -360,7 +313,7 @@ class FalkorDBBackend:
         graph.query(
             "CREATE (n:_SchemaSeed {created_at: $created_at}) "
             "DELETE n",
-            {"created_at": _utc_now_iso()},
+            {"created_at": utc_now_iso()},
         )
         logger.info("Created new empty FalkorDB graph '{}'", name)
 
@@ -415,34 +368,15 @@ class FalkorDBBackend:
     ) -> tuple[int, list[dict[str, Any]], list[dict[str, Any]]]:
         """Write an extraction result to the database.
 
-        In overwrite mode (default) every entity is upserted with
-        last-write-wins semantics — identical to the original behaviour.
+        Overwrite mode upserts every entity (last-write-wins). Conflict mode
+        fetches each node first and records disagreements in-graph
+        (first-writer-wins; see :func:`build_conflict_merge`). When
+        ``recon_enabled`` is set, plain-name Resources are tested for
+        similarity against indexed ones (see :mod:`knowledge.reconciliation`).
+        Resource descriptions are always LLM-coalesced on a name-match merge
+        and the embedding is re-persisted.
 
-        In conflict mode each entity node is first fetched by ``{name}`` to
-        discover existing scalar values; incoming values that disagree with a
-        non-null existing value are recorded as conflicts (in-graph
-        ``conflicts`` list property + appended to the JSONL log) and the
-        existing value is preserved (first-writer-wins).
-
-        When reconciliation is enabled (``recon_enabled=True``), plain-name
-        Resource nodes (``name_has_index=false``) that do not match an existing
-        node by name are tested for similarity against indexed Resource nodes.
-        See :mod:`knowledge.reconciliation` for the full algorithm.
-
-        For Resources, the ``description`` field is always coalesced via an
-        LLM call when a name-match merge happens (both merge modes), and the
-        embedding is persisted/re-embedded on the node so cosine search stays
-        accurate.
-
-        Relationships are written with the same find-or-create MERGE in both
-        modes; v1 does not detect conflicts on edge properties.
-
-        Returns ``(statement_count, conflicts, reconciliations)`` where
-        ``conflicts`` is the list of conflict dicts (empty in overwrite mode
-        or when none were found) and ``reconciliations`` is the list of
-        reconciliation records for plain-name nodes linked to an indexed
-        duplicate during this write (empty when recon is disabled or no
-        links were found).
+        Returns ``(statement_count, conflicts, reconciliations)``.
         """
         all_conflicts: list[dict[str, Any]] = []
         all_reconciliations: list[dict[str, Any]] = []
@@ -453,19 +387,20 @@ class FalkorDBBackend:
             dim = await self._resolve_embedding_dim()
             self.ensure_vector_index(dim=dim)
 
-        if self._merge_mode is MergeMode.CONFLICT:
-            rel_statements, node_entries = extraction_to_cypher_with_mode(
-                graph, self._merge_mode, source=source, chunk_index=chunk_index
-            )
+        rel_statements, _node_entries = extraction_to_cypher_with_mode(
+            graph, self._merge_mode, source=source, chunk_index=chunk_index
+        )
 
-            # Pass 1: per-entity fetch + conflict-aware merge.
-            for fetch_q, fetch_p, entity, label in node_entries:
-                existing_props = self._fetch_node_props(fetch_q, fetch_p, label)
+        # Per-entity pass: fetch → coalesce → embed → write → maybe reconcile.
+        # Both modes share this shape; only the write builder differs.
+        for entity, label in _iter_entities(graph):
+            fetch_q, fetch_p = model_to_cypher_fetch(entity, label)
+            existing_props = self._fetch_node_props(fetch_q, fetch_p)
+            is_new_node = not existing_props
 
-                coalesced = await self._maybe_coalesce(
-                    entity, label, existing_props
-                )
+            coalesced = await self._maybe_coalesce(entity, label, existing_props)
 
+            if self._merge_mode is MergeMode.CONFLICT:
                 write_q, write_p, conflicts = build_conflict_merge(
                     entity,
                     label,
@@ -474,63 +409,43 @@ class FalkorDBBackend:
                     chunk_index=chunk_index,
                     coalesced_values=coalesced,
                 )
+            else:
+                write_q, write_p = model_to_cypher_merge(entity, label)
+                conflicts = []
+                if coalesced:
+                    write_p["p_description"] = coalesced["description"]
+                    write_q = _append_set(write_q, "n.description = $p_description")
 
-                embedding_written = await self._maybe_write_embedding(
-                    entity, label, existing_props, coalesced
+            embedding = await self._maybe_write_embedding(
+                entity, label, existing_props, coalesced
+            )
+            if embedding:
+                write_p["p_embedding"] = _serialize_embedding(embedding)
+                write_q = _append_set(write_q, "n.embedding = $p_embedding")
+
+            self._query(write_q, write_p)
+            statements_run += 1
+            if conflicts:
+                all_conflicts.extend(conflicts)
+
+            # Reconcile new plain-name Resources against indexed ones.
+            if (
+                self._recon_enabled
+                and is_new_node
+                and label == "Resource"
+                and isinstance(entity, Resource)
+                and not entity.name_has_index
+            ):
+                recon_record = await self._maybe_reconcile(
+                    entity, source=source, chunk_index=chunk_index
                 )
-                if embedding_written:
-                    write_p["p_embedding"] = _serialize_embedding(embedding_written)
-                    _append_set(write_q, "n.embedding = $p_embedding")
+                if recon_record:
+                    all_reconciliations.append(recon_record)
 
-                if write_q:
-                    self._query(write_q, write_p)
-                    statements_run += 1
-                if conflicts:
-                    all_conflicts.extend(conflicts)
-
-                # Reconciliation: only for Resource, plain name, new node.
-                if (
-                    self._recon_enabled
-                    and label == "Resource"
-                    and not existing_props
-                    and isinstance(entity, Resource)
-                    and not entity.name_has_index
-                ):
-                    recon_record = await self._maybe_reconcile(
-                        entity, source=source, chunk_index=chunk_index
-                    )
-                    if recon_record:
-                        all_reconciliations.append(recon_record)
-
-            # Pass 2: relationships.
-            for query, params in rel_statements:
-                self._query(query, params)
-                statements_run += 1
-        else:
-            # Overwrite mode: coalesce descriptions + persist embeddings for
-            # Resources before the flat MERGE list is executed.
-            statements = extraction_to_cypher(graph)
-            for entity, label in _iter_resource_entities(graph):
-                await self._overwrite_coalesce_and_embed(
-                    entity, statements, source=source, chunk_index=chunk_index
-                )
-
-            for query, params in statements:
-                self._query(query, params)
-            statements_run = len(statements)
-
-            # Reconciliation pass for new plain-name resources in overwrite mode.
-            if self._recon_enabled:
-                for entity, label in _iter_resource_entities(graph):
-                    if (
-                        isinstance(entity, Resource)
-                        and not entity.name_has_index
-                    ):
-                        recon_record = await self._maybe_reconcile_overwrite(
-                            entity, source=source, chunk_index=chunk_index
-                        )
-                        if recon_record:
-                            all_reconciliations.append(recon_record)
+        # Relationship pass.
+        for query, params in rel_statements:
+            self._query(query, params)
+            statements_run += 1
 
         if all_reconciliations:
             self._append_reconciliations_log(all_reconciliations)
@@ -606,55 +521,6 @@ class FalkorDBBackend:
             logger.warning("Embedding failed for {}: {}", entity.name, exc)
             return None
 
-    async def _overwrite_coalesce_and_embed(
-        self,
-        entity: BaseModel,
-        statements: list[tuple[str, dict[str, Any]]],
-        *,
-        source: str | None = None,
-        chunk_index: int | None = None,
-    ) -> None:
-        """In overwrite mode, coalesce + re-embed Resources before MERGE runs.
-
-        Finds the MERGE statement for ``entity`` in ``statements``, fetches
-        the existing node, coalesces the description, and patches the SET
-        clause with the coalesced description + embedding.
-        """
-        if not isinstance(entity, Resource):
-            return
-        name = entity.name
-        target_idx: int | None = None
-        for i, (q, _p) in enumerate(statements):
-            if f"MERGE (n:Resource {{name: $name}})" in q and _p.get("name") == name:
-                target_idx = i
-                break
-        if target_idx is None:
-            return
-
-        existing_props = self._fetch_node_props(
-            f"MATCH (n:Resource {{name: $name}}) RETURN n",
-            {"name": name},
-            "Resource",
-        )
-
-        coalesced = await self._maybe_coalesce(entity, "Resource", existing_props)
-        embedding = await self._maybe_write_embedding(
-            entity, "Resource", existing_props, coalesced
-        )
-
-        query, params = statements[target_idx]
-        set_parts_added: list[str] = []
-        if coalesced:
-            params["p_description"] = coalesced["description"]
-            set_parts_added.append("n.description = $p_description")
-        if embedding:
-            params["p_embedding"] = _serialize_embedding(embedding)
-            set_parts_added.append("n.embedding = $p_embedding")
-        if set_parts_added:
-            for part in set_parts_added:
-                query = _append_set(query, part)
-            statements[target_idx] = (query, params)
-
     async def _maybe_reconcile(
         self,
         entity: Resource,
@@ -662,7 +528,7 @@ class FalkorDBBackend:
         source: str | None = None,
         chunk_index: int | None = None,
     ) -> dict[str, Any] | None:
-        """Run reconciliation for a new plain-name Resource in conflict mode.
+        """Run reconciliation for a new plain-name Resource.
 
         Returns the reconciliation record dict if a link was created, else
         None.
@@ -701,29 +567,6 @@ class FalkorDBBackend:
             return decision.record
         logger.debug("No reconciliation match for '{}'", entity.name)
         return None
-
-    async def _maybe_reconcile_overwrite(
-        self,
-        entity: Resource,
-        *,
-        source: str | None = None,
-        chunk_index: int | None = None,
-    ) -> dict[str, Any] | None:
-        """Run reconciliation for a new plain-name Resource in overwrite mode.
-
-        Checks whether the node already exists by name (it may have been
-        created by the flat MERGE pass). Only reconciles truly-new nodes.
-        """
-        existing_props = self._fetch_node_props(
-            f"MATCH (n:Resource {{name: $name}}) RETURN n",
-            {"name": entity.name},
-            "Resource",
-        )
-        if existing_props:
-            return None
-        return await self._maybe_reconcile(
-            entity, source=source, chunk_index=chunk_index
-        )
 
     def _write_reconciliation_link(
         self,
@@ -777,13 +620,11 @@ class FalkorDBBackend:
         return records
 
     def _fetch_node_props(
-        self, query: str, params: dict[str, Any], label: str
+        self, query: str, params: dict[str, Any]
     ) -> dict[str, Any]:
         """Run a read-only MATCH and return the matched node's properties.
 
-        Returns an empty dict when the node does not yet exist. The ``label``
-        is unused for the lookup itself but kept for future schema-aware
-        handling.
+        Returns an empty dict when the node does not yet exist.
         """
         result = self._query(query, params)
         rows = result.result_set if result.result_set else []
@@ -793,8 +634,6 @@ class FalkorDBBackend:
         if node is None:
             return {}
         props = dict(node.properties) if hasattr(node, "properties") else {}
-        # The conflicts list is itself a JSON string in-graph; leave it as-is
-        # — it is not a scalar property we compare against.
         return props
 
     def _append_reconciliations_log(self, records: list[dict[str, Any]]) -> None:
@@ -846,13 +685,14 @@ class FalkorDBBackend:
         from the indexed node. Returns the number of edges deleted.
         """
         label_clause = f":{label}" if label else ""
-        name_clause = " AND a.name = $plain_name" if plain_name else ""
         params: dict[str, Any] = {}
+        where = ""
         if plain_name:
             params["plain_name"] = plain_name
+            where = " WHERE a.name = $plain_name"
         cypher = (
-            f"MATCH (a{label_clause})-[r:POSSIBLE_DUPLICATE_OF]->(b) "
-            f"WHERE 1=1{name_clause} "
+            f"MATCH (a{label_clause})-[r:POSSIBLE_DUPLICATE_OF]->(b)"
+            f"{where} "
             f"DELETE r "
             f"SET a.canonical_name = null, "
             f"b.aliases = [x IN coalesce(b.aliases, []) WHERE x <> a.name]"

@@ -74,7 +74,7 @@ services:
       - AGENT_MAX_TOOL_REPEATS=${AGENT_MAX_TOOL_REPEATS:-}
 
       # --- Logging ---
-      - LOG_LEVEL=${LOG_LEVEL:-WARNING}
+      - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
       - LOG_ATTACHMENTS=${LOG_ATTACHMENTS:-1}
       - DATA_LAYER_DEBUG=${DATA_LAYER_DEBUG:-}
 

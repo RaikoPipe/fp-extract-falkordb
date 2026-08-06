@@ -12,21 +12,22 @@ from loguru import logger
 from pydantic import BaseModel
 
 from knowledge._clients import chat_client
+from knowledge._textutils import strip_code_fence
 from knowledge.graph_models.factory_graph_model import FactoryPlanningGraph
 
 _DEFAULT_LLM_MODEL = "qwen3.5:122b-a10b"
 
 
-def _validate_and_log(text: str, schema_class: Type[BaseModel]) -> BaseModel:
-    """Validate JSON text and log any ambiguous durations surfaced."""
-    result = schema_class.model_validate_json(text)
-    _log_ambiguous(result)
-    return result
+def _validate_and_log(text_or_obj: str | object, schema_class: Type[BaseModel]) -> BaseModel:
+    """Validate JSON text or a Python object and log any ambiguous durations.
 
-
-def _validate_and_log_obj(obj: object, schema_class: Type[BaseModel]) -> BaseModel:
-    """Validate a Python object and log any ambiguous durations surfaced."""
-    result = schema_class.model_validate(obj)
+    Dispatches on type: strings go through ``model_validate_json``, other
+    objects through ``model_validate``.
+    """
+    if isinstance(text_or_obj, str):
+        result = schema_class.model_validate_json(text_or_obj)
+    else:
+        result = schema_class.model_validate(text_or_obj)
     _log_ambiguous(result)
     return result
 
@@ -50,45 +51,12 @@ from the given document text into the JSON schema provided.
 Rules:
 - Extract ONLY information explicitly stated in the text.
 - Use consistent, exact entity names to enable deduplication.
-- All time-valued fields are STRINGS following a fixed duration schema:
-  - Constant: 'd=40s'
-  - Distribution: 'normal(mean=300, std=45)' / 'uniform(min=10, max=20)' \
-/ 'exponential(lambda=0.5)' / 'weibull(k=1.5, lambda=200)'
-  - All values are SECONDS. Use 'mean'/'std' (NOT mu/sigma), 'min'/'max', \
-'lambda', 'k'. Use key=value arguments inside the parentheses.
-  - If the source text is ambiguous or lacks precise numbers, put the raw \
-text verbatim in the field — it will be flagged for human review.
-- Lengths in meters, weights in grams, speeds in m/s.
 - Never extract personal names, contact information, or employee identifiers.
 - If a field's value is not mentioned in the text, omit it (do not guess).
 - Return valid JSON matching the schema. No markdown fences, no commentary.
 
-Resource-specific rules:
-- Every resource MUST have a semantically rich description that captures its \
-function, location, role in the production flow, and distinguishing \
-characteristics. Even for sparse mentions, synthesize a concise description \
-from the available context. When re-encountering a known resource, extend \
-the description with newly discovered context while preserving prior \
-information.
-- Set name_has_index to true when the name includes a clear index, ID, or \
-code that distinguishes this resource (e.g. 'AKL-01', 'Workstation-3A', \
-'AGV-02'). Set it to false when the name is a plain or generic word with no \
-distinguishing index (e.g. 'Machine', 'Buffer', 'Conveyor').
-
-Resource / Zone boundary:
-- A Resource is an ATOMIC, addressable asset that performs an operation or \
-stores material — it has processing time, MTBF, capacity, access time, or \
-storage policy. Resource types: machine, workstation, buffer, source, sink, \
-conveyor, AS/RS, supermarket, warehouse, gate, charging_station, \
-inspection_station, other.
-- A Zone is a SPATIAL/LOGICAL container that groups resources; it has NO \
-operational state of its own (no processing time, capacity, MTBF, or storage \
-policy). Zone types: hall, area, segment, assembly_line, pick_zone, building, \
-floor, other.
-- assembly_line and pick_zone are ZONES, NOT Resources. A building-scale \
-warehouse is a Zone; the single storage unit inside it is a Resource of type \
-'warehouse' or 'supermarket'. Link a Resource to its Zone via the 'zone' \
-field, and list member Resources on the Zone via 'member_resources'.
+The schema's field descriptions carry the domain rules (duration grammar, \
+units, Resource/Zone boundary, name_has_index). Follow them precisely.
 """
 
 
@@ -153,15 +121,8 @@ async def extract_from_chunk(
                 raw,
             )
 
-            # Strip markdown code fences if present
-            text = raw.strip()
-            if text.startswith("```"):
-                lines = text.split("\n")
-                lines = lines[1:]  # drop opening fence
-                if lines and lines[-1].strip() == "```":
-                    lines = lines[:-1]
-                text = "\n".join(lines)
-
+            # Strip markdown code fences if present, then validate.
+            text = strip_code_fence(raw)
             try:
                 return _validate_and_log(text, schema_class)
             except Exception:
@@ -169,9 +130,7 @@ async def extract_from_chunk(
                 from json_repair import repair_json
 
                 repaired = repair_json(text)
-                if isinstance(repaired, str):
-                    return _validate_and_log(repaired, schema_class)
-                return _validate_and_log_obj(repaired, schema_class)
+                return _validate_and_log(repaired, schema_class)
 
         except Exception as exc:
             if attempt < max_retries - 1:
@@ -197,6 +156,8 @@ async def extract_from_chunks(
     llm_model: str | None = None,
     api_base: str | None = None,
     concurrency: int = 4,
+    *,
+    on_progress=None,
 ) -> list[tuple[BaseModel, str, int]]:
     """Extract from all chunks with bounded concurrency.
 
@@ -204,9 +165,19 @@ async def extract_from_chunks(
     successfully parsed chunk — preserving the provenance needed by the
     conflict-detecting merge mode. ``source`` is the originating file name
     and ``chunk_index`` is the positional index within that file.
+
+    Args:
+        on_progress: Optional ``async (completed: int, total: int) -> None``
+            callback invoked once per chunk as it completes (success or
+            failure). The Chainlit UI uses this to drive a tqdm-style
+            progress line with ETA. The callback is awaited from the
+            ``as_completed`` consumer loop, so it must not block. ``None``
+            (the default) keeps the previous behaviour exactly.
     """
     semaphore = asyncio.Semaphore(concurrency)
     results: list[tuple[BaseModel, str, int]] = []
+    total = len(chunks)
+    completed = 0
 
     async def _extract_one(chunk_info: dict) -> tuple[BaseModel, str, int] | None:
         async with semaphore:
@@ -227,6 +198,12 @@ async def extract_from_chunks(
     tasks = [_extract_one(c) for c in chunks]
     for coro in asyncio.as_completed(tasks):
         result = await coro
+        completed += 1
+        if on_progress is not None:
+            try:
+                await on_progress(completed, total)
+            except Exception as exc:  # noqa: BLE001 — never break extraction
+                logger.debug("extract on_progress callback raised: {}", exc)
         if result is not None:
             results.append(result)
 

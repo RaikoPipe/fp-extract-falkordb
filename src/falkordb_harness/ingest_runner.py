@@ -50,10 +50,23 @@ _PLAIN_EXTS = {".txt", ".md", ".csv", ".json", ".html", ".py"}
 #     read). ``file`` is the name; ``stage`` is the stage running on it.
 #   - ``file_end``     : that file finished its stage. ``file`` + ``stage``
 #     plus optional metrics (``chars``/``pages``/``chunks``/``cached``).
+#   - ``progress``     : a granular within-stage tick for long stages
+#     (extract / write). Carries ``stage``, ``completed``, ``total``,
+#     and optional ``label`` (a pre-rendered tqdm-style string built by
+#     the UI layer from its :class:`TimeEstimator`). Emitted once per
+#     chunk (extract) or per extraction (write) so the UI can show
+#     ``n/total  xx%  elapsed  ETA  rate`` between stage_start and
+#     stage_end.
 #   - ``error``        : a per-file/per-stage failure. ``file`` and/or
 #     ``stage`` plus ``error`` message.
 #   - ``info``         : a free-form informational note (cached skips, plain
 #     text, etc.).
+#   - ``graph_updated``: emitted after each successful ``write_extraction``
+#     call during the write stage. Carries ``source``, ``chunk_index``,
+#     ``statements``, and ``nodes_in_graph`` (the post-write node count).
+#     Consumed by the polling GraphView panel (public/graph_view.js) to
+#     switch to its active refresh cadence; the TaskList progress panel
+#     treats it as a no-op.
 #
 # The UI (Chainlit ``on_ingest_documents``) interprets these to drive a live
 # ``cl.TaskList``. Callers that ignore ``details`` still get a readable
@@ -455,11 +468,28 @@ async def run_ingestion(
         )
 
     # --- Stage 4: LLM extraction ---
+    async def _extract_progress(completed: int, total: int) -> None:
+        # Forward as a granular ``progress`` event so the UI's TimeEstimator
+        # can render a tqdm-style line (n/total, %, elapsed, ETA, rate).
+        # Skip the no-op sink entirely to avoid needless await overhead.
+        if progress is _noop_progress:
+            return
+        await progress(
+            f"Extracting {completed}/{total} chunk(s)…",
+            {
+                "kind": "progress",
+                "stage": "extract",
+                "completed": completed,
+                "total": total,
+            },
+        )
+
     extractions = await extract_from_chunks(
         chunks,
         llm_model=os.getenv("LLM_MODEL"),
         api_base=os.getenv("OLLAMA_BASE_URL"),
         concurrency=concurrency,
+        on_progress=_extract_progress,
     )
     if progress:
         await progress(
@@ -476,6 +506,8 @@ async def run_ingestion(
     backend = get_backend()
     total_stmts = 0
     total_conflicts = 0
+    _write_total = len(extractions)
+    _write_completed = 0
     # Track which source filenames produced at least one successful write,
     # so we can register them as ingested in the document registry after
     # the loop. A source maps to its staged file (original or preprocessed)
@@ -497,9 +529,39 @@ async def run_ingestion(
             total_stmts += stmts
             total_conflicts += len(conflicts)
             ingested_sources.add(source)
+            # Live graph-view signal: emit a ``graph_updated`` event after
+            # every successful write so the polling client (public/graph_view.js)
+            # can refresh at its active cadence. The TaskList progress panel
+            # ignores this kind (no-op branch in chainlit_progress.progress);
+            # the JS poller is the consumer. Carries the post-write node count
+            # so the panel can update its footer even between polls.
+            if progress:
+                live_nodes = backend.node_count()
+                await progress(
+                    f"Wrote `{source}` chunk {chunk_index} → {stmts} statement(s).",
+                    {
+                        "kind": "graph_updated",
+                        "stage": "write",
+                        "source": source,
+                        "chunk_index": chunk_index,
+                        "statements": stmts,
+                        "nodes_in_graph": live_nodes,
+                    },
+                )
         except Exception as exc:  # noqa: BLE001 — per-extraction resilience
             errors.append(f"Write failed for `{source}` chunk {chunk_index}: {exc}")
             logger.error("Ingestion write error for {} chunk {}: {}", source, chunk_index, exc)
+        _write_completed += 1
+        if progress is not _noop_progress:
+            await progress(
+                f"Writing {_write_completed}/{_write_total} extraction(s)…",
+                {
+                    "kind": "progress",
+                    "stage": "write",
+                    "completed": _write_completed,
+                    "total": _write_total,
+                },
+            )
 
     nodes_in_graph = backend.node_count()
     if progress:
