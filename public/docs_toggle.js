@@ -6,15 +6,11 @@
 // screen the way the old OpenDocsButton CustomElement did — sending that as
 // a chat message was what swapped the starter view for an empty chat).
 //
-// Visibility: fetches the authenticated /api/docs-info endpoint
-// (registered in auth.register_routes) for whether the user's last-used
-// knowledge graph has any ingested documents. The button is hidden when
-// there is nothing to show (ingested-rows proxy — the endpoint runs outside
-// any Chainlit session, so it cannot see the current thread's uploads; the
-// sidebar already auto-opens on upload via _refresh_sidebar, so the toggle
-// is not needed in that narrow case). Re-fetches every 15s and on DOM
-// mutations (Chainlit re-renders on view transitions). Falls back
-// gracefully: a 401/503 hides the button.
+// Visibility: the button is always visible. On click, if the last poll
+// indicates no documents are available, an error toast is shown instead of
+// toggling the sidebar. The /api/docs-info endpoint is polled every 15s and
+// on DOM mutations to keep the cached state current. Falls back gracefully:
+// a 401 hides the button.
 //
 // Open: window.postMessage({type: "chainlit-toggle-docs-sidebar", open: true})
 // — Chainlit's AppWrapper forwards window messages to the backend
@@ -41,9 +37,9 @@
   var SIDEBAR_CLOSE_BUTTON_SELECTOR =
     SIDEBAR_OPEN_SELECTOR + " button";
 
+  var hasDocuments = false;
+
   function localized() {
-    // The page locale: Chainlit sets <html lang="...">; default to German
-    // (the app's DEFAULT_LANG) when undeterminable.
     var htmlLang = (document.documentElement.lang || "de").toLowerCase();
     var isEn = htmlLang.indexOf("en") === 0;
     return {
@@ -51,6 +47,7 @@
       close: isEn ? "Close" : "Schließen",
       openTitle: isEn ? "Open document sidebar" : "Dokumenten-Seitenleiste öffnen",
       closeTitle: isEn ? "Close document sidebar" : "Dokumenten-Seitenleiste schließen",
+      noDocs: isEn ? "No documents available" : "Keine Dokumente verfügbar",
     };
   }
 
@@ -80,18 +77,14 @@
       "user-select:none",
       "box-shadow:0 1px 3px rgba(0,0,0,0.12)",
     ].join(";");
-    // Treat the pill as a button for accessibility.
     el.setAttribute("role", "button");
     el.setAttribute("tabindex", "0");
     return el;
   }
 
-  function renderButton(hasDocs) {
+  function renderButton() {
     var labels = localized();
     var btn = ensureButtonContainer();
-    // Icon (a small panel/document glyph rendered as inline SVG so we don't
-    // depend on lucide or any CSS). Mirrors the PanelRight icon the old
-    // OpenDocsButton used.
     var icon =
       '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" ' +
       'viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
@@ -101,19 +94,14 @@
       '</svg>';
     var text = document.createElement("span");
     text.style.cssText = "overflow:hidden;text-overflow:ellipsis";
-    text.textContent = labels.open; // default = closed-state label
+    text.textContent = labels.open;
     btn.title = labels.openTitle;
-    // Replace children (preserve the container + handlers).
     while (btn.firstChild) btn.removeChild(btn.firstChild);
     btn.insertAdjacentHTML("afterbegin", icon);
     btn.appendChild(text);
-    // Hide when there is nothing to show.
-    btn.style.display = hasDocs ? "flex" : "none";
-    // Attach to body (fixed positioning, so any parent is fine).
+    btn.style.display = "flex";
     if (!btn.parentElement) document.body.appendChild(btn);
-    // Wire handlers once.
     wireHandlers(btn);
-    // Start the open/closed state poller once.
     startStatePoller(btn, text);
   }
 
@@ -143,6 +131,12 @@
   }
 
   function toggleSidebar() {
+    if (!hasDocuments) {
+      if (typeof showToast === "function") {
+        showToast(localized().noDocs, "error");
+      }
+      return;
+    }
     if (isSidebarOpen()) {
       closeSidebar();
     } else {
@@ -151,9 +145,6 @@
   }
 
   function openSidebar() {
-    // Ask the server to re-run _refresh_sidebar (which re-opens the
-    // ElementSidebar via set_elements). window.postMessage is forwarded by
-    // Chainlit's AppWrapper to the backend window_message socket event.
     window.postMessage(
       { type: OPEN_MSG_TYPE, open: true },
       window.location.origin
@@ -161,10 +152,6 @@
   }
 
   function closeSidebar() {
-    // Click the sidebar's own close button (the ArrowLeft button inside
-    // #side-view-title). This triggers Chainlit's setSideView(undefined)
-    // and tears down the sidebar via its own React state — no server
-    // round-trip, no new endpoint.
     var closeBtn = document.querySelector(SIDEBAR_CLOSE_BUTTON_SELECTOR);
     if (closeBtn) closeBtn.click();
   }
@@ -184,9 +171,6 @@
       if (text) text.textContent = open ? labels.close : labels.open;
       btn.title = open ? labels.closeTitle : labels.openTitle;
     }
-    // Poll the DOM for sidebar state. ElementSideView mounts/unmounts
-    // [id="side-view-title"] on open/close; a MutationObserver would also
-    // work but a light poll is simpler and matches the KG badge's cadence.
     setInterval(sync, STATE_POLL_MS);
     sync();
   }
@@ -202,34 +186,28 @@
         return r.json();
       })
       .then(function (data) {
-        renderButton(!!(data && data.has_documents));
+        hasDocuments = !!(data && data.has_documents);
+        renderButton();
       })
       .catch(function (err) {
-        // 401 -> user not logged in yet (login page); hide button silently.
-        // Other errors -> hide (no docs signal).
         if (err && err.message && err.message.indexOf("401") !== -1) {
           hideButton();
           return;
         }
-        hideButton();
+        hasDocuments = false;
+        renderButton();
       })
       .finally(function () { fetching = false; });
   }
 
-  // Initial render once the DOM is ready (defer guarantees DOMContentLoaded
-  // has not yet fired, so listen for it).
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", refresh);
   } else {
     refresh();
   }
 
-  // Poll periodically so a graph switch / ingestion is reflected even
-  // without a DOM mutation.
   setInterval(refresh, POLL_MS);
 
-  // Re-render on DOM mutations (Chainlit re-renders on view transitions
-  // such as starter -> chat). Throttle with a flag.
   var dirty = false;
   if (typeof MutationObserver !== "undefined") {
     var observer = new MutationObserver(function () {

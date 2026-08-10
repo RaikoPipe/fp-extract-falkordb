@@ -16,10 +16,14 @@
 //
 // Cytoscape is loaded lazily on first open so the initial page load pays
 // nothing; the ~300 KB library is fetched once and cached by the browser.
-// Falls back gracefully: a 401 hides the panel, a 503 / fetch error leaves
+// Falls back gracefully: a 401 hides the toggle, a 503 / fetch error leaves
 // the last successful render in place and surfaces a small "unavailable"
 // badge. The panel never blocks the chat — it is a side panel with its own
 // scroll and pointer events.
+//
+// Visibility: the toggle button is always visible. On click, if no graph
+// data is available (no non-empty snapshot has landed), an error toast is
+// shown instead of opening the panel.
 (function () {
   "use strict";
 
@@ -31,9 +35,9 @@
     "https://cdn.jsdelivr.net/npm/cytoscape@3.28.1/dist/cytoscape.min.js";
   var INGESTION_STEP_MARKER = "extract_and_write";
 
-  var cy = null; // Cytoscape instance, built on first open.
-  var cytoLoaded = false; // Script tag inserted + resolved.
-  var cytoLoading = null; // In-flight load promise (dedupes concurrent opens).
+  var cy = null;
+  var cytoLoaded = false;
+  var cytoLoading = null;
   var panelEl = null;
   var toggleBtnEl = null;
   var isOpen = false;
@@ -57,6 +61,7 @@
       pause: isEn ? "Pause" : "Pause",
       resume: isEn ? "Resume" : "Fortsetzen",
       falkorUi: isEn ? "Open in FalkorDB UI" : "In FalkorDB UI öffnen",
+      noGraph: isEn ? "No graph data available" : "Keine Graphdaten verfügbar",
     };
   }
 
@@ -92,9 +97,9 @@
     btn.style.cssText = [
       "position:fixed",
       "bottom:1rem",
-      "right:8rem", // left of the docs toggle (right:1rem)
+      "right:8rem",
       "z-index:9999",
-      "display:none", // hidden until the first snapshot lands
+      "display:flex",
       "align-items:center",
       "gap:6px",
       "padding:6px 12px",
@@ -157,7 +162,7 @@
       "width:420px",
       "height:calc(100vh - 6rem)",
       "z-index:9998",
-      "display:none", // hidden until first open
+      "display:none",
       "flex-direction:column",
       "border:1px solid rgb(228,228,231)",
       "border-radius:12px",
@@ -199,6 +204,12 @@
   var paused = false;
 
   function toggleOpen() {
+    if (!lastSnapshot || !lastSnapshot.graph) {
+      if (typeof showToast === "function") {
+        showToast(localized().noGraph, "error");
+      }
+      return;
+    }
     setOpen(!isOpen);
   }
 
@@ -207,7 +218,6 @@
     if (!panelEl) panelEl = ensurePanel();
     panelEl.style.display = open ? "flex" : "none";
     if (open) {
-      // Lazy-load Cytoscape + build the instance on first open.
       loadCytoscape()
         .then(function () {
           if (!cy && window.cytoscape) {
@@ -265,7 +275,7 @@
             });
           }
           if (lastSnapshot) renderSnapshot(lastSnapshot);
-          scheduleNext(0); // immediate refresh on open
+          scheduleNext(0);
         })
         .catch(function (err) {
           setFooter(localized().unavailable + " (" + err.message + ")");
@@ -297,7 +307,6 @@
   function renderSnapshot(data) {
     if (!cy) return;
     var labels = localized();
-    // Title: graph name + node/edge counts.
     var title = document.getElementById("kg-view-title");
     if (title) {
       var name = (data && data.graph) || labels.empty;
@@ -308,7 +317,6 @@
         " / " + edgeCount + " " + labels.edges;
     }
 
-    // Empty / error states: clear the canvas.
     if (!data || !data.nodes || !data.nodes.length) {
       cy.elements().remove();
       if (data && data.stats && data.error === "graph-unavailable") {
@@ -319,9 +327,6 @@
       return;
     }
 
-    // Build Cytoscape elements: nodes keyed by name (stable id across polls
-    // so the layout doesn't reflow on every refresh), edges keyed by
-    // src|tgt|type.
     var nodes = data.nodes.map(function (n) {
       var label = (n._labels && n._labels[0]) || "Resource";
       return {
@@ -344,8 +349,6 @@
       };
     });
 
-    // Diff-friendly update: remove elements no longer present, add new ones,
-    // keep positions for survivors so the layout is stable across polls.
     var survivingIds = new Set(nodes.map(function (n) { return n.data.id; }));
     cy.nodes().forEach(function (n) {
       if (!survivingIds.has(n.id())) n.remove();
@@ -362,21 +365,16 @@
       if (!cy.getElementById(e.data.id).length) cy.add(e);
     });
 
-    // Run a cose layout only when the graph grew (new nodes added) — avoids
-    // a full reflow on every idle poll when nothing changed.
     if (cy.nodes().length > 0 && data.stats && data.stats.node_count > 0) {
       var addedAny = nodes.some(function (n) {
         return cy.getElementById(n.data.id).length &&
           !cy.getElementById(n.data.id).position();
       });
-      // Always run layout on the first render (positions undefined) and
-      // when the node count grew since the last render.
       if (!lastSnapshot || lastSnapshot.stats.node_count < data.stats.node_count) {
         runLayout();
       }
     }
 
-    // Footer: truncation notice + FalkorDB UI link.
     var footerParts = [];
     if (data.stats && data.stats.truncated) {
       footerParts.push(labels.truncated.replace("N", String(data.nodes.length)));
@@ -398,7 +396,6 @@
   function setFooter(text) {
     var footer = document.getElementById("kg-view-footer");
     if (!footer) return;
-    // Preserve the FalkorDB UI link (right side) if present.
     var link = footer.querySelector("a");
     while (footer.firstChild && footer.firstChild !== link) {
       footer.removeChild(footer.firstChild);
@@ -408,7 +405,6 @@
       span.textContent = text;
       footer.insertBefore(span, link);
     }
-    // Add the FalkorDB UI link once.
     if (!link) {
       link = document.createElement("a");
       link.textContent = localized().falkorUi;
@@ -423,10 +419,6 @@
   // --- Polling ------------------------------------------------------------
 
   function isInjectionActive() {
-    // Detect a visible "extract_and_write" Step in the chat timeline. The
-    // agent's tool Step panels carry the tool name in their header; we scan
-    // for a Step whose text content includes the marker. This is a heuristic
-    // but cheap and stable across Chainlit re-renders.
     var steps = document.querySelectorAll("[class*='step'], [class*='Step']");
     for (var i = 0; i < steps.length; i++) {
       if (steps[i].textContent &&
@@ -434,7 +426,6 @@
         return true;
       }
     }
-    // The Ingest action button path emits a TaskList panel; detect it too.
     var tasklist = document.querySelector("[class*='task'], [class*='Task']");
     if (tasklist && tasklist.textContent &&
         tasklist.textContent.toLowerCase().indexOf("ingest") !== -1) {
@@ -470,23 +461,16 @@
       })
       .then(function (data) {
         lastSnapshot = data;
-        // Show the toggle button once the first non-empty snapshot lands.
-        if (data && data.graph && !toggleBtnEl) {
+        if (!toggleBtnEl) {
           toggleBtnEl = ensureToggle();
-          toggleBtnEl.style.display = "flex";
-        }
-        if (toggleBtnEl && data && data.graph) {
-          toggleBtnEl.style.display = "flex";
         }
         if (isOpen) renderSnapshot(data);
       })
       .catch(function (err) {
-        // 401 -> not logged in; hide the toggle silently.
         if (err && err.message && err.message.indexOf("401") !== -1) {
           if (toggleBtnEl) toggleBtnEl.style.display = "none";
           return;
         }
-        // Other errors: leave the last render in place, surface a footer note.
         if (isOpen) setFooter(localized().unavailable);
       })
       .finally(function () {
@@ -504,16 +488,9 @@
   }
 
   function init() {
-    // First fetch on load to decide whether to show the toggle button. We
-    // do not open the panel automatically — the user opens it via the
-    // toggle. The poll then keeps the toggle visible + the panel (if open)
-    // refreshed.
     refresh();
   }
 
-  // Re-render on DOM mutations (Chainlit re-renders on view transitions
-  // such as starter -> chat). Throttle with a flag so a burst of mutations
-  // (e.g. streaming tokens) doesn't spam the endpoint.
   var dirty = false;
   if (typeof MutationObserver !== "undefined") {
     var observer = new MutationObserver(function () {
@@ -521,9 +498,7 @@
       dirty = true;
       setTimeout(function () {
         dirty = false;
-        // Only re-evaluate the toggle's visibility; a full refresh is
-        // unnecessary on every DOM mutation (the poll handles data).
-        if (lastSnapshot && lastSnapshot.graph && toggleBtnEl) {
+        if (toggleBtnEl) {
           toggleBtnEl.style.display = "flex";
         }
       }, 300);

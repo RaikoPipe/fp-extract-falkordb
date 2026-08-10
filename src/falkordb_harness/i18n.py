@@ -291,6 +291,16 @@ STRINGS: dict[str, dict[str, str]] = {
     "ingest.progress.rate_unknown": {"en": "? it/s", "de": "? it/s"},
     "ingest.progress.percent_unknown": {"en": "?", "de": "?"},
 
+    # --- Debug "Run Showcase" button (public/debug_button.js) --------------
+    "debug.button.label": {
+        "en": "Run Showcase",
+        "de": "Showcase ausführen",
+    },
+    "debug.button.tooltip": {
+        "en": "Fill the composer with an end-to-end showcase prompt (admin only)",
+        "de": "Composer mit einem End-to-End-Showcase-Prompt füllen (nur Admin)",
+    },
+
     # --- Upload receipt (chainlit_app.py on_message) ----------------------
     "upload.receipt": {
         "en": "Received **{n_new}** file(s). **{n_total}** total file(s) ready for ingestion into graph `{graph}`.",

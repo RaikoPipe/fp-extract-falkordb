@@ -1622,6 +1622,43 @@ def register_routes() -> None:
         payload = build_graph_snapshot(last, _GRAPH_SNAPSHOT_MAX_NODES)
         return JSONResponse(payload)
 
+    # --- /api/debug-allowed --------------------------------------------------
+    # Read-only JSON endpoint consumed by the custom_js debug "Run Showcase"
+    # button (public/debug_button.js) to decide whether to show the floating
+    # button and to serve the showcase prompt. Returns ``{"allowed": bool,
+    # "prompt": str}``. ``allowed`` is true only for admins; ``prompt`` is
+    # the showcase prompt string (empty for non-admins). Authenticated via
+    # the Chainlit JWT cookie (same pattern as /api/graph-info).
+
+    async def debug_allowed(request: Request) -> JSONResponse:
+        from chainlit.auth.cookie import get_token_from_cookies
+        from chainlit.auth.jwt import decode_jwt, get_jwt_secret
+
+        secret = get_jwt_secret()
+        if not secret:
+            return JSONResponse({"allowed": False, "prompt": ""}, status_code=503)
+        token = get_token_from_cookies(request.cookies)
+        if not token:
+            return JSONResponse({"allowed": False, "prompt": ""}, status_code=401)
+        try:
+            user = decode_jwt(token)
+        except Exception:  # noqa: BLE001 — invalid/expired token
+            return JSONResponse({"allowed": False, "prompt": ""}, status_code=401)
+        identifier = getattr(user, "identifier", None)
+        if not identifier:
+            return JSONResponse({"allowed": False, "prompt": ""}, status_code=401)
+        try:
+            role = await get_user_role(identifier)
+        except Exception:  # noqa: BLE001 — DB not ready
+            role = ROLE_USER
+        allowed = role == ROLE_ADMIN
+        prompt = ""
+        if allowed:
+            from falkordb_harness.showcase import SHOWCASE_PROMPT
+
+            prompt = SHOWCASE_PROMPT
+        return JSONResponse({"allowed": allowed, "prompt": prompt})
+
     # Build the Starlette Route objects and insert them at the FRONT of
     # Chainlit's router (ahead of the ``/{full_path:path}`` catch-all).
     new_routes = [
@@ -1629,6 +1666,8 @@ def register_routes() -> None:
         Route("/api/docs-info", endpoint=docs_info, methods=["GET"], name="docs_info"),
         Route("/api/graph-snapshot", endpoint=graph_snapshot, methods=["GET"],
               name="graph_snapshot"),
+        Route("/api/debug-allowed", endpoint=debug_allowed, methods=["GET"],
+              name="debug_allowed"),
         Route("/register", endpoint=register_page, methods=["GET"], name="register_page"),
         Route("/register", endpoint=register_submit, methods=["POST"], name="register_submit"),
         Route("/verify-email", endpoint=verify_email_page, methods=["GET"], name="verify_email"),
