@@ -65,6 +65,7 @@ reaction_on_message_received = false
     accept = [
         "text/plain",
         "text/markdown",
+        "application/octet-stream",
         "application/pdf",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "application/vnd.openxmlformats-officedocument.presentationml.presentation",
