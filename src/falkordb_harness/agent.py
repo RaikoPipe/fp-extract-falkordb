@@ -27,8 +27,10 @@ from falkordb_harness._loop_guard import RepeatGuardMiddleware
 from falkordb_harness.tools import all_tools_for_role
 
 # Recursion limit: LangGraph's default (25) is too low for the tool-heavy
-# PRE-INGESTION REVIEW ROUTINE; 50 + repeat-guard bounds runaway loops.
-_DEFAULT_RECURSION_LIMIT = 50
+# PRE-INGESTION REVIEW ROUTINE; 100 + repeat-guard bounds runaway loops.
+# Raised from 50 to 100 to accommodate long multi-step showcase pipelines
+# (10+ tool-call-heavy steps) without exhausting the per-turn budget.
+_DEFAULT_RECURSION_LIMIT = 100
 
 logger = logging.getLogger("falkordb_harness.attachments")
 agent_logger = logging.getLogger("falkordb_harness.agent")
@@ -57,6 +59,16 @@ if _LOG_ATTACHMENTS:
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
         logger.addHandler(handler)
     logger.propagate = False
+
+# Module-level sandbox reference for lifecycle cleanup.  Set by build_agent
+# when PYTHON_RUNNER_ENABLE is active; consumed by Chainlit's on_chat_end
+# and the CLI's atexit handler.
+_SANDBOX: object | None = None
+
+
+def get_sandbox() -> object | None:
+    """Return the current PythonRunnerSandbox, or None."""
+    return _SANDBOX
 
 
 def _summarise_part(part: object) -> object:
@@ -613,7 +625,27 @@ def build_agent(
     tools = all_tools_for_role(role)
 
     data_dir = Path(os.getenv("DATA_DIR", "./data")).resolve()
-    backend = FilesystemBackend(root_dir=str(data_dir), virtual_mode=True)
+
+    # PythonRunnerSandbox: opt-in Docker-backed code execution with pandas.
+    # When PYTHON_RUNNER_ENABLE is set, the agent's filesystem tools (ls,
+    # read_file, write_file, edit_file, glob, grep) operate inside a
+    # per-thread python-runner container via BaseSandbox's execute-based
+    # implementations.  The host DATA_DIR is bind-mounted read-only at
+    # /workspace so the agent can inspect originals/ and preprocessed/.
+    # Custom tools (file_metadata, extract_and_write, etc.) continue to use
+    # the host-side fs_backend() in _paths.py independently.
+    if os.getenv("PYTHON_RUNNER_ENABLE", "").lower() in ("1", "true", "yes"):
+        from falkordb_harness.python_runner import PythonRunnerSandbox
+
+        global _SANDBOX
+        _SANDBOX = PythonRunnerSandbox(
+            thread_id=thread_id or "_unscoped",
+            data_dir=data_dir,
+        )
+        backend = _SANDBOX
+    else:
+        backend = FilesystemBackend(root_dir=str(data_dir), virtual_mode=True)
+
     agent = create_deep_agent(
         model=llm,
         tools=tools,

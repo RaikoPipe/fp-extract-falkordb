@@ -73,6 +73,17 @@ services:
       - AGENT_LLM_TEMPERATURE=${AGENT_LLM_TEMPERATURE:-0.0}
       - AGENT_MAX_TOOL_REPEATS=${AGENT_MAX_TOOL_REPEATS:-}
 
+      # --- PythonRunnerSandbox (Docker-backed code execution) ---
+      # Set to "1" to enable the sandbox backend (pandas, numpy, etc.).
+      # Requires the python-runner:latest image built on the host:
+      #   docker build -f python-runner.Dockerfile -t python-runner:latest .
+      - PYTHON_RUNNER_ENABLE=${PYTHON_RUNNER_ENABLE:-}
+      - PYTHON_RUNNER_IMAGE=${PYTHON_RUNNER_IMAGE:-python-runner:latest}
+      - PYTHON_RUNNER_TTL=${PYTHON_RUNNER_TTL:-3600}
+      - PYTHON_RUNNER_NETWORK=${PYTHON_RUNNER_NETWORK:-none}
+      - PYTHON_RUNNER_DEFAULT_TIMEOUT=${PYTHON_RUNNER_DEFAULT_TIMEOUT:-120}
+      - PYTHON_RUNNER_MAX_OUTPUT_BYTES=${PYTHON_RUNNER_MAX_OUTPUT_BYTES:-100000}
+
       # --- Logging ---
       - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
       - LOG_ATTACHMENTS=${LOG_ATTACHMENTS:-1}
@@ -104,6 +115,9 @@ services:
 
     volumes:
       - ./data:/app/data
+      # Docker-out-of-Docker: the chainlit container creates sibling
+      # python-runner-<thread> containers via the host daemon.
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       falkordb:
         condition: service_healthy

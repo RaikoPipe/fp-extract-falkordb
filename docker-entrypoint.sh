@@ -8,5 +8,13 @@ set -e
 # privileges below).
 chown -R appuser:appuser /app/data
 
+# Grant appuser access to the Docker socket (Docker-out-of-Docker).
+# The socket is bind-mounted from the host.  gosu does not preserve
+# supplementary groups, so we make the socket world-readable/writable
+# instead of trying to match the host's docker group gid.
+if [ -S /var/run/docker.sock ]; then
+    chmod a+rw /var/run/docker.sock
+fi
+
 # Drop to the non-root appuser and exec the original CMD.
 exec gosu appuser "$@"

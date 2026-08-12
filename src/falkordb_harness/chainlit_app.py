@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import shutil
@@ -19,7 +20,7 @@ from chainlit import input_widget
 from chainlit.action import Action
 from chainlit.types import ThreadDict
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from falkordb_harness import auth as _auth_module  # noqa: F401
 from falkordb_harness.auth import register_routes
@@ -459,6 +460,13 @@ def _rebuild_agent_for_selection(
     from falkordb_harness.backend import _SESSION_BACKEND
 
     cl.user_session.set("session_backend", _SESSION_BACKEND.get())
+
+    # Stash the sandbox (if any) for cleanup in on_chat_end.
+    from falkordb_harness.agent import get_sandbox
+
+    sandbox = get_sandbox()
+    if sandbox is not None:
+        cl.user_session.set("sandbox", sandbox)
 
 
 @cl.set_starter_categories
@@ -1681,6 +1689,14 @@ async def on_message(message: cl.Message) -> None:
     # Tool text streams into a collapsible "Thinking" Step; replayed into
     # response_msg as the visible answer after the stream ends.
     _any_tool_called = False
+    # Claude-style tool-call history: preserve full AIMessage(tool_calls) +
+    # ToolMessage pairs so the agent sees exactly what it called and what
+    # each tool returned on subsequent turns.
+    _pending_tool_calls: dict[str, dict] = {}  # run_id -> {name, args, tool_call_id}
+    _tool_results: dict[str, str] = {}          # run_id -> output
+    _tool_call_batches: list[list[dict]] = []   # each batch: [{name, args, id, result}, ...]
+    _current_batch_run_ids: list[str] = []      # run_ids in the current in-flight batch
+    _in_tool_batch: bool = False
     thinking_step: cl.Step | None = None
     thinking_text: str = ""
     # Visual elements collected during the stream, attached to the final msg.
@@ -1706,6 +1722,29 @@ async def on_message(message: cl.Message) -> None:
         _chain_tool = None
         _chain_count = 0
         run_index.clear()
+
+    def _flush_tool_batch() -> None:
+        """Flush pending tool calls/results as Claude-style AIMessage+ToolMessage pairs.
+
+        Each batch becomes one AIMessage(tool_calls=[...]) followed by one
+        ToolMessage per tool call. The batch is appended to _tool_call_batches
+        for later inclusion in chat_history.
+        """
+        nonlocal _in_tool_batch
+        if not _current_batch_run_ids:
+            return
+        batch: list[dict] = []
+        for rid in _current_batch_run_ids:
+            tc = _pending_tool_calls.get(rid)
+            result = _tool_results.get(rid, "")
+            if tc:
+                batch.append({**tc, "result": result})
+        if batch:
+            _tool_call_batches.append(batch)
+        _current_batch_run_ids.clear()
+        _pending_tool_calls.clear()
+        _tool_results.clear()
+        _in_tool_batch = False
 
     agent_input = {"messages": chat_history + [HumanMessage(content=user_content)]}
     from langgraph.errors import GraphRecursionError
@@ -1733,6 +1772,10 @@ async def on_message(message: cl.Message) -> None:
                 if kind not in ("on_tool_start", "on_tool_end"):
                     if _chain_step is not None:
                         await _close_chain_step()
+                    # Flush any completed tool batch when the model starts
+                    # generating text (or any non-tool event arrives).
+                    if _in_tool_batch and _current_batch_run_ids:
+                        _flush_tool_batch()
 
                 if kind == "on_chat_model_stream":
                     metadata = event.get("metadata", {})
@@ -1781,6 +1824,13 @@ async def on_message(message: cl.Message) -> None:
                     _icon, _lang, _open = _step_meta(tool_name)
 
                     _any_tool_called = True
+                    _in_tool_batch = True
+                    _current_batch_run_ids.append(run_id)
+                    _pending_tool_calls[run_id] = {
+                        "name": tool_name,
+                        "args": tool_input,
+                        "tool_call_id": run_id,
+                    }
 
                     # Same-tool chain: reuse the open step if the tool matches
                     # and no non-tool event broke the chain; else start fresh.
@@ -1854,6 +1904,8 @@ async def on_message(message: cl.Message) -> None:
                     step = active_steps.pop(run_id, None)
                     n = run_index.pop(run_id, 0)
                     output = event.get("data", {}).get("output", "")
+                    # Store tool result for Claude-style history preservation.
+                    _tool_results[run_id] = str(output) if output is not None else ""
                     if step:
                         try:
                             from falkordb_harness.chainlit_formatting import (
@@ -1906,6 +1958,9 @@ async def on_message(message: cl.Message) -> None:
             "GraphRecursionError: recursion limit (%d) reached",
             _DEFAULT_RECURSION_LIMIT,
         )
+        # Flush any pending tool batch before storing history.
+        if _in_tool_batch and _current_batch_run_ids:
+            _flush_tool_batch()
         if not full_response:
             full_response = t("error.recursion")
             await response_msg.stream_token(full_response)
@@ -1947,10 +2002,54 @@ async def on_message(message: cl.Message) -> None:
         response_msg.content = thinking_text
         await response_msg.update()
 
+    # Claude-style history: preserve full tool-call/tool-result pairs so the
+    # agent sees exactly what it called and what each tool returned on
+    # subsequent turns. Each batch of tool calls becomes one
+    # AIMessage(tool_calls=[...]) followed by one ToolMessage per call.
     chat_history.append(HumanMessage(content=user_content))
+    for batch in _tool_call_batches:
+        tool_calls = []
+        for tc in batch:
+            tool_calls.append({
+                "name": tc["name"],
+                "args": tc["args"],
+                "id": tc["tool_call_id"],
+                "type": "tool_call",
+            })
+        chat_history.append(AIMessage(content="", tool_calls=tool_calls))
+        for tc in batch:
+            chat_history.append(ToolMessage(
+                content=tc["result"],
+                tool_call_id=tc["tool_call_id"],
+            ))
     chat_history.append(AIMessage(content=full_response))
 
-    if len(chat_history) > MAX_HISTORY_PAIRS * 2:
-        chat_history[:] = chat_history[-(MAX_HISTORY_PAIRS * 2) :]
+    # Cap history by conversation turns (user/assistant pairs), not by raw
+    # message count. Each turn may contain many tool messages; counting by
+    # turns keeps the cap predictable regardless of tool-call density.
+    _turn_count = sum(1 for m in chat_history if isinstance(m, HumanMessage))
+    if _turn_count > MAX_HISTORY_PAIRS:
+        _keep_turns = MAX_HISTORY_PAIRS
+        _skip = _turn_count - _keep_turns
+        _seen = 0
+        _cut = 0
+        for _i, _m in enumerate(chat_history):
+            if isinstance(_m, HumanMessage):
+                _seen += 1
+                if _seen > _skip:
+                    _cut = _i
+                    break
+        chat_history[:] = chat_history[_cut:]
 
     cl.user_session.set("chat_history", chat_history)
+
+
+@cl.on_chat_end
+async def on_chat_end() -> None:
+    """Clean up the per-thread PythonRunnerSandbox when the chat ends."""
+    sandbox = cl.user_session.get("sandbox")
+    if sandbox is not None:
+        try:
+            sandbox.cleanup()
+        except Exception:
+            pass

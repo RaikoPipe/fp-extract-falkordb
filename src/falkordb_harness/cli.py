@@ -22,10 +22,23 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import getpass
 import sys
 
 from dotenv import load_dotenv
+
+
+def _cleanup_sandbox() -> None:
+    """atexit handler: stop+remove the PythonRunnerSandbox if one was created."""
+    from falkordb_harness.agent import get_sandbox
+
+    sandbox = get_sandbox()
+    if sandbox is not None:
+        try:
+            sandbox.cleanup()
+        except Exception:
+            pass
 
 
 async def _async_main(model: str | None, single_query: str | None) -> None:
@@ -121,6 +134,7 @@ async def _create_admin(username: str, email: str, password: str | None) -> int:
 
 def main() -> None:
     load_dotenv(override=True)
+    atexit.register(_cleanup_sandbox)
 
     parser = argparse.ArgumentParser(
         description="FalkorDB deep-agent harness — LangGraph agent "
