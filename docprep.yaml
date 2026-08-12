@@ -33,7 +33,7 @@ fallback:
 # image/chart interpretation, so the quality-gate VLM fallback above is
 # skipped for those backends; pipeline-backend output may still escalate.
 mineru:
-  enabled: false
+  enabled: enabled
   backend: hybrid-engine          # pipeline | vlm-engine | hybrid-engine
   effort: medium                  # medium | high (hybrid-engine only)
   language: ch                    # pipeline OCR lang hint (PP-OCRv6 collapsed to "ch")
