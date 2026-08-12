@@ -26,10 +26,8 @@ from langgraph.types import Checkpointer
 from falkordb_harness._loop_guard import RepeatGuardMiddleware
 from falkordb_harness.tools import all_tools_for_role
 
-# Default recursion limit for the agent graph. LangGraph's built-in default
-# (25) is too low for the tool-heavy PRE-INGESTION REVIEW ROUTINE, which can
-# legitimately chain 6+ tool calls per file; combined with the repeat-guard
-# middleware this gives headroom while still bounding runaway loops.
+# Recursion limit: LangGraph's default (25) is too low for the tool-heavy
+# PRE-INGESTION REVIEW ROUTINE; 50 + repeat-guard bounds runaway loops.
 _DEFAULT_RECURSION_LIMIT = 50
 
 logger = logging.getLogger("falkordb_harness.attachments")
@@ -43,16 +41,11 @@ if not agent_logger.handlers:
     agent_logger.setLevel(logging.INFO)
     agent_logger.propagate = False
 
-# Toggle for the attachment wire-format logger. Controlled by the
-# ``LOG_ATTACHMENTS`` env var (default ``"1"`` when unset). When enabled, the
-# graph dumps the raw content of the last ``HumanMessage`` on every invocation
-# so you can see exactly how `langgraph dev` delivers file uploads to the
-# agent (e.g. ``image_url`` parts with ``data:`` base64 URLs).
+# Toggle for the attachment wire-format logger (LOG_ATTACHMENTS env, default
+# "1"). Dumps the raw last HumanMessage to inspect upload delivery.
 _LOG_ATTACHMENTS = os.getenv("LOG_ATTACHMENTS", "1") not in ("", "0", "false", "no")
 
-# Ensure the attachment logger emits to stderr even when the host process
-# (e.g. `langgraph dev`) hasn't configured root logging. Set
-# ``LOG_ATTACHMENTS=0`` in the env to suppress entirely.
+# Emit to stderr even when the host hasn't configured root logging.
 if _LOG_ATTACHMENTS:
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "WARNING"),
@@ -146,11 +139,13 @@ You can:
 - Inspect raw source files before ingestion (file_metadata, read_excerpt)
 - Preprocess binary/scanned/image documents into Markdown \
 (preprocess_document)
-- Ingest preprocessed Markdown into the graph (chunk_documents, extract_and_write)
+- Ingest preprocessed Markdown into the graph (chunk_documents, \
+extract_and_write) — and estimate how long ingestion will take before \
+confirming (estimate_ingestion_time)
 - Query the graph with raw Cypher (cypher_query) or natural language (nl_query)
-- Search by full-text (fulltext_search) or vector similarity (vector_search)
+- Search by full-text or vector similarity (search)
 - Inspect the graph schema, nodes, edges, and node count \
-(get_schema, list_nodes, list_edges, node_count)
+(get_schema)
 - Discover which knowledge graphs exist in the FalkorDB instance (list_graphs) \
 and switch the active graph among the user's enabled set — switching requires \
 prior user confirmation via request_graph_switch followed by use_graph
@@ -166,10 +161,15 @@ its JSON string to set ``resolved: true`` and ``resolved_at`` and SETting \
 the full ``n.conflicts`` list back in one Cypher statement. Each conflict \
 entry carries a stable ``id`` of the form ``<property>:<detected_at>``. See \
 the cypher_query tool docstring for the exact schema and query patterns.
-- Manage similarity-based reconciliation of plain-name Resources: \
-review POSSIBLE_DUPLICATE_OF links (get_reconciliations), dismiss reviewed ones \
-(clear_reconciliations), and run a post-hoc pass over pre-existing plain-name \
-nodes (reconcile_posthoc)
+- Manage duplicate detection: reconciliation runs automatically during \
+ingestion. After ingestion, report duplicates found alongside conflicts. \
+Offer an interactive walkthrough: present each duplicate one-by-one (plain \
+name, indexed name, cosine similarity, LLM confidence) and ask the user to \
+accept or reject. Use resolve_duplicate(plain_name, action) where action is \
+"accept" (merge nodes, transfer relationships, record property conflicts in \
+n.conflicts), "reject" (dismiss the link), or "keep_separate" (same as reject \
+but the user considers the entities distinct). Use get_reconciliations to list \
+outstanding duplicates at any time.
 - Reset the graph (reset_graph) — use only when explicitly asked
 - Ask the user a clarifying question (ask_user) or request explicit \
 confirmation before ingestion (request_ingestion_confirmation)
@@ -192,7 +192,7 @@ session (CLI / pre-session uploads). Touch them only when the user \
 explicitly references them.
 - Ingested files are graph-scoped (cross-session), tracked in the registry \
 under a graph name rather than a thread. Query them via the graph tools \
-(cypher_query, nl_query, fulltext_search, vector_search, list_nodes) — do \
+(cypher_query, nl_query, search) — do \
 NOT reach into another session's directory to inspect an already-ingested \
 file. The registry's ``originalPath``/``preprocessedPath`` columns on \
 ingested rows are provenance only and may point at a different session's \
@@ -248,9 +248,18 @@ conversion before extraction.
    - a 1-3 sentence content description per file
    - anything that looks like noise, out-of-scope, or non-factory-planning data
    - which files were preprocessed and which were skipped (already Markdown)
+4b. ESTIMATE: call ``estimate_ingestion_time`` with the SAME ``data_dir`` / \
+``chunk_size`` / ``concurrency`` you intend to pass to ``extract_and_write``. \
+Read ``estimated_human`` (e.g. ``"≈ 3m 20s"``) and ``chunk_count`` from the \
+result and fold them into the confirmation summary in step 5 — e.g. include a \
+line like "Estimated processing time: ≈ 3m 20s (42 chunks across 5 files at \
+concurrency 4)". This keeps the user informed about the expected wait BEFORE \
+they confirm. Do NOT call extract_and_write here; the estimate is read-only \
+and performs no LLM extraction or graph writes.
 5. CONFIRM: STOP and call ``request_ingestion_confirmation`` with your \
-summary (do NOT ask in prose — use the tool so the user gets explicit \
-Confirm/Cancel buttons). Do NOT call extract_and_write until the user \
+summary (including the time estimate from 4b — do NOT ask in prose — use the \
+tool so the user gets explicit Confirm/Cancel buttons). Do NOT call \
+extract_and_write until the user \
 confirms via that tool. chunk_documents (preview-only, no graph writes) \
 may be used during this review to preview chunks, but the actual ingestion \
 must wait for confirmation.
@@ -274,7 +283,10 @@ provides Cypher or when you can construct a precise query.
 - Always report results clearly, including counts, conflicts detected, and \
 reconciliation links.
 - Reconciliation applies to Resources only and never auto-merges duplicates; \
-always leave adjudication to the human via clear_reconciliations.
+always leave adjudication to the human via resolve_duplicate.
+- When accepting a merge, warn the user that conflicting properties are stored \
+in the surviving node's conflicts list and offer to resolve them.
+- Present duplicates one at a time; do not batch-accept or batch-reject.
 - Never reset the graph without explicit user confirmation.
 - To switch the active graph: (1) call list_graphs to see what exists, (2) \
 call request_graph_switch(name) — this asks the user to confirm via a \
@@ -286,7 +298,7 @@ user choose.
 - When you need to learn about the existing knowledge graphs (e.g. before \
 switching, or to answer "what's in this graph?"), call ``describe_graph()`` \
 with NO arguments FIRST — it returns every graph's description in one call. \
-Only fall back to get_schema / list_nodes on the active graph if the \
+Only fall back to get_schema on the active graph if the \
 description is empty or you need structural detail.
 - You are restricted to the user's enabled knowledge graphs. \
 use_graph(name) will reject any graph the user has not enabled. \
@@ -305,7 +317,7 @@ def _build_graph_context_prefix(
     """Build the dynamic preamble appended to SYSTEM_PROMPT for graph selection.
 
     Tells the agent which graph is active and which graphs are in scope, so it
-    can answer "which KGs are available?" without falling back to node_count
+    can answer "which KGs are available?" without falling back to cypher_query
     on the bound graph. Also surfaces the current session (Chainlit thread)
     id so the agent knows which per-session on-disk subdirectory
     (``originals/<thread_id>/`` / ``preprocessed/<thread_id>/``) is its own —
@@ -392,10 +404,8 @@ def _normalize_model_id(model_name: str) -> str:
     - ``openai:<model>`` / ``anthropic:<model>`` (already-colon form) are
       passed through unchanged.
     """
-    # Early-return only for known provider prefixes (``openai:`` /
-    # ``anthropic:``) — bare Ollama tags like ``glm-5.2:cloud`` contain a
-    # colon but are not provider-prefixed, so they must fall through to the
-    # Ollama-routing branch below.
+    # Early-return for known provider prefixes; bare Ollama tags like
+    # ``glm-5.2:cloud`` contain a colon but aren't provider-prefixed.
     if model_name.startswith("openai:") or model_name.startswith("anthropic:"):
         return model_name
     if model_name.startswith("anthropic/") or "claude" in model_name:
@@ -404,10 +414,7 @@ def _normalize_model_id(model_name: str) -> str:
     if model_name.startswith("openai/") or "gpt" in model_name:
         model_id = model_name.removeprefix("openai/")
         return f"openai:{model_id}"
-    # Bare Ollama tags (or any other unknown id) route to the OpenAI provider,
-    # which ChatOpenAI points at Ollama's OpenAI-compatible endpoint via
-    # OPENAI_API_BASE / OPENAI_API_KEY (derived from OLLAMA_API_BASE /
-    # OLLAMA_API_KEY in resolve_model).
+    # Bare Ollama tags route to ChatOpenAI pointed at the Ollama endpoint.
     return f"openai:{model_name}"
 
 
@@ -561,20 +568,11 @@ def build_agent(
 
     llm = resolve_model(model_name, temperature)
 
-    # Per-session knowledge-graph selection (Chainlit UI). When the user
-    # picks a graph in the sidebar, the Chainlit layer passes active_graph +
-    # allowed_graphs through the configurable; we build a session-scoped
-    # backend bound to that graph and install it so every tool sees it via
-    # get_backend(). The CLI path leaves these unset and falls back to the
-    # module-level env-driven backend cache.
+    # Per-session graph selection (Chainlit). CLI path leaves these unset
+    # and falls back to the module-level env-driven backend cache.
     active_graph: str | None = configurable.get("active_graph")
     allowed_graphs_raw = configurable.get("allowed_graphs")
     allowed_graphs: list[str] | None = None
-    # Per-session thread id (Chainlit) surfaced to the prompt so the agent
-    # knows which originals/<thread_id>/ and preprocessed/<thread_id>/
-    # subdirectories are its own (SESSION FILE ISOLATION in SYSTEM_PROMPT).
-    # None in the CLI / pre-session path; the preamble then refers to
-    # originals/_unscoped/.
     thread_id: str | None = configurable.get("thread_id")
     if isinstance(allowed_graphs_raw, (list, tuple)):
         allowed_graphs = [str(g) for g in allowed_graphs_raw if g]
@@ -583,8 +581,6 @@ def build_agent(
         from falkordb_harness.backend import set_session_backend
         from knowledge.falkordb_backend import FalkorDBBackend
 
-        # The active graph must always be inside the enabled set; if the UI
-        # passed an inconsistent state, fix it up rather than rejecting.
         if allowed_graphs is None:
             allowed_graphs = [active_graph]
         elif active_graph not in allowed_graphs:
@@ -596,10 +592,8 @@ def build_agent(
         )
         set_session_backend(session_backend)
 
-    # Fetch the active graph's description (if any) so the preamble can
-    # surface it without a tool call. Uses the SYNC sqlite reader because
-    # build_agent runs inside the already-running Chainlit event loop and
-    # cannot await. Best-effort: a fetch failure degrades to no description.
+    # Best-effort description fetch (sync reader; build_agent runs in the
+    # Chainlit event loop and cannot await).
     graph_description: str | None = None
     if active_graph:
         try:
@@ -613,10 +607,8 @@ def build_agent(
         active_graph, allowed_graphs, thread_id, graph_description
     )
 
-    # Role-based tool gating: the destructive reset_graph tool is only
-    # exposed to admins. The CLI path (no role in config) defaults to
-    # admin so local development isn't hobbled; the Chainlit layer passes
-    # the authenticated user's role through the configurable.
+    # Role-based tool gating: reset_graph is admin-only. CLI (no role)
+    # defaults to admin so local dev isn't hobbled.
     role = configurable.get("role") or "admin"
     tools = all_tools_for_role(role)
 
@@ -633,19 +625,16 @@ def build_agent(
     if not _LOG_ATTACHMENTS:
         return agent
 
-    # Wrap the deep agent in a parent graph whose first node logs the raw
-    # wire format of the last HumanMessage. This lets us inspect how
-    # `langgraph dev` delivers file uploads (e.g. image_url parts with
-    # data: base64 URLs) without modifying the agent itself.
+    # Wrap in a parent graph whose first node logs the raw wire format of
+    # the last HumanMessage (inspect how `langgraph dev` delivers uploads).
     parent = StateGraph(MessagesState)
     parent.add_node("log_attachments", _log_attachments)
     parent.add_node("agent", agent)
     parent.add_edge(START, "log_attachments")
     parent.add_edge("log_attachments", "agent")
-    # Preserve the checkpointer/await already configured on the deep agent.
     checkpointer: Checkpointer | None = getattr(agent, "checkpointer", None)
     return parent.compile(checkpointer=checkpointer)
 
 
-# Alias for LangGraph Studio / langgraph.json, which expects a graph factory.
+# Alias for LangGraph Studio / langgraph.json.
 build_graph = build_agent

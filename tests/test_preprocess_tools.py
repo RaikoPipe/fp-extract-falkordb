@@ -113,7 +113,6 @@ def test_preprocess_noop_when_md_exists(tmp_path):
     fake.assert_not_called()
     assert out["already_exists"] is True
     assert out["markdown_char_count"] == len("old markdown")
-    # Existing file is untouched.
     assert (out_dir / "scan.md").read_text() == "old markdown"
 
 
@@ -157,7 +156,6 @@ def test_preprocess_unsupported_format(tmp_path):
 
     assert "error" in out
     assert "unsupported" in out["error"]
-    # No .md written on failure.
     assert not (
         Path(os.getenv("PREPROCESSED_DIR")) / "_unscoped" / "weird.md"
     ).exists()
@@ -195,8 +193,7 @@ def test_preprocess_missing_config_hard_fails(tmp_path, monkeypatch):
     """
     src = Path(os.getenv("ORIGINALS_DIR")) / "scan.pdf"
     src.write_bytes(b"%PDF-1.4 fake")
-    # Ensure no docprep.yaml is visible from CWD (tmp_path has none, and the
-    # repo-root docprep.yaml must not be picked up).
+    # tmp_path has no docprep.yaml; repo-root must not be picked up.
     monkeypatch.chdir(tmp_path)
 
     with patch("docprep.entrypoint.convert") as fake:

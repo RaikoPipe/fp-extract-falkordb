@@ -310,7 +310,6 @@ def test_verify_email_token_expired(tmp_db):
     from falkordb_harness.data_layer import build_data_layer
 
     _, _, token = _register(tmp_db, username="hank")
-    # Force the expiry into the past.
     layer = build_data_layer()
 
     async def expire():
@@ -335,7 +334,6 @@ def test_verify_email_token_reuse_rejected(tmp_db):
 
     _, _, token = _register(tmp_db, username="iris")
     _run(verify_email_token(token))
-    # Second use: token was cleared, so it's now invalid.
     ok, _msg = _run(verify_email_token(token))
     assert not ok
 
@@ -353,9 +351,7 @@ def test_password_reset_roundtrip(tmp_db):
 
     _register(tmp_db, username="jane")
     _run(approve_user("jane"))
-    # Request reset — always returns True (no email actually sent in tests).
     assert _run(request_password_reset("jane@example.com")) is True
-    # We need the token from the DB since the email isn't sent.
     from sqlalchemy import text
 
     from falkordb_harness.data_layer import build_data_layer
@@ -376,7 +372,6 @@ def test_password_reset_roundtrip(tmp_db):
     token = _run(get_token())
     ok, _msg = _run(reset_password(token, "Newpassword1"))
     assert ok
-    # Old password no longer works; new one does.
     assert _run(verify_credentials("jane", "Supersecret1")) is None
     assert _run(verify_credentials("jane", "Newpassword1")) is not None
 
@@ -452,7 +447,6 @@ def test_password_reset_reuse_rejected(tmp_db):
 
     token = _run(get_token())
     _run(reset_password(token, "Newpassword1"))
-    # Reuse: token was cleared.
     ok, _msg = _run(reset_password(token, "Another1"))
     assert not ok
 
@@ -461,7 +455,6 @@ def test_password_reset_unknown_email_is_noop(tmp_db):
     from falkordb_harness.auth import request_password_reset
 
     _run(_init(tmp_db))
-    # Should not raise and should return True (enumeration resistance).
     assert _run(request_password_reset("nobody@example.com")) is True
 
 

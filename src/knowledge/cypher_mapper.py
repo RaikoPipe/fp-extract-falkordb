@@ -271,7 +271,6 @@ def build_conflict_merge(
 
         existing = existing_props.get(key)
         if existing is None:
-            # No prior value — write it.
             param_key = f"p_{key}"
             params[param_key] = _serialize_value(incoming)
             set_parts.append(f"n.{key} = ${param_key}")
@@ -279,10 +278,8 @@ def build_conflict_merge(
 
         incoming_ser = _serialize_value(incoming)
         if existing == incoming_ser:
-            # Agreement — no-op.
             continue
 
-        # Conflict: keep existing, record incoming.
         detected_at = utc_now_iso()
         conflict = {
             "id": f"{key}:{detected_at}",

@@ -80,7 +80,6 @@ def test_backend_ensure_fulltext_index_idempotent_on_existing():
     backend._graph = MagicMock()
     backend._graph.query.side_effect = Exception("Index already exists")
 
-    # Should not raise — "already exists" is treated as success.
     backend.ensure_fulltext_index("Resource", ("name",))
 
 
@@ -131,12 +130,9 @@ def test_searcher_vector_search_uses_embedding(monkeypatch):
     searcher = GraphSearcher(backend, mode="vector")
 
     async def fake_embed(self, text):
-        # The dim probe sends "dimension probe"; the real query sends the
-        # user's text. Return a 3-dim vector for both so the index is created
-        # with dim=3 and the search uses the same vector.
+        # Return 3-dim vectors for both probe and query so dim=3 throughout.
         return [0.5, 0.5, 0.5]
 
-    # Patch the private embedding helper on the class.
     monkeypatch.setattr(GraphSearcher, "_embed", fake_embed)
 
     rows = asyncio.run(searcher.vector_search("AGV throughput"))

@@ -69,8 +69,6 @@ def reset_engine_cache() -> None:
 def _sqlite_path() -> str:
     """Return the on-disk SQLite path parsed from DATABASE_URL (sync fallback)."""
     url = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./data/chainlit.db")
-    # Forms: sqlite+aiosqlite:///./data/chainlit.db  -> ./data/chainlit.db
-    #        sqlite:///./data/chainlit.db
     for prefix in ("sqlite+aiosqlite:///", "sqlite:///"):
         if url.startswith(prefix):
             return url[len(prefix):]
@@ -179,8 +177,6 @@ async def set_description(name: str, description: str) -> None:
     await _ensure_graph_descriptions_table()
     ts = _utc_now_iso()
     async with _engine().connect() as conn:
-        # SQLite UPSERT (ON CONFLICT) requires SQLite >= 3.24 (2018);
-        # aiosqlite ships a modern SQLite, so this is safe.
         await conn.execute(
             text(
                 """
@@ -256,7 +252,6 @@ async def get_description_map(names: list[str]) -> dict[str, str]:
         return {}
     await _ensure_graph_descriptions_table()
     async with _engine().connect() as conn:
-        # Bind an IN (...) list safely.
         params = {f"n{i}": n for i, n in enumerate(names)}
         placeholders = ", ".join(f":n{i}" for i in range(len(names)))
         rows = await conn.execute(

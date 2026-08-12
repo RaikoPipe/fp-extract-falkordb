@@ -125,25 +125,22 @@ def test_estimator_total_zero_percent_zero():
 
 def test_estimator_eta_unknown_until_first_tick():
     est = TimeEstimator(total=10)
-    # Before any update: rate=0 -> ETA unknown sentinel
     assert est.rate == 0.0
     assert est.eta == -1.0
 
 
 def test_estimator_eta_becomes_estimable_after_first_tick():
     est = TimeEstimator(total=10)
-    # Patch the per-call dt to a known value so the EMA is deterministic.
-    # We do this by faking the monotonic clock used inside update().
+    # Fake the monotonic clock so the rate is deterministic.
     t0 = [100.0]
     with patch("falkordb_harness.progress_eta.time.monotonic", side_effect=lambda: t0[0]):
-        est._last_time = 100.0
         est.start_time = 100.0
         t0[0] = 101.0  # advance 1s
         est.update(1)  # rate ~1 it/s
-    assert est.rate > 0
-    assert est.eta >= 0
-    # remaining 9 / rate ~1 -> ETA ~9s (within a tolerance)
-    assert 8.0 <= est.eta <= 10.0
+        assert est.rate > 0
+        assert est.eta >= 0
+        # remaining 9 / rate ~1 -> ETA ~9s (within a tolerance)
+        assert 8.0 <= est.eta <= 10.0
 
 
 def test_estimator_eta_zero_when_complete():
@@ -153,25 +150,47 @@ def test_estimator_eta_zero_when_complete():
     assert est.eta == 0.0
 
 
-def test_estimator_rate_ema_smoothing():
-    """A single slow tick shouldn't dominate after several fast ones."""
+def test_estimator_rate_robust_to_concurrent_clustering():
+    """Cumulative-average rate must not saturate under clustered ticks.
+
+    ``extract_from_chunks`` runs LLM calls at bounded concurrency, so
+    completion ticks arrive in clusters: several within microseconds,
+    then a long pause. A per-tick EMA (tqdm's ``1/dt``) saturates at the
+    ``_MIN_DT`` clamp during each cluster and reports millions of it/s,
+    collapsing the ETA to 0:00. The cumulative average ``n / elapsed``
+    is immune because both ``n`` and ``elapsed`` are monotone.
+    """
+    est = TimeEstimator(total=8)
+    t0 = [0.0]
+    with patch("falkordb_harness.progress_eta.time.monotonic", side_effect=lambda: t0[0]):
+        est.start_time = 0.0
+        # Two clusters of 4 completions each (mimics concurrent LLM calls) 5s apart.
+        t0[0] = 5.0
+        est.update(4)
+        first_rate = est.rate
+        t0[0] = 10.0
+        est.update(4)
+        final_rate = est.rate
+        final_eta = est.eta
+    # True rate is 8 items / 10s = 0.8 it/s; ETA = 0/0.8 = 0 (complete).
+    # Critical: rate must NOT be in the millions (the old EMA bug).
+    assert first_rate < 1.5  # 4/5 = 0.8, not ~4e6
+    assert final_rate < 1.5  # 8/10 = 0.8, not ~4e6
+    assert final_rate > 0.5
+    assert final_eta == 0.0  # n >= total
+
+
+def test_estimator_rate_cumulative_average_matches_n_over_elapsed():
+    """``rate`` is exactly ``n / elapsed`` once elapsed > _MIN_DT."""
     est = TimeEstimator(total=100)
     t0 = [0.0]
     with patch("falkordb_harness.progress_eta.time.monotonic", side_effect=lambda: t0[0]):
-        # Baseline the estimator's clock at 0 so the fake advances from there.
         est.start_time = 0.0
-        est._last_time = 0.0
-        # First tick: 1 item in 10s -> instant rate 0.1 it/s
-        t0[0] = 10.0
-        est.update(1)
-        first_rate = est.rate
-        assert abs(first_rate - 0.1) < 1e-6
-        # Subsequent fast ticks: 1 item / 0.1s each -> instant rate 10 it/s
-        for i in range(20):
-            t0[0] += 0.1
-            est.update(1)
-    # EMA should have converged well above the initial slow rate.
-    assert est.rate > first_rate * 5
+        t0[0] = 20.0
+        est.update(5)
+        # 5 items in 20s -> 0.25 it/s; remaining 95 / 0.25 = 380s.
+        assert abs(est.rate - 0.25) < 1e-6
+        assert abs(est.eta - 380.0) < 1e-3
 
 
 def test_estimator_reset_reuses_total_when_none():
@@ -279,8 +298,9 @@ def test_render_tqdm_line_known_rate_after_tick():
     est = TimeEstimator(total=10)
     t0 = [0.0]
     with patch("falkordb_harness.progress_eta.time.monotonic", side_effect=lambda: t0[0]):
+        est.start_time = 0.0
         t0[0] = 2.0
-        est.update(4)  # 4 items in 2s -> rate ~2 it/s
+        est.update(4)  # 4 items in 2s -> rate 2 it/s
     line = _render_tqdm_line("Write", est)
     assert "it/s" in line
     assert "? it/s" not in line
@@ -456,6 +476,74 @@ def test_finalize_failed_marks_running_tasks_failed(_stub_tasklist):
     for task in tasklist.tasks:
         assert task.status == TaskStatus.FAILED
     assert tasklist.status == "Failed"
+
+
+@pytestmark_chainlit
+def test_finalize_swallows_update_exception(_stub_tasklist, monkeypatch):
+    """``finalize`` must not strand the panel if ``tasklist.update`` raises.
+
+    The cleanup runs from the ingestion caller's ``finally`` block, which
+    may execute while the on-message task is being cancelled by the
+    Chainlit stop button. A second ``CancelledError`` (or any other
+    exception from a dead socket) during the final ``tasklist.update()``
+    must be swallowed so the panel state is still flipped to a terminal
+    status in-memory.
+    """
+    set_lang("en")
+    from falkordb_harness.chainlit_progress import make_ingestion_progress
+
+    tasklist, progress, finalize = asyncio.run(make_ingestion_progress())
+
+    async def _boom():
+        raise RuntimeError("socket gone")
+
+    monkeypatch.setattr(tasklist, "update", _boom)
+
+    async def _run():
+        await progress("Extracting…", {"kind": "stage_start",
+                                       "stage": "extract", "total": 4})
+        await finalize(True)
+
+    # Should not raise despite the failing update.
+    asyncio.run(_run())
+    from chainlit.element import TaskStatus
+
+    # In-memory state still flipped to terminal.
+    assert tasklist.status == "Done"
+    for task in tasklist.tasks:
+        assert task.status == TaskStatus.DONE
+
+
+def test_ingestion_finalize_called_on_cancellation():
+    """The ingest-tools ``try/finally`` must call ``finalize`` on CancelledError.
+
+    ``CancelledError`` inherits from ``BaseException`` (Python 3.8+), so a
+    plain ``except Exception`` would skip cleanup and leave the TaskList
+    pinned at "Running" when the user hits the Chainlit stop button. This
+    test exercises the structural pattern used by ``_extract_and_write_impl``
+    (``try/finally`` with a ``success`` flag) to confirm finalize fires.
+    """
+    finalized = []
+
+    async def fake_run_ingestion(*args, **kwargs):
+        raise asyncio.CancelledError()
+
+    async def finalize(success):
+        finalized.append(success)
+
+    async def _extract_and_write_impl_shape():
+        success = False
+        try:
+            await fake_run_ingestion()
+            success = True
+            return "ok"
+        finally:
+            if finalize is not None:
+                await finalize(success)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(_extract_and_write_impl_shape())
+    assert finalized == [False]
 
 
 # ---------------------------------------------------------------------------

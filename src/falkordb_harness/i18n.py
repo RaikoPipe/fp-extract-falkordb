@@ -321,6 +321,22 @@ STRINGS: dict[str, dict[str, str]] = {
         "en": "Tool calls ({n})",
         "de": "Tool-Aufrufe ({n})",
     },
+    # Same-tool chain aggregate step: "<tool> x N" header + per-call I/O headings.
+    "tools.chain.header": {
+        "en": "{tool} x {n}",
+        "de": "{tool} x {n}",
+    },
+    "tools.chain.call_input": {
+        "en": "### Call {n} input",
+        "de": "### Aufruf {n} Eingabe",
+    },
+    "tools.chain.call_output": {
+        "en": "### Call {n} output",
+        "de": "### Aufruf {n} Ausgabe",
+    },
+
+    # --- Thinking step (chainlit_app.py on_message) -----------------------
+    "thinking.label": {"en": "Thinking", "de": "Nachdenken"},
 
     # --- Recursion / error messages (chainlit_app.py on_message) ---------
     "error.recursion": {
@@ -350,6 +366,34 @@ STRINGS: dict[str, dict[str, str]] = {
     # sidebar.open_button.* entries are needed here. The DocumentManager
     # sidebar content itself is driven by _build_document_manager_props,
     # whose labels come from the doc.action.* keys below.
+
+    # --- Task sidebar (public/tasks_toggle.js) ------------------------------
+    # The toggle button does its own localization via <html lang>; these
+    # keys are kept for server-side reference and future i18n migration.
+    "tasks_sidebar.title": {
+        "en": "Task History",
+        "de": "Aufgabenverlauf",
+    },
+    "tasks_sidebar.toggle.open": {
+        "en": "Task History",
+        "de": "Aufgabenverlauf",
+    },
+    "tasks_sidebar.toggle.close": {
+        "en": "Close",
+        "de": "Schließen",
+    },
+    "tasks_sidebar.toggle.open_title": {
+        "en": "Open task history",
+        "de": "Aufgabenverlauf öffnen",
+    },
+    "tasks_sidebar.toggle.close_title": {
+        "en": "Close task history",
+        "de": "Aufgabenverlauf schließen",
+    },
+    "tasks_sidebar.toggle.no_tasks": {
+        "en": "No tasks yet",
+        "de": "Noch keine Aufgaben",
+    },
 
     # --- Document manager row actions (DocumentManager.jsx + callbacks) ---
     "doc.action.open.label": {"en": "Open", "de": "Öffnen"},
@@ -442,18 +486,8 @@ STRINGS: dict[str, dict[str, str]] = {
     "fmt.schema.heading.node_labels": {"en": "Node Labels", "de": "Knoten-Labels"},
     "fmt.schema.heading.rel_types": {"en": "Relationship Types", "de": "Beziehungs-Typen"},
     "fmt.schema.heading.prop_keys": {"en": "Property Keys", "de": "Eigenschafts-Schlüssel"},
-    "fmt.node_count.one": {
-        "en": "**{n}** nodes in the graph.",
-        "de": "**{n}** Knoten im Graphen.",
-    },
 
     # --- Visual elements (chainlit_elements.py) ---------------------------
-    "chart.nodes_by_label.title": {"en": "Nodes by label", "de": "Knoten nach Label"},
-    "chart.nodes_by_label.x": {"en": "Label", "de": "Label"},
-    "chart.nodes_by_label.y": {"en": "Node count", "de": "Knotenanzahl"},
-    "chart.rel_by_type.title": {"en": "Relationships by type", "de": "Beziehungen nach Typ"},
-    "chart.rel_by_type.x": {"en": "Relationship type", "de": "Beziehungstyp"},
-    "chart.rel_by_type.y": {"en": "Count", "de": "Anzahl"},
     "chart.search_scores.title": {"en": "Search relevance scores", "de": "Suchrelevanz-Scores"},
     "chart.search_scores.x": {"en": "Node", "de": "Knoten"},
     "chart.search_scores.y": {"en": "Relevance", "de": "Relevanz"},

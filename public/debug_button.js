@@ -33,11 +33,31 @@
     };
   }
 
+  // Detect Chainlit's active theme so the pill's background/border
+  // contrast with the page. See kg_badge.js#themeColors for rationale.
+  function themeColors() {
+    var html = document.documentElement;
+    var dark =
+      (html.getAttribute("data-theme") || "").toLowerCase() === "dark" ||
+      html.classList.contains("dark") ||
+      (window.matchMedia &&
+        window.matchMedia("(prefers-color-scheme: dark)").matches);
+    return dark
+      ? { bg: "rgb(30,30,30)", border: "rgb(60,60,60)" }
+      : { bg: "rgb(255,255,255)", border: "rgb(242,242,242)" };
+  }
+
   function ensureButtonContainer() {
     var existing = document.getElementById(BUTTON_ID);
-    if (existing) return existing;
+    if (existing) {
+      var cc = themeColors();
+      existing.style.borderColor = cc.border;
+      existing.style.background = cc.bg;
+      return existing;
+    }
     var el = document.createElement("div");
     el.id = BUTTON_ID;
+    var c = themeColors();
     el.style.cssText = [
       "position:fixed",
       "bottom:1rem",
@@ -52,8 +72,8 @@
       "font-weight:500",
       "line-height:1",
       "white-space:nowrap",
-      "border:1px solid rgb(242,242,242)",
-      "background:rgb(255,255,255)",
+      "border:1px solid " + c.border,
+      "background:" + c.bg,
       "color:inherit",
       "cursor:pointer",
       "user-select:none",

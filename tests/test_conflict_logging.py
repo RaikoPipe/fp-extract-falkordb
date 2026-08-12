@@ -65,14 +65,12 @@ def _make_backend(mode: MergeMode) -> FalkorDBBackend:
 def test_backend_write_extraction_conflict_mode_returns_conflict(monkeypatch):
     backend = _make_backend(MergeMode.CONFLICT)
 
-    # Avoid real LLM coalesce calls for M-old (existing description differs).
     async def fake_coalesce(existing, incoming, **kwargs):
         return f"{existing}\n{incoming}"
 
     monkeypatch.setattr("knowledge.falkordb_backend.coalesce_description", fake_coalesce)
 
-    # Fetch results per entity (MATCH queries). Write queries (MERGE) get an
-    # empty result — the side_effect discriminates by query prefix.
+    # side_effect discriminates fetch (MATCH) vs write (MERGE) queries.
     fetch_results = iter([
         _FakeResult([]),  # M-new: no existing node
         _FakeResult([[_FakeNode({"name": "M-old", "name_has_index": True, "description": "Old", "resource_type": "machine", "capacity": 500})]]),
@@ -96,7 +94,6 @@ def test_backend_write_extraction_conflict_mode_returns_conflict(monkeypatch):
         backend.write_extraction(graph, source="doc.docx", chunk_index=2)
     )
 
-    # M-new: 1 write; M-old: 1 write; no relationships. Total 2.
     assert statements >= 2
     assert len(conflicts) == 1
     c = conflicts[0]
@@ -105,7 +102,6 @@ def test_backend_write_extraction_conflict_mode_returns_conflict(monkeypatch):
     assert c["incoming_value"] == 600
     assert c["source"] == "doc.docx"
     assert c["chunk_index"] == 2
-    # New: stable id + resolved flag.
     assert c["id"] == f"capacity:{c['detected_at']}"
     assert c["resolved"] is False
     assert reconciliations == []
@@ -114,7 +110,6 @@ def test_backend_write_extraction_conflict_mode_returns_conflict(monkeypatch):
 def test_backend_write_extraction_no_conflicts_returns_empty(tmp_path):
     backend = _make_backend(MergeMode.CONFLICT)
 
-    # Node exists with identical values -> no conflict.
     fetch_results = iter([
         _FakeResult([[_FakeNode({"name": "M-1", "name_has_index": True, "description": "M1", "resource_type": "machine", "capacity": 500})]]),
     ])
@@ -141,7 +136,6 @@ def test_backend_write_extraction_no_conflicts_returns_empty(tmp_path):
 def test_backend_write_extraction_overwrite_mode_returns_no_conflicts(tmp_path):
     backend = _make_backend(MergeMode.OVERWRITE)
 
-    # Overwrite mode calls extraction_to_cypher -> one MERGE per entity.
     backend._graph.query.return_value = _FakeResult([])
 
     graph = FactoryPlanningGraph(

@@ -129,6 +129,45 @@ def _action(callback_name: str, row_id: str):
     return Action(name=callback_name, payload={"id": row_id})
 
 
+def _resolve_doc_id(registry, ingestion_id: str, *, name: str) -> str:
+    """Translate a register_ingested return value (ingestion-row id) to the
+    documents-row id the action callbacks expect.
+
+    Under the v1 schema ``register_ingested`` returns the
+    ``document_ingestions.id``, not the documents-row id. The action
+    callbacks fetch the row via ``document_registry.get(id)`` (which
+    reads the documents table), so tests must pass the documents id.
+    """
+    from sqlalchemy import text
+
+    async def _fetch():
+        async with registry._engine().connect() as conn:
+            row = (
+                await conn.execute(
+                    text(
+                        'SELECT "documentId" FROM document_ingestions '
+                        'WHERE "id" = :id LIMIT 1'
+                    ),
+                    {"id": ingestion_id},
+                )
+            ).fetchone()
+            if row is None:
+                # fallback: look the document up by name
+                row = (
+                    await conn.execute(
+                        text(
+                            'SELECT "id" FROM documents WHERE "name" = :n '
+                            "LIMIT 1"
+                        ),
+                        {"n": name},
+                    )
+                ).fetchone()
+                return row[0] if row else None
+            return row[0]
+
+    return _run(_fetch())
+
+
 # ---------------------------------------------------------------------------
 # on_delete_document
 # ---------------------------------------------------------------------------
@@ -143,6 +182,7 @@ def test_on_delete_document_removes_uploaded_row(tmp_registry, tmp_path, monkeyp
     )
     session, recorder = _install_cl_stubs(monkeypatch)
     session.set("uploaded_files", [f])  # simulate the Ingest button target list
+    refresh_calls = _stub_refresh_sidebar(monkeypatch)
 
     import falkordb_harness.chainlit_app as app
 
@@ -150,27 +190,27 @@ def test_on_delete_document_removes_uploaded_row(tmp_registry, tmp_path, monkeyp
 
     assert _run(tmp_registry.get(rid)) is None  # row gone
     assert not f.exists()  # on-disk file unlinked
-    # uploaded_files trimmed
     assert session.get("uploaded_files") == []
-    # a confirmation message was sent
     assert any("Deleted" in m["content"] for m in recorder.sent)
+    assert refresh_calls == []
 
 
 def test_on_delete_document_ingested_row_not_deletable(tmp_registry, monkeypatch):
+    # Under the v1 schema, register_ingested returns the ingestion-row id;
+    # resolve the documents-row id so the action callback can fetch it.
     rid = _run(
         tmp_registry.register_ingested(
             graph_name="g1", user_identifier="u1", name="a.md", source="a.md",
         )
     )
+    doc_id = _resolve_doc_id(tmp_registry, rid, name="a.md")
     _session, recorder = _install_cl_stubs(monkeypatch)
 
     import falkordb_harness.chainlit_app as app
 
-    _run(app.on_delete_document(_action("delete_document", rid)))
+    _run(app.on_delete_document(_action("delete_document", doc_id)))
 
-    # row still present
-    assert _run(tmp_registry.get(rid)) is not None
-    # a "not deletable" message was sent
+    assert _run(tmp_registry.get(doc_id)) is not None
     assert any("permanent" in m["content"] for m in recorder.sent)
 
 
@@ -197,8 +237,8 @@ def test_on_preprocess_document_runs_docprep_and_registers(tmp_registry, tmp_pat
         )
     )
     _session, recorder = _install_cl_stubs(monkeypatch)
+    refresh_calls = _stub_refresh_sidebar(monkeypatch)
 
-    # Mock _preprocess_document_impl so no docprep/VLM call is made.
     out_md = tmp_path / "preprocessed" / "scan.md"
     out_md.parent.mkdir(parents=True)
     out_md.write_text("# converted\n", encoding="utf-8")
@@ -218,26 +258,20 @@ def test_on_preprocess_document_runs_docprep_and_registers(tmp_registry, tmp_pat
         pt, "_preprocess_document_impl",
         lambda path, yaml_path, overwrite: fake_result,
     )
-    # The callback imports the impl lazily via module attribute lookup, so
-    # also patch the chainlit_app module's reference path by ensuring the
-    # lazy import resolves to the patched module. The callback does:
-    #   from falkordb_harness.tools.preprocess_tools import _preprocess_document_impl
-    # which re-reads the module attribute at call time → patched value wins.
+    # Patch the module attribute the callback lazy-imports at call time.
 
     _run(app.on_preprocess_document(_action("preprocess_document_action", rid)))
 
-    # A preprocessed row was registered for the thread.
     docs = _run(tmp_registry.list_for_thread("t1"))
-    stages = {d["stage"] for d in docs}
-    assert "preprocessed" in stages
-    # A "done" message was sent.
+    assert any(d.get("preprocessedPath") for d in docs)
     assert any("Preprocessed" in m["content"] for m in recorder.sent)
+    assert refresh_calls == []
 
 
 def test_on_preprocess_document_wrong_stage_rejected(tmp_registry, monkeypatch):
     rid = _run(
         tmp_registry.register_preprocessed(
-            thread_id="t1", user_identifier="u1", name="a.md",
+            thread_id="t1", user_identifier="u1", name="a.pdf",
             original_path="/o/a.pdf", preprocessed_path="/p/a.md",
         )
     )
@@ -291,11 +325,12 @@ def test_on_open_document_ingested_hint(tmp_registry, monkeypatch):
             graph_name="g1", user_identifier="u1", name="a.md", source="a.md",
         )
     )
+    doc_id = _resolve_doc_id(tmp_registry, rid, name="a.md")
     _session, recorder = _install_cl_stubs(monkeypatch)
 
     import falkordb_harness.chainlit_app as app
 
-    _run_with_ctx(app.on_open_document(_action("open_document", rid)))
+    _run_with_ctx(app.on_open_document(_action("open_document", doc_id)))
     assert any("knowledge graph" in m["content"].lower() for m in recorder.sent)
 
 
@@ -437,4 +472,108 @@ def test_on_chat_start_does_not_send_open_docs_button(monkeypatch):
     )
     assert "OpenDocsButton" not in cleaned, (
         "on_chat_start must not reference the removed OpenDocsButton CustomElement"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sidebar must NOT auto-open from any behavioral flow
+# ---------------------------------------------------------------------------
+# The sidebar opens only on an explicit user click of the floating toggle
+# button (public/docs_toggle.js → on_window_message → _refresh_sidebar).
+# All other flows (chat start / resume / settings update / upload /
+# ingestion / preprocessing / deletion / tool-end) must NOT call
+# _refresh_sidebar — they mutate the registry in place, and the toggle's
+# open path re-reads current data.
+#
+# Asserted at the source level so the tests run without invoking the full
+# Chainlit handler machinery (which would need a live Chainlit session).
+
+def _clean_source(src: str) -> str:
+    """Strip comments + docstrings so only executable statements remain."""
+    import re
+
+    cleaned = re.sub(r"#.*", "", src)
+    cleaned = re.sub(r'""".*?"""', "", cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r"'''.*?'''", "", cleaned, flags=re.DOTALL)
+    return cleaned
+
+
+def test_on_chat_start_does_not_refresh_sidebar():
+    """on_chat_start must not call _refresh_sidebar (no auto-open on new chat)."""
+    import inspect
+
+    import falkordb_harness.chainlit_app as app
+
+    cleaned = _clean_source(inspect.getsource(app.on_chat_start))
+    assert "_refresh_sidebar" not in cleaned, (
+        "on_chat_start must not call _refresh_sidebar — the sidebar opens "
+        "only on explicit user click of the floating toggle button"
+    )
+
+
+def test_on_chat_resume_does_not_refresh_sidebar():
+    """on_chat_resume must not call _refresh_sidebar (no auto-open on resume)."""
+    import inspect
+
+    import falkordb_harness.chainlit_app as app
+
+    cleaned = _clean_source(inspect.getsource(app.on_chat_resume))
+    assert "_refresh_sidebar" not in cleaned, (
+        "on_chat_resume must not call _refresh_sidebar — the sidebar opens "
+        "only on explicit user click of the floating toggle button"
+    )
+
+
+def test_on_settings_update_does_not_refresh_sidebar():
+    """on_settings_update must not call _refresh_sidebar (no auto-open on graph switch)."""
+    import inspect
+
+    import falkordb_harness.chainlit_app as app
+
+    cleaned = _clean_source(inspect.getsource(app.on_settings_update))
+    assert "_refresh_sidebar" not in cleaned, (
+        "on_settings_update must not call _refresh_sidebar — the sidebar "
+        "opens only on explicit user click of the floating toggle button"
+    )
+
+
+def test_on_ingest_documents_does_not_refresh_sidebar():
+    """on_ingest_documents must not call _refresh_sidebar (no auto-open after ingest)."""
+    import inspect
+
+    import falkordb_harness.chainlit_app as app
+
+    cleaned = _clean_source(inspect.getsource(app.on_ingest_documents))
+    assert "_refresh_sidebar" not in cleaned, (
+        "on_ingest_documents must not call _refresh_sidebar — the sidebar "
+        "opens only on explicit user click of the floating toggle button"
+    )
+
+
+def test_on_message_does_not_refresh_sidebar():
+    """on_message must not call _refresh_sidebar (no auto-open on upload or tool-end)."""
+    import inspect
+
+    import falkordb_harness.chainlit_app as app
+
+    cleaned = _clean_source(inspect.getsource(app.on_message))
+    assert "_refresh_sidebar" not in cleaned, (
+        "on_message must not call _refresh_sidebar — the sidebar opens "
+        "only on explicit user click of the floating toggle button "
+        "(upload, preprocess_document, extract_and_write, reset_graph all "
+        "mutate the registry in place; the toggle re-reads it on open)"
+    )
+
+
+def test_on_window_message_still_refreshes_sidebar():
+    """on_window_message (the floating toggle's open path) MUST still call
+    _refresh_sidebar — this is the sole legitimate caller."""
+    import inspect
+
+    import falkordb_harness.chainlit_app as app
+
+    cleaned = _clean_source(inspect.getsource(app.on_window_message))
+    assert "_refresh_sidebar" in cleaned, (
+        "on_window_message must call _refresh_sidebar — it is the sole "
+        "legitimate entry point (the user's explicit click on the toggle)"
     )

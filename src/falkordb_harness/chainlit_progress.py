@@ -26,8 +26,9 @@ This mirrors the tqdm display: the elapsed time starts at the first tick
 (:meth:`TimeEstimator.reset` is called on the first ``progress`` event for a
 stage, not at ``stage_start`` — the gap between ``stage_start`` and the first
 chunk completing is setup, not extraction, and we don't want it inflating
-the ETA). The ETA uses a smoothed EMA rate (see :mod:`progress_eta`) so a
-single slow chunk doesn't blow up the estimate.
+the ETA). The ETA uses the cumulative-average rate ``n / elapsed`` (see
+:mod:`progress_eta`), which is stable under the clustered-completion pattern
+of concurrent extraction where a per-tick EMA would saturate.
 """
 
 from __future__ import annotations
@@ -153,17 +154,11 @@ async def make_ingestion_progress() -> (
             task = stage_tasks.get(stage)
             if task:
                 task.status = TaskStatus.DONE
-                # Drop the tqdm decoration on completion and restore the
-                # plain base title so the finished row reads cleanly
-                # (e.g. "LLM entity extraction" instead of the last tick's
-                # "12/40  30%  …"). The stage_end label from the runner
-                # already carries the final totals in chat.
+                # Restore the plain base title (drops the last tqdm tick line).
                 base = stage_base_titles.get(stage)
                 if base is not None:
                     task.title = base
                 await tasklist.update()
-            # Stop the estimator clock for this stage so any later stray
-            # tick doesn't restart it.
             stage_estimators.pop(stage, None)
         elif kind == "file_start" and fname:
             await _get_stage_task(stage)
@@ -201,45 +196,28 @@ async def make_ingestion_progress() -> (
             await tasklist.add_task(err_task)
             await tasklist.update()
         elif kind == "progress":
-            # Granular within-stage tick (extract / write). Feed the
-            # per-stage estimator and rewrite the stage task's title with
-            # a tqdm-style line. We deliberately don't create the task
-            # here for unknown stages — ``stage_start`` always fires
-            # before the first ``progress`` tick in the current runner.
+            # Within-stage tick: feed the estimator + rewrite the title with
+            # a tqdm-style line. stage_start always fires before the first tick.
             completed = int((details or {}).get("completed", 0) or 0)
             total = int((details or {}).get("total", 0) or 0)
             task = stage_tasks.get(stage)
             if task is None:
-                # Defensive: ensure the row exists even if stage_start
-                # was missed (e.g. a future stage that emits progress
-                # without a stage_start). Keeps the panel from dropping
-                # the live counter.
                 task = await _get_stage_task(stage)
             est = stage_estimators.get(stage)
             if est is None:
                 est = TimeEstimator(total=total)
                 stage_estimators[stage] = est
             elif est.total != total and total > 0:
-                # Total can change between stage_start and the first tick
-                # (the runner learns the chunk count only after chunking
-                # finishes). Re-baseline the estimator when the real
-                # total arrives without resetting the elapsed clock.
+                # Re-baseline when the real total arrives (chunk count is
+                # unknown until chunking finishes) without resetting elapsed.
                 est.total = total
-            # Advance the estimator by the delta since the last tick
-            # (the runner sends absolute ``completed``, not a delta).
+            # ``completed`` is absolute, not a delta.
             delta = completed - est.n
             if delta > 0:
                 est.update(delta)
             base = stage_base_titles.get(stage, stage)
             task.title = _render_tqdm_line(base, est)
             await tasklist.update()
-        # ``graph_updated``: emitted by ``ingest_runner`` after each
-        # successful ``write_extraction``. The TaskList progress panel ignores
-        # it — the consumer is the polling GraphView panel
-        # (public/graph_view.js).
-        elif kind == "graph_updated":
-            pass
-        # info events: no task change; the label still surfaces in chat if needed.
 
     async def finalize(success: bool) -> None:
         final_status = TaskStatus.DONE if success else TaskStatus.FAILED
@@ -250,7 +228,13 @@ async def make_ingestion_progress() -> (
             if task.status == TaskStatus.RUNNING:
                 task.status = final_status
         tasklist.status = "Done" if success else "Failed"
-        await tasklist.update()
+        # ``finalize`` runs from a ``finally``; a sibling CancelledError can
+        # land during the await (Chainlit stop). Guard the emit so the panel
+        # still flips to a terminal status.
+        try:
+            await tasklist.update()
+        except Exception as exc:  # noqa: BLE001 — never strand the panel
+            logger.warning("ingest progress finalize update failed: %s", exc)
 
     return tasklist, progress, finalize
 

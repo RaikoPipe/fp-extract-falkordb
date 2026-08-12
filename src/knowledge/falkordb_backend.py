@@ -57,7 +57,7 @@ _DEFAULT_RECONCILIATIONS_LOG = "./data/reconciliations.jsonl"
 _DEFAULT_RECON_COSINE_CUTOFF = 0.40
 _DEFAULT_RECON_CONFIDENCE_THRESHOLD = 0.90
 _DEFAULT_RECON_TOP_K = 10
-_DEFAULT_RECON_ENABLED = False
+_DEFAULT_RECON_ENABLED = True
 
 
 def _is_index_already_exists_error(exc: Exception) -> bool:
@@ -391,8 +391,6 @@ class FalkorDBBackend:
             graph, self._merge_mode, source=source, chunk_index=chunk_index
         )
 
-        # Per-entity pass: fetch → coalesce → embed → write → maybe reconcile.
-        # Both modes share this shape; only the write builder differs.
         for entity, label in _iter_entities(graph):
             fetch_q, fetch_p = model_to_cypher_fetch(entity, label)
             existing_props = self._fetch_node_props(fetch_q, fetch_p)
@@ -442,7 +440,6 @@ class FalkorDBBackend:
                 if recon_record:
                     all_reconciliations.append(recon_record)
 
-        # Relationship pass.
         for query, params in rel_statements:
             self._query(query, params)
             statements_run += 1
@@ -704,6 +701,164 @@ class FalkorDBBackend:
                 if hasattr(stats, key):
                     return int(getattr(stats, key) or 0)
         return 0
+
+    def resolve_duplicate(self, plain_name: str, action: str) -> dict[str, Any]:
+        """Resolve a POSSIBLE_DUPLICATE_OF link for a plain-name Resource.
+
+        ``action`` is one of:
+        - ``"accept"`` — merge the plain node into the indexed node: transfer
+          outgoing relationships, copy missing properties, record conflicting
+          properties in ``n.conflicts``, then delete the plain node.
+        - ``"reject"`` — dismiss the link (delete edge, clean up
+          canonical_name/aliases). The two nodes remain separate.
+        - ``"keep_separate"`` — same graph operation as reject; the user
+          acknowledges the suggestion but considers the entities distinct.
+
+        Returns a dict with ``action``, ``plain_name``, ``indexed_name``,
+        ``merged`` (bool), ``relationships_transferred``, and
+        ``conflicts_created``.
+        """
+        if action not in ("accept", "reject", "keep_separate"):
+            return {
+                "error": f"Unknown action '{action}'. Use 'accept', 'reject', or 'keep_separate'.",
+                "plain_name": plain_name,
+            }
+
+        # Look up the reconciliation link.
+        cypher = (
+            "MATCH (a:Resource {name: $plain_name})-[r:POSSIBLE_DUPLICATE_OF]->(b:Resource) "
+            "RETURN b.name AS indexed_name"
+        )
+        result = self._query(cypher, {"plain_name": plain_name})
+        rows = result.result_set if result.result_set else []
+        if not rows:
+            return {
+                "error": f"No POSSIBLE_DUPLICATE_OF link found for '{plain_name}'.",
+                "plain_name": plain_name,
+            }
+        indexed_name = str(rows[0][0] or "")
+
+        if action in ("reject", "keep_separate"):
+            self.clear_reconciliations(plain_name=plain_name)
+            return {
+                "action": action,
+                "plain_name": plain_name,
+                "indexed_name": indexed_name,
+                "merged": False,
+                "relationships_transferred": 0,
+                "conflicts_created": 0,
+            }
+
+        # --- accept: merge plain node into indexed node ---
+
+        rel_cypher = (
+            "MATCH (a:Resource {name: $plain_name})-[r]->(t) "
+            "WHERE type(r) <> 'POSSIBLE_DUPLICATE_OF' "
+            "RETURN type(r) AS rel_type, t.name AS target_name, labels(t) AS target_labels"
+        )
+        rel_result = self._query(rel_cypher, {"plain_name": plain_name})
+        rels = []
+        for row in rel_result.result_set or []:
+            rels.append({
+                "rel_type": str(row[0] or ""),
+                "target_name": str(row[1] or ""),
+                "target_labels": list(row[2]) if row[2] else [],
+            })
+
+        transferred = 0
+        for rel in rels:
+            target_labels = rel["target_labels"]
+            if not target_labels:
+                continue
+            target_label = target_labels[0]
+            merge_rel = (
+                f"MATCH (src:Resource {{name: $indexed_name}}) "
+                f"MATCH (tgt:{target_label} {{name: $target_name}}) "
+                f"MERGE (src)-[r:{rel['rel_type']}]->(tgt)"
+            )
+            self._query(merge_rel, {
+                "indexed_name": indexed_name,
+                "target_name": rel["target_name"],
+            })
+            transferred += 1
+
+        fetch_cypher = (
+            "MATCH (a:Resource {name: $plain_name}) "
+            "MATCH (b:Resource {name: $indexed_name}) "
+            "RETURN properties(a) AS plain_props, properties(b) AS indexed_props"
+        )
+        fetch_result = self._query(fetch_cypher, {
+            "plain_name": plain_name,
+            "indexed_name": indexed_name,
+        })
+        fetch_rows = fetch_result.result_set if fetch_result.result_set else []
+        if not fetch_rows:
+            return {
+                "error": "Failed to fetch node properties for merge.",
+                "plain_name": plain_name,
+                "indexed_name": indexed_name,
+            }
+        plain_props = dict(fetch_rows[0][0]) if fetch_rows[0][0] else {}
+        indexed_props = dict(fetch_rows[0][1]) if fetch_rows[0][1] else {}
+
+        skip_keys = {
+            "name", "_labels", "embedding", "conflicts",
+            "canonical_name", "aliases", "name_has_index",
+        }
+        set_parts: list[str] = []
+        set_params: dict[str, Any] = {}
+        conflicts_created = 0
+
+        for key, plain_val in plain_props.items():
+            if key in skip_keys:
+                continue
+            if plain_val is None:
+                continue
+            indexed_val = indexed_props.get(key)
+            if indexed_val is None:
+                param_key = f"p_{key}"
+                set_params[param_key] = plain_val
+                set_parts.append(f"b.{key} = ${param_key}")
+            elif indexed_val != plain_val:
+                detected_at = utc_now_iso()
+                conflict = json.dumps({
+                    "id": f"{key}:{detected_at}",
+                    "property": key,
+                    "existing_value": indexed_val,
+                    "incoming_value": plain_val,
+                    "source": "reconciliation_merge",
+                    "chunk_index": None,
+                    "detected_at": detected_at,
+                    "resolved": False,
+                })
+                c_key = f"c_{key}"
+                set_params[c_key] = conflict
+                set_parts.append(
+                    f"b.conflicts = coalesce(b.conflicts, \"[]\") + [${c_key}]"
+                )
+                conflicts_created += 1
+
+        if set_parts:
+            merge_props = (
+                f"MATCH (b:Resource {{name: $indexed_name}}) "
+                f"SET {', '.join(set_parts)}"
+            )
+            set_params["indexed_name"] = indexed_name
+            self._query(merge_props, set_params)
+
+        self._query(
+            "MATCH (a:Resource {name: $plain_name}) DETACH DELETE a",
+            {"plain_name": plain_name},
+        )
+
+        return {
+            "action": action,
+            "plain_name": plain_name,
+            "indexed_name": indexed_name,
+            "merged": True,
+            "relationships_transferred": transferred,
+            "conflicts_created": conflicts_created,
+        }
 
     def reset(self) -> None:
         """Delete all nodes and relationships."""

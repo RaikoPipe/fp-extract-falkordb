@@ -71,18 +71,14 @@ async def _create_graph_impl(name: str, description: str) -> str:
             ensure_ascii=False,
         )
     backend = get_backend()
-    # Materialize the graph on the instance (rejects duplicates).
     backend.create_graph(name)
-    # Activate it and ensure it's in the allowlist (create_graph appends).
     backend.set_active_graph(name)
-    # Seed the description row.
     try:
         from falkordb_harness.graph_descriptions import set_description
 
         await set_description(name, description)
     except Exception as exc:  # noqa: BLE001 — never block creation on desc write
         logger.warning("set_description failed for new graph %r: %s", name, exc)
-    # Persist as the user's last-used graph + update session state.
     await _persist_last_graph(name)
     _sync_session_selection(name, backend.allowed_graphs or [name])
     _set_switch_approval(name)

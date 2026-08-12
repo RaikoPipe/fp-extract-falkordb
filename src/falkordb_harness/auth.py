@@ -1136,111 +1136,6 @@ def _registration_enabled() -> bool:
 
 # --- Route registration ----------------------------------------------------
 
-def build_graph_snapshot(
-    graph_name: str | None, max_nodes: int = 500
-) -> dict[str, Any]:
-    """Build the JSON payload for the ``/api/graph-snapshot`` endpoint.
-
-    Extracted as a module-level helper so it is testable without invoking
-    ``register_routes`` (which mutates Chainlit's global router). The
-    endpoint closure is a thin auth + ``get_last_graph`` shim around this.
-
-    Args:
-        graph_name: The user's last-used graph name (or ``None``/empty when
-            unset). An empty name returns an empty snapshot.
-        max_nodes: Cap on the number of nodes serialized into the payload.
-            Larger graphs are truncated; ``stats.truncated`` reports it.
-
-    Returns:
-        A dict with ``graph``, ``nodes``, ``edges``, and ``stats`` keys
-        suitable for ``JSONResponse``. FalkorDB failures degrade to an
-        empty snapshot with ``stats.error = "graph-unavailable"`` rather
-        than raising, so the polling client keeps rendering the empty
-        state instead of surfacing a 5xx.
-    """
-    empty = {
-        "graph": "",
-        "nodes": [],
-        "edges": [],
-        "stats": {
-            "node_count": 0,
-            "edge_count": 0,
-            "label_counts": {},
-            "rel_type_counts": {},
-            "truncated": False,
-        },
-    }
-    if not graph_name:
-        return empty
-
-    try:
-        from knowledge.falkordb_backend import FalkorDBBackend
-
-        backend = FalkorDBBackend(graph_name=graph_name)
-        nodes_raw = backend.get_all_nodes()
-        edges_raw = backend.get_all_edges()
-    except Exception as exc:  # noqa: BLE001 — FalkorDB unreachable
-        logger.debug("graph-snapshot backend failed for %s: %s", graph_name, exc)
-        return {
-            "graph": graph_name,
-            "nodes": [],
-            "edges": [],
-            "stats": {
-                "node_count": 0,
-                "edge_count": 0,
-                "label_counts": {},
-                "rel_type_counts": {},
-                "truncated": False,
-                "error": "graph-unavailable",
-            },
-        }
-
-    # Cap the rendered nodes for browser friendliness. Edges are filtered
-    # to those that connect two surviving nodes; orphan edges are dropped.
-    truncated = len(nodes_raw) > max_nodes
-    capped_nodes = nodes_raw[:max_nodes]
-    surviving_names = {n.get("name") for n in capped_nodes if n.get("name")}
-
-    nodes: list[dict[str, Any]] = []
-    label_counts: dict[str, int] = {}
-    for n in capped_nodes:
-        labels = n.get("_labels") or []
-        if isinstance(labels, str):
-            labels = [labels]
-        for lbl in labels or ["(unlabeled)"]:
-            label_counts[str(lbl)] = label_counts.get(str(lbl), 0) + 1
-        # Strip the embedding (large, opaque) and the conflicts JSON list
-        # (verbose; the conflicts panel already surfaces these). Keep
-        # scalar properties for the node tooltip.
-        slim = {
-            k: v
-            for k, v in n.items()
-            if k not in ("embedding", "conflicts") and not isinstance(v, (dict, list))
-        }
-        slim["_labels"] = list(labels) if labels else []
-        nodes.append(slim)
-
-    edges: list[dict[str, Any]] = []
-    rel_type_counts: dict[str, int] = {}
-    for src, tgt, rel, _props in edges_raw:
-        if src not in surviving_names or tgt not in surviving_names:
-            continue
-        rel_type_counts[rel] = rel_type_counts.get(rel, 0) + 1
-        edges.append({"source": src, "target": tgt, "type": rel})
-
-    return {
-        "graph": graph_name,
-        "nodes": nodes,
-        "edges": edges,
-        "stats": {
-            "node_count": len(nodes_raw),
-            "edge_count": len(edges_raw),
-            "label_counts": label_counts,
-            "rel_type_counts": rel_type_counts,
-            "truncated": truncated,
-        },
-    }
-
 
 def register_routes() -> None:
     """Add the auth routes to Chainlit's FastAPI app.
@@ -1535,13 +1430,15 @@ def register_routes() -> None:
     # --- /api/docs-info -----------------------------------------------------
     # Read-only JSON endpoint consumed by the custom_js document-sidebar
     # toggle (public/docs_toggle.js) to decide whether to show the floating
-    # toggle button. Reports whether the user's last-used knowledge graph
-    # has any ingested documents — an ingested-rows proxy for "is there
-    # anything to show in the sidebar?". The endpoint runs outside any
-    # Chainlit session, so it cannot see the current thread's uploads; the
-    # sidebar already auto-opens on upload via _refresh_sidebar, so the
-    # toggle being hidden in that narrow case is acceptable. Authenticated
-    # via the Chainlit JWT cookie (same pattern as /api/graph-info).
+    # toggle button. Reports whether there is anything to show in the
+    # sidebar: ingested rows for the user's last-used knowledge graph OR
+    # any uploaded/preprocessed rows owned by the user (the latter covers
+    # the upload-but-not-ingested case, since the sidebar is no longer
+    # auto-opened on upload — only an explicit click on the toggle opens
+    # it). The endpoint runs outside any Chainlit session, so it cannot
+    # see the current thread's uploads; the user-scoped count is the proxy.
+    # Authenticated via the Chainlit JWT cookie (same pattern as
+    # /api/graph-info).
 
     async def docs_info(request: Request) -> JSONResponse:
         from chainlit.auth.cookie import get_token_from_cookies
@@ -1561,7 +1458,10 @@ def register_routes() -> None:
         if not identifier:
             return JSONResponse({"error": "unauthenticated"}, status_code=401)
         try:
-            from falkordb_harness.document_registry import list_for_graph
+            from falkordb_harness.document_registry import (
+                count_for_user,
+                list_for_graph,
+            )
             from falkordb_harness.graph_descriptions import get_last_graph
 
             last = await get_last_graph(identifier)
@@ -1574,53 +1474,16 @@ def register_routes() -> None:
                 has_documents = bool(rows)
             except Exception:  # noqa: BLE001
                 has_documents = False
+        # Also count the user's uploaded/preprocessed rows so the toggle
+        # stays visible before any ingestion has happened (the sidebar is
+        # no longer auto-opened on upload, so this endpoint is the only
+        # signal the toggle button has that there is something to show).
+        if not has_documents:
+            try:
+                has_documents = (await count_for_user(identifier)) > 0
+            except Exception:  # noqa: BLE001
+                has_documents = False
         return JSONResponse({"has_documents": has_documents})
-
-    # --- /api/graph-snapshot ------------------------------------------------
-    # Read-only JSON endpoint consumed by the custom_js GraphView panel
-    # (public/graph_view.js) to render the live graph topology. Returns the
-    # nodes + edges of the user's last-used knowledge graph, capped to keep
-    # the payload browser-friendly, plus aggregate stats (label/rel-type
-    # counts, totals) for the toolbar. Authenticated via the Chainlit JWT
-    # cookie (same pattern as /api/graph-info and /api/docs-info).
-    #
-    # Runs outside any Chainlit session, so the per-session backend
-    # contextvar is unavailable. We construct a one-shot FalkorDBBackend
-    # bound to the user's ``last_graph`` rather than calling ``get_backend()``
-    # (which would fall back to the module-level default graph, not the
-    # user's selection). The backend's connection is lazy and FalkorDB
-    # keeps the graph handle cheap to acquire, so a per-call construction
-    # is acceptable for a polled endpoint.
-
-    _GRAPH_SNAPSHOT_MAX_NODES = int(
-        os.getenv("GRAPH_SNAPSHOT_MAX_NODES", "500")
-    )
-
-    async def graph_snapshot(request: Request) -> JSONResponse:
-        from chainlit.auth.cookie import get_token_from_cookies
-        from chainlit.auth.jwt import decode_jwt, get_jwt_secret
-
-        secret = get_jwt_secret()
-        if not secret:
-            return JSONResponse({"error": "unavailable"}, status_code=503)
-        token = get_token_from_cookies(request.cookies)
-        if not token:
-            return JSONResponse({"error": "unauthenticated"}, status_code=401)
-        try:
-            user = decode_jwt(token)
-        except Exception:  # noqa: BLE001 — invalid/expired token
-            return JSONResponse({"error": "unauthenticated"}, status_code=401)
-        identifier = getattr(user, "identifier", None)
-        if not identifier:
-            return JSONResponse({"error": "unauthenticated"}, status_code=401)
-        try:
-            from falkordb_harness.graph_descriptions import get_last_graph
-
-            last = await get_last_graph(identifier)
-        except Exception:  # noqa: BLE001 — DB not ready
-            last = None
-        payload = build_graph_snapshot(last, _GRAPH_SNAPSHOT_MAX_NODES)
-        return JSONResponse(payload)
 
     # --- /api/debug-allowed --------------------------------------------------
     # Read-only JSON endpoint consumed by the custom_js debug "Run Showcase"
@@ -1664,8 +1527,6 @@ def register_routes() -> None:
     new_routes = [
         Route("/api/graph-info", endpoint=graph_info, methods=["GET"], name="graph_info"),
         Route("/api/docs-info", endpoint=docs_info, methods=["GET"], name="docs_info"),
-        Route("/api/graph-snapshot", endpoint=graph_snapshot, methods=["GET"],
-              name="graph_snapshot"),
         Route("/api/debug-allowed", endpoint=debug_allowed, methods=["GET"],
               name="debug_allowed"),
         Route("/register", endpoint=register_page, methods=["GET"], name="register_page"),

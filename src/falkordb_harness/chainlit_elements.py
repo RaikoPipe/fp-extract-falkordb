@@ -33,10 +33,7 @@ _MAX_DF_ROWS = 200
 # list_nodes/list_edges/search are dicts).
 _DF_TOOLS: frozenset[str] = frozenset(
     {
-        "list_nodes",
-        "list_edges",
-        "fulltext_search",
-        "vector_search",
+        "search",
     }
 )
 
@@ -75,8 +72,8 @@ def _flatten_record(rec: dict) -> dict:
 def build_result_dataframe(tool_name: str, raw_output: Any):
     """Return a ``cl.Dataframe`` for tabular tool results, or ``None``.
 
-    Handles ``list_nodes`` / ``list_edges`` / ``fulltext_search`` /
-    ``vector_search`` (and best-effort ``cypher_query`` when rows are dicts).
+    Handles ``search`` (and best-effort
+    ``cypher_query`` when rows are dicts).
     Returns ``None`` if pandas is unavailable or the output isn't a list
     of record dicts, so the caller falls back to the Markdown table.
     """
@@ -113,89 +110,6 @@ def build_result_dataframe(tool_name: str, raw_output: Any):
         data=df,
         display="inline",
     )
-
-
-def _label_counts_from_nodes(nodes: list[dict]) -> dict[str, int]:
-    """Return ``{label: count}`` from get_all_nodes() output."""
-    counts: dict[str, int] = {}
-    for n in nodes:
-        labels = n.get("_labels") or n.get("labels") or []
-        if isinstance(labels, str):
-            labels = [labels]
-        for lbl in labels or ["(unlabeled)"]:
-            counts[str(lbl)] = counts.get(str(lbl), 0) + 1
-    return counts
-
-
-def _rel_type_counts_from_edges(edges: list) -> dict[str, int]:
-    """Return ``{rel_type: count}`` from get_all_edges() tuples/lists."""
-    counts: dict[str, int] = {}
-    for e in edges:
-        # get_all_edges returns tuples (src, tgt, rel, props); list_edges
-        # tool wraps them into dicts with a "type" key.
-        if isinstance(e, dict):
-            rel = str(e.get("type", ""))
-        elif len(e) >= 3:
-            rel = str(e[2])
-        else:
-            continue
-        counts[rel] = counts.get(rel, 0) + 1
-    return counts
-
-
-def build_label_distribution_plot(raw_output: str):
-    """Bar chart of node counts by label (from ``list_nodes`` output)."""
-    return _build_count_plot(
-        raw_output,
-        _label_counts_from_nodes,
-        title=t("chart.nodes_by_label.title"),
-        x_title=t("chart.nodes_by_label.x"),
-        y_title=t("chart.nodes_by_label.y"),
-        name="node_label_distribution",
-    )
-
-
-def build_rel_distribution_plot(raw_output: str):
-    """Bar chart of relationship counts by type (from ``list_edges`` output)."""
-    return _build_count_plot(
-        raw_output,
-        _rel_type_counts_from_edges,
-        title=t("chart.rel_by_type.title"),
-        x_title=t("chart.rel_by_type.x"),
-        y_title=t("chart.rel_by_type.y"),
-        name="rel_type_distribution",
-    )
-
-
-def _build_count_plot(raw_output: str, extractor, *, title, x_title, y_title, name):
-    """Build a Plotly bar chart from a counts dict extracted via ``extractor``."""
-    try:
-        import plotly.graph_objects as go
-    except ImportError:
-        return None
-    data = _try_parse_json(raw_output if isinstance(raw_output, str) else str(raw_output))
-    if not isinstance(data, list) or not data:
-        return None
-    counts = extractor(data)
-    if not counts:
-        return None
-    labels = list(counts.keys())
-    values = [counts[k] for k in labels]
-    fig = go.Figure(
-        data=[go.Bar(x=labels, y=values, marker_color="#6366f1")],
-        layout={
-            "title": title,
-            "xaxis": {"title": x_title, "tickangle": -30},
-            "yaxis": {"title": y_title, "dtick": 1},
-            "margin": {"l": 40, "r": 20, "t": 40, "b": 60},
-            "height": 320,
-        },
-    )
-    try:
-        import chainlit as cl
-    except ImportError:
-        return None
-    return cl.Plotly(name=name, figure=fig, display="inline", size="medium")
 
 
 def build_search_score_plot(raw_output: str, *, metric: str = "score"):
@@ -452,81 +366,8 @@ def _safe_resolve(data_dir: Path, virtual: str) -> Path | None:
     return candidate
 
 
-def build_graph_view_element(raw_output: Any, *, lang: str = "de", max_nodes: int = 500):
-    """Return a ``cl.CustomElement`` (GraphView) for the post-ingestion snapshot.
-
-    Called from :func:`chainlit_app._collect_visual_elements` after the
-    ``extract_and_write`` tool (and the Ingest action button path) so the
-    user gets a persistent, scroll-back-able record of the post-ingestion
-    topology pinned to the assistant message. The live floating panel
-    (public/graph_view.js) is the real-time view; this element is the
-    snapshot attached to the message.
-
-    Parses the tool's JSON output for the active ``graph_name`` (the
-    ``run_ingestion`` summary carries ``nodes_in_graph`` but not the name;
-    we fall back to the session backend's ``graph_name`` via
-    :func:`backend.get_backend` when available, and finally to the
-    ``extract_and_write`` summary's ``merge_mode`` as a presence signal).
-
-    Returns ``None`` when chainlit is unavailable, the output shape is
-    unsuitable, or the snapshot build fails — the caller falls back to the
-    existing Plotly summary chart.
-    """
-    try:
-        import chainlit as cl
-    except ImportError:
-        return None
-
-    data = _try_parse_json(raw_output if isinstance(raw_output, str) else str(raw_output))
-    if not isinstance(data, dict):
-        return None
-    # Only attach when the ingestion actually wrote something. An empty
-    # run (no files / no extractions) leaves the snapshot out so the chat
-    # doesn't get a redundant empty canvas.
-    stmts = data.get("cypher_statements", 0)
-    nodes_in_graph = data.get("nodes_in_graph", 0)
-    if not stmts and not nodes_in_graph:
-        return None
-
-    # Resolve the active graph name. The run_ingestion summary doesn't
-    # carry it; prefer the session backend, then the module-level default.
-    graph_name = ""
-    try:
-        from falkordb_harness.backend import get_backend
-
-        graph_name = get_backend().graph_name
-    except Exception:  # noqa: BLE001 — non-UI / CLI path has no backend
-        graph_name = ""
-
-    from falkordb_harness.auth import build_graph_snapshot
-
-    snapshot = build_graph_snapshot(graph_name, max_nodes=max_nodes)
-    # Skip when the snapshot is empty (graph unreachable / unset) — the
-    # Plotly summary chart already covers the "ingestion ran" message.
-    if not snapshot.get("nodes"):
-        return None
-
-    title = t("chart.ingestion_summary.title")  # reuse the ingestion title key
-    props = {
-        "graph": snapshot.get("graph", graph_name),
-        "nodes": snapshot.get("nodes", []),
-        "edges": snapshot.get("edges", []),
-        "stats": snapshot.get("stats", {}),
-        "lang": lang,
-        "title": title,
-    }
-    try:
-        return cl.CustomElement(name="GraphView", props=props)
-    except Exception as exc:  # noqa: BLE001 — CustomElement may be unavailable
-        logger.debug("GraphView CustomElement build failed: %s", exc)
-        return None
-
-
 __all__ = [
-    "build_graph_view_element",
     "build_ingestion_summary_plot",
-    "build_label_distribution_plot",
-    "build_rel_distribution_plot",
     "build_result_dataframe",
     "build_search_score_plot",
     "build_source_elements",

@@ -59,13 +59,11 @@ def _trailing_repeat_count(messages: list[Any]) -> int:
     calls = getattr(last_ai, "tool_calls", None) or []
     if not calls:
         return 0
-    # Only consider single-tool AIMessages for the repeat pattern; multi-tool
-    # messages are ambiguous so we fall back to the first call's key.
+    # Single-tool AIMessages only; multi-tool is ambiguous → first call's key.
     key = _tool_call_key(calls[0]["name"], calls[0].get("args", {}))
     count = 1
-    # Walk backwards over preceding (AIMessage, ToolMessage) pairs. The tail
-    # pair is (messages[-2], messages[-1]); the previous pair is
-    # (messages[-4], messages[-3]), so step by 2 starting at len-4.
+    # Walk backwards over (AIMessage, ToolMessage) pairs: tail pair is
+    # (messages[-2], messages[-1]), so step by 2 from len-4.
     i = len(messages) - 4
     while i >= 0:
         ai = messages[i]

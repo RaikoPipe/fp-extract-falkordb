@@ -141,7 +141,6 @@ def test_set_lang_rejects_unknown_language():
 
 
 def test_lang_name_in_german():
-    # Default lang is de, so the display name is German
     assert lang_name("de") == "Deutsch"
     assert lang_name("en") == "Englisch"
 
@@ -166,9 +165,9 @@ def test_starter_message_roundtrip_both_langs():
 
 
 def test_chart_titles_localize():
-    assert t("chart.nodes_by_label.title") == "Knoten nach Label"
+    assert t("chart.search_scores.title") == "Suchrelevanz-Scores"
     set_lang("en")
-    assert t("chart.nodes_by_label.title") == "Nodes by label"
+    assert t("chart.search_scores.title") == "Search relevance scores"
 
 
 def test_error_recursion_message_both_langs():
@@ -197,11 +196,6 @@ def test_settings_create_success_formats_allowed_list():
     )
     assert "`orders_v2`" in msg
     assert "factory_planning" in msg
-
-
-# ---------------------------------------------------------------------------
-# Removed Language-tab settings keys (browser-driven language, no switcher)
-# ---------------------------------------------------------------------------
 
 
 def test_language_tab_keys_removed():

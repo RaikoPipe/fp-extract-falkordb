@@ -70,12 +70,25 @@ python scripts/ingest.py --recon-posthoc      # reconcile plain names added befo
 - The agent's virtual filesystem is rooted at `DATA_DIR` (`FilesystemBackend(virtual_mode=True)`), so `ls`/`read_file`/`glob`/`grep` plus the custom `file_metadata`/`read_excerpt` tools see real `originals/` and `preprocessed/` trees with path-traversal containment.
 - Per-session graph selection (Chainlit): `config["configurable"]["active_graph"]` + `["allowed_graphs"]` install a session-scoped `FalkorDBBackend`. The CLI / `langgraph dev` path leaves these unset and uses the module-level env-driven backend cache.
 
+## Chainlit quirks
+
+- `Message.to_dict()` stores both user **and** assistant message text in the `"output"` field; `"input"` is gated on `showInput` (always empty for `user_message` steps). The SQL layer (`sql_alchemy.get_all_user_threads`) further gates `"input"` on `showInput not in {None, "false"}`, so a persisted `user_message` always returns `input=""` and `output=<text>`. Read `output` first; fall back to `input` only for legacy threads persisted the old way. See `_history_from_thread` in `chainlit_app.py`.
+- Chainlit runs each handler (`on_chat_start` / `on_settings_update` / `on_message`) in its own asyncio task, so contextvars set in one (e.g. the session backend installed by `build_agent`) do **not** survive into the next. Stash live objects in `cl.user_session` (preserved across handler tasks, keyed by session id) and re-install them at the start of each handler.
+- Sending any assistant message — even an empty one carrying only a `CustomElement` — transitions Chainlit's frontend out of the starter view into the active chat view (a regression that persisted even after modal dismissal). The document-sidebar toggle and the startup warning use `custom_js` scripts / server-rendered `/register` HTML instead, never sending a Chainlit message.
+- `ChatSettings.__init__` only accepts `inputs=` on Chainlit 2.11; the documented `tabs=` kwarg is silently dropped. Pass `Tab` objects via `inputs` (`_inputs_as_dicts` serializes them recursively).
+- `CancelledError` is a `BaseException` since Python 3.8, so `except Exception` skips cleanup. Ingestion `finalize` / `_finalize_progress` run from `finally` blocks so the progress panel still flips to a terminal status when the user hits the stop button.
+
 ## Pipeline behavior to preserve
 
 - Merge modes: `overwrite` (last-write-wins, default) vs `conflict` (first-writer-wins; disagreements stored as an in-graph `conflicts` JSON list, queryable via Cypher). Set via `MERGE_MODE` env or `--merge-mode`.
 - Reconciliation links plain-name Resources (`name_has_index=false`) to indexed ones via `POSSIBLE_DUPLICATE_OF` edges using cosine similarity (`RECON_COSINE_CUTOFF` default 0.70) + LLM pairwise confidence (`RECON_CONFIDENCE_THRESHOLD` default 0.90). Append-only audit log at `RECONCILIATIONS_LOG`; it survives `--reset`.
 - `FalkorDBBackend` connects **lazily** and reconnects on transient errors (see `test_backend_reconnect.py`). Don't add eager connection in `__init__`.
 - Preprocessing (docprep) is only for scanned/image PDFs and office files with embedded figures. Plain `.txt`/`.md`/`.csv`/`.json`/`.html` go straight into `PREPROCESSED_DIR`. `docprep.yaml` configures the VLM fallback (Docling + EasyOCR + Ollama-hosted VLM).
+
+## Data layer schema
+
+- `steps` column set must cover **every** key in `chainlit.step.StepDict`: the SQLAlchemy layer builds its INSERT column list dynamically from the StepDict keys (`sql_alchemy.create_step`), so a missing column raises `sqlite3.OperationalError` at runtime. Keep the DDL in `data_layer._DDL_STATEMENTS` in sync with `chainlit/step.py`'s `StepDict` (and the SELECT column list in `sql_alchemy.get_step` / `get_all_user_threads`).
+- Forward-only migration: `_MIGRATION_COLUMNS` lists columns that may be missing from `steps`/`elements`/`users` tables in older DBs. SQLite lacks `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, so `_migrate_columns` checks `PRAGMA table_info` and adds only what's absent. New StepDict columns added by a future Chainlit release must be added here **and** to `_DDL_STATEMENTS`.
 
 ## Docker / deployment
 

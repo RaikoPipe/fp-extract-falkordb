@@ -33,11 +33,37 @@
     };
   }
 
+  // Detect Chainlit's active theme so the pill's background/border
+  // contrast with the page. Chainlit sets <html data-theme="dark|light">
+  // (config default_theme = "dark" — see .chainlit/config.toml); fall back
+  // to the OS prefers-color-scheme media query when the attribute is absent
+  // (e.g. before the React app hydrates). The MutationObserver below
+  // re-runs renderBadge on every <html> mutation, so a theme switch is
+  // picked up without dedicated wiring.
+  function themeColors() {
+    var html = document.documentElement;
+    var dark =
+      (html.getAttribute("data-theme") || "").toLowerCase() === "dark" ||
+      html.classList.contains("dark") ||
+      (window.matchMedia &&
+        window.matchMedia("(prefers-color-scheme: dark)").matches);
+    return dark
+      ? { bg: "rgb(30,30,30)", border: "rgb(60,60,60)" }
+      : { bg: "rgb(242,242,242)", border: "rgb(242,242,242)" };
+  }
+
   function ensureBadgeContainer() {
     var existing = document.getElementById(BADGE_ID);
-    if (existing) return existing;
+    if (existing) {
+      // Re-apply theme colors so a theme switch restyles the pill in place.
+      var cc = themeColors();
+      existing.style.borderColor = cc.border;
+      existing.style.background = cc.bg;
+      return existing;
+    }
     var el = document.createElement("div");
     el.id = BADGE_ID;
+    var c = themeColors();
     el.style.cssText = [
       "position:relative",
       "display:flex",
@@ -52,8 +78,8 @@
       "max-width:340px",
       "overflow:hidden",
       "text-overflow:ellipsis",
-      "border:1px solid rgb(242,242,242)",
-      "background:rgb(242,242,242)",
+      "border:1px solid " + c.border,
+      "background:" + c.bg,
       "color:inherit",
       "cursor:pointer",
       "user-select:none",

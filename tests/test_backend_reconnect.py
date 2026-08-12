@@ -28,7 +28,6 @@ def test_backend_does_not_connect_on_construction():
         "knowledge.falkordb_backend.FalkorDB", autospec=True
     ) as fake_ctor:
         backend = FalkorDBBackend(host="h", port=6379, graph_name="g")
-        # No connection attempted yet.
         fake_ctor.assert_not_called()
         assert backend._db is None
         assert backend._graph is None
@@ -51,7 +50,6 @@ def test_get_graph_connects_lazily_on_first_use():
         fake_ctor.assert_called_once_with(host="h", port=6379)
         fake_db.select_graph.assert_called_once_with("g")
 
-        # Second call reuses the cached handle (no reconnect).
         g2 = backend._get_graph()
         assert g2 is fake_graph
         assert fake_ctor.call_count == 1
@@ -70,7 +68,6 @@ def test_query_invalidates_handle_on_transient_then_reconnects():
     with patch(
         "knowledge.falkordb_backend.FalkorDB", autospec=True
     ) as fake_ctor:
-        # Two distinct graph handles: the first dies, the second works.
         graph1 = MagicMock()
         graph1.query.side_effect = ConnectionRefusedError("redis down")
         graph2 = MagicMock()
@@ -83,12 +80,10 @@ def test_query_invalidates_handle_on_transient_then_reconnects():
 
         backend = FalkorDBBackend(host="h", port=6379, graph_name="g")
 
-        # First call raises (transient) and invalidates the handle.
         with pytest.raises(ConnectionRefusedError):
             backend._query("MATCH (n) RETURN n")
         assert backend._graph is None
 
-        # Next call reconnects (fresh FalkorDB) and succeeds.
         out = backend._query("MATCH (n) RETURN n")
         assert out.result_set == [["ok"]]
         assert fake_ctor.call_count == 2
@@ -108,7 +103,6 @@ def test_query_does_not_invalidate_on_non_transient_error():
         backend = FalkorDBBackend(host="h", port=6379, graph_name="g")
         with pytest.raises(ValueError):
             backend._query("MATCH (n) RETURN n")
-        # Handle is NOT invalidated for non-transient errors.
         assert backend._graph is graph
         assert fake_ctor.call_count == 1
 
@@ -128,7 +122,6 @@ def test_query_index_already_exists_not_treated_as_transient():
         backend = FalkorDBBackend(host="h", port=6379, graph_name="g")
         with pytest.raises(Exception, match="already exists"):
             backend._query("CALL db.idx.fulltext.createNodeIndex(...)")
-        # Handle retained; no reconnect triggered.
         assert backend._graph is graph
         assert fake_ctor.call_count == 1
 
@@ -153,7 +146,6 @@ def test_execute_routes_through_query_and_reconnects():
 
         with pytest.raises(ConnectionResetError):
             backend.execute("MATCH (n) RETURN count(n)")
-        # Retry via the retry helper would call execute again -> reconnects.
         result = backend.execute("MATCH (n) RETURN count(n)")
         assert result.result_set == [[42]]
         assert fake_ctor.call_count == 2
@@ -207,7 +199,6 @@ def test_get_backend_does_not_cache_construction_failure(monkeypatch):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("construction blew up")
-        # Second call: return a MagicMock as the backend instance.
         return MagicMock()
 
     monkeypatch.setattr(harness_backend, "FalkorDBBackend", fail_then_succeed)
@@ -215,7 +206,6 @@ def test_get_backend_does_not_cache_construction_failure(monkeypatch):
     with pytest.raises(RuntimeError, match="construction blew up"):
         harness_backend.get_backend()
 
-    # Cache was not poisoned: a fresh construction runs on the next call.
     backend = harness_backend.get_backend()
     assert backend is not None
     assert calls["n"] == 2

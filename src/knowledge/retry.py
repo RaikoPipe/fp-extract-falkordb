@@ -66,10 +66,8 @@ RETRY_MAX_DELAY = _env_float("RETRY_MAX_DELAY", 8.0)
 # ---------------------------------------------------------------------------
 # Transient-error classification
 # ---------------------------------------------------------------------------
-# Substrings in the lowercased exception message that indicate a transient
-# failure (used as a fallback when the exception type isn't a known transient
-# class, e.g. a bare ``RuntimeError("connection reset by peer")`` raised by a
-# client library that wraps the real OS error).
+# Fallback substrings for transient classification when the exception type
+# isn't a known transient class (e.g. a bare RuntimeError wrapping an OS error).
 _TRANSIENT_MESSAGE_FRAGMENTS: tuple[str, ...] = (
     "connection",
     "connection refused",
@@ -91,9 +89,8 @@ _TRANSIENT_MESSAGE_FRAGMENTS: tuple[str, ...] = (
     "deadlocked",
 )
 
-# Exception types that are always transient (checked via isinstance, so
-# subclasses are covered). Populated lazily/defensively to avoid import
-# failures when an optional dependency is absent.
+# Always-transient types (isinstance-checked; populated lazily to tolerate
+# missing optional deps).
 _ALWAYS_TRANSIENT_TYPES: tuple[type, ...] = (
     ConnectionError,
     TimeoutError,
@@ -160,7 +157,6 @@ def _collect_optional_transient_types() -> tuple[type, ...]:
     except Exception:  # pragma: no cover - import-time guard
         pass
 
-    # Deduplicate while preserving order.
     seen: set[type] = set()
     unique: list[type] = []
     for t in types:
@@ -263,7 +259,6 @@ async def retry_async(
             if on_retry is not None:
                 on_retry(attempt, exc, delay)
             await _sleep(delay)
-    # Unreachable: loop either returns or raises on the final attempt.
     assert last_exc is not None  # pragma: no cover
     raise last_exc  # pragma: no cover
 

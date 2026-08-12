@@ -2,16 +2,21 @@
 
 A small, dependency-free helper that mirrors the parts of ``tqdm`` we need
 for the Chainlit ingestion panel: track completion count against a total,
-measure elapsed wall time, and expose a smoothed iteration rate so we can
-compute a remaining-time estimate (ETA). The estimator is pure-Python and
+measure elapsed wall time, and expose an iteration rate so we can compute
+a remaining-time estimate (ETA). The estimator is pure-Python and
 synchronous; the Chainlit progress layer (``chainlit_progress.py``) calls
 into it from its async event handler.
 
-The smoothing follows tqdm's default EMA window: the instantaneous rate is
-``1 / max(dt, 1e-6)`` per item, smoothed by an exponential moving average
-with ``alpha = 1 / smooth_window`` (``smooth_window = 10`` by default). This
-keeps the ETA stable across a few slow chunks while still converging when
-the rate shifts.
+The rate is the cumulative average ``n / elapsed`` rather than a per-tick
+EMA. The ingestion pipeline extracts chunks with bounded concurrency
+(``extract_from_chunks`` runs N LLM calls in flight), so completion ticks
+arrive in clusters: several chunks finish within microseconds of each
+other, then a long pause until the next batch. A per-tick EMA (tqdm's
+``1 / dt`` formula, designed for serial iteration) saturates at the
+``_MIN_DT`` clamp during each cluster and produces rates in the millions of
+it/s, which collapses the ETA to 0:00. The cumulative average is immune to
+clustering because both ``n`` and ``elapsed`` are monotone and unaffected
+by the inter-tick gap distribution.
 """
 
 from __future__ import annotations
@@ -19,7 +24,6 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
-_SMOOTH_WINDOW = 10
 _MIN_DT = 1e-6
 
 
@@ -68,11 +72,6 @@ class TimeEstimator:
     total: int = 0
     n: int = 0
     start_time: float = field(default_factory=time.monotonic)
-    _last_time: float = field(init=False)
-    _ema_rate: float = field(init=False, default=0.0)
-
-    def __post_init__(self) -> None:
-        self._last_time = self.start_time
 
     def reset(self, total: int | None = None) -> None:
         """Reset the estimator, optionally changing the total.
@@ -84,29 +83,17 @@ class TimeEstimator:
             self.total = total
         self.n = 0
         self.start_time = time.monotonic()
-        self._last_time = self.start_time
-        self._ema_rate = 0.0
 
     def update(self, count: int = 1) -> None:
-        """Record ``count`` newly-completed items and refresh the rate EMA.
+        """Record ``count`` newly-completed items.
 
-        The EMA update is computed once per :meth:`update` call (not per
-        item), so a batched ``update(5)`` advances the EMA by one tick.
-        Multiple ticks within ``_MIN_DT`` seconds are clamped to avoid
-        division-by-zero spikes in the instantaneous rate.
+        The rate is derived from cumulative ``n`` and :attr:`elapsed`, so
+        this method only advances the counter (no per-tick rate state).
+        Batched ``update(5)`` is equivalent to five ``update(1)`` calls.
         """
         self.n += count
         if self.n < 0:
             self.n = 0
-        now = time.monotonic()
-        dt = max(now - self._last_time, _MIN_DT)
-        instant = count / dt
-        if self._ema_rate <= 0:
-            self._ema_rate = instant
-        else:
-            alpha = 1.0 / _SMOOTH_WINDOW
-            self._ema_rate = (1 - alpha) * self._ema_rate + alpha * instant
-        self._last_time = now
 
     @property
     def elapsed(self) -> float:
@@ -115,8 +102,16 @@ class TimeEstimator:
 
     @property
     def rate(self) -> float:
-        """Smoothed items-per-second rate (EMA over ``_SMOOTH_WINDOW``)."""
-        return self._ema_rate
+        """Cumulative-average items-per-second rate (``n / elapsed``).
+
+        Returns ``0.0`` before the first tick (or if fewer than
+        ``_MIN_DT`` seconds have elapsed), which the :attr:`eta` property
+        treats as the "not yet estimable" sentinel.
+        """
+        e = self.elapsed
+        if e <= _MIN_DT:
+            return 0.0
+        return self.n / e
 
     @property
     def remaining(self) -> int:
@@ -138,16 +133,18 @@ class TimeEstimator:
 
         Returns ``-1.0`` when no items have completed or the total is
         unknown / zero, matching tqdm's "unknown" sentinel. The ETA is
-        ``remaining / rate`` using the smoothed rate, which is more stable
-        than the raw instantaneous rate (especially right after the first
-        chunk when a single slow LLM call would otherwise blow up the
-        estimate).
+        ``remaining / rate`` using the cumulative-average rate, which is
+        stable under the clustered-completion pattern of concurrent
+        extraction (see module docstring).
         """
-        if self.total <= 0 or self._ema_rate <= 0:
+        if self.total <= 0:
             return -1.0
         if self.n >= self.total:
             return 0.0
-        return self.remaining / self._ema_rate
+        r = self.rate
+        if r <= 0:
+            return -1.0
+        return self.remaining / r
 
     def render(self) -> dict[str, str | float]:
         """Return a dict of display-ready fields for the UI layer.

@@ -56,7 +56,16 @@ def test_init_db_creates_all_tables(tmp_layer):
         return [r[0] for r in rows]
 
     tables = _run(fetch_tables())
-    assert set(tables) == {"documents", "elements", "feedbacks", "graph_descriptions", "steps", "threads", "users"}
+    assert set(tables) == {
+        "document_ingestions",
+        "documents",
+        "elements",
+        "feedbacks",
+        "graph_descriptions",
+        "steps",
+        "threads",
+        "users",
+    }
 
 
 def test_init_db_is_idempotent(tmp_layer):
@@ -79,7 +88,7 @@ def test_init_db_is_idempotent(tmp_layer):
         return rows
 
     tables = _run(count_tables())
-    assert len(tables) == 7  # users, threads, steps, elements, feedbacks, documents, graph_descriptions
+    assert len(tables) == 8  # users, threads, steps, elements, feedbacks, documents, document_ingestions, graph_descriptions
 
 
 def test_init_db_steps_table_has_all_stepdict_columns(tmp_layer):
@@ -235,8 +244,7 @@ def test_create_step_with_list_tags_round_trips(tmp_path, monkeypatch):
     layer = build_data_layer()
     _run(init_db(layer))
 
-    # Stub update_thread (called by create_step) — no context needed and
-    # we don't need a real thread row for the step insert to succeed.
+    # Stub update_thread (called by create_step) — no context/thread needed.
     async def _noop_update_thread(*a, **kw):
         return None
 
@@ -262,14 +270,12 @@ def test_create_step_with_list_tags_round_trips(tmp_path, monkeypatch):
         # Chainlit session context) by calling the unwrapped function.
         create_step = type(layer).create_step.__wrapped__  # type: ignore[attr-defined]
         await create_step(layer, step_dict)
-        # get_step is NOT decorated, so call it directly.
         got = await layer.get_step("s_tags")
         await layer.engine.dispose()
         return got
 
     got = _run(do_roundtrip())
     assert got is not None
-    # Read-back returns a list, not a JSON string.
     assert got["tags"] == ["Tool calls", "read_excerpt"]
 
 
@@ -280,9 +286,7 @@ def test_coerce_tags_helpers_round_trip():
     assert _coerce_tags_from_json('["a", "b"]') == ["a", "b"]
     assert _coerce_tags_to_json(None) is None
     assert _coerce_tags_from_json(None) is None
-    # Already-a-list passthrough (Postgres path).
     assert _coerce_tags_from_json(["a"]) == ["a"]
-    # Raw non-JSON string wrapped as single-element list.
     assert _coerce_tags_from_json("plain") == ["plain"]
     assert _coerce_tags_from_json("") == []
 

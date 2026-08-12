@@ -7,7 +7,7 @@ import json
 from langchain_core.tools import tool
 
 from falkordb_harness.backend import get_backend
-from falkordb_harness.tools._retry import awith_retry, with_retry
+from falkordb_harness.tools._retry import with_retry
 
 
 @tool
@@ -28,46 +28,27 @@ def _get_reconciliations_impl(label: str) -> str:
 
 
 @tool
-def clear_reconciliations(label: str = "", plain_name: str = "") -> str:
-    """Dismiss reviewed reconciliation links by deleting the edge.
+def resolve_duplicate(plain_name: str, action: str) -> str:
+    """Resolve a POSSIBLE_DUPLICATE_OF link for a plain-name Resource.
 
-    Also removes the ``canonical_name`` from the plain node and the
-    alias from the indexed node. Optionally filter by label and/or
-    plain entity name. Returns the number of edges deleted.
+    ``action`` is one of:
+    - ``"accept"`` — merge the plain node into the indexed node: transfer
+      outgoing relationships, copy missing properties, record conflicting
+      properties in ``n.conflicts`` on the surviving node, then delete the
+      plain node. Warn the user about any conflicts created.
+    - ``"reject"`` — dismiss the link (delete the edge, clean up
+      canonical_name/aliases). The two nodes remain separate.
+    - ``"keep_separate"`` — same graph operation as reject; use when the
+      user acknowledges the suggestion but considers the entities distinct.
+
+    Call ``get_reconciliations`` first to list outstanding duplicates, then
+    present each one to the user for adjudication. Never batch-accept or
+    batch-reject — walk through duplicates one at a time.
     """
-    return with_retry(lambda: _clear_reconciliations_impl(label, plain_name))
+    return with_retry(lambda: _resolve_duplicate_impl(plain_name, action))
 
 
-def _clear_reconciliations_impl(label: str, plain_name: str) -> str:
+def _resolve_duplicate_impl(plain_name: str, action: str) -> str:
     backend = get_backend()
-    count = backend.clear_reconciliations(
-        label=label or None,
-        plain_name=plain_name or None,
-    )
-    return f"{count} reconciliation link(s) deleted"
-
-
-@tool
-async def reconcile_posthoc() -> str:
-    """Run a post-hoc reconciliation pass over existing plain-name Resources.
-
-    Scans Resource nodes without a distinguishing index that do not yet have
-    a ``POSSIBLE_DUPLICATE_OF`` link, embeds each, and runs the two-stage
-    (cosine + LLM pairwise confidence) reconciliation pipeline. Writes any new
-    links to the graph and the reconciliations JSONL log.
-
-    Use this after ingesting documents whose plain-name Resources arrived
-    before their indexed counterparts. Returns the new reconciliation records.
-    """
-    return await awith_retry(lambda: _reconcile_posthoc_impl())
-
-
-async def _reconcile_posthoc_impl() -> str:
-    backend = get_backend()
-    records = await backend.reconcile_posthoc()
-    return json.dumps(
-        {"new_reconciliations": len(records), "records": records},
-        indent=2,
-        ensure_ascii=False,
-        default=str,
-    )
+    result = backend.resolve_duplicate(plain_name, action)
+    return json.dumps(result, indent=2, ensure_ascii=False, default=str)

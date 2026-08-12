@@ -61,12 +61,6 @@ _PLAIN_EXTS = {".txt", ".md", ".csv", ".json", ".html", ".py"}
 #     ``stage`` plus ``error`` message.
 #   - ``info``         : a free-form informational note (cached skips, plain
 #     text, etc.).
-#   - ``graph_updated``: emitted after each successful ``write_extraction``
-#     call during the write stage. Carries ``source``, ``chunk_index``,
-#     ``statements``, and ``nodes_in_graph`` (the post-write node count).
-#     Consumed by the polling GraphView panel (public/graph_view.js) to
-#     switch to its active refresh cadence; the TaskList progress panel
-#     treats it as a no-op.
 #
 # The UI (Chainlit ``on_ingest_documents``) interprets these to drive a live
 # ``cl.TaskList``. Callers that ignore ``details`` still get a readable
@@ -367,7 +361,7 @@ async def run_ingestion(
                     await register_preprocessed(
                         thread_id=_session_thread_id(),
                         user_identifier=_session_user_id(),
-                        name=md.name,
+                        name=src.name,
                         original_path=str(src),
                         preprocessed_path=str(md),
                     )
@@ -506,48 +500,23 @@ async def run_ingestion(
     backend = get_backend()
     total_stmts = 0
     total_conflicts = 0
+    total_reconciliations = 0
     _write_total = len(extractions)
     _write_completed = 0
-    # Track which source filenames produced at least one successful write,
-    # so we can register them as ingested in the document registry after
-    # the loop. A source maps to its staged file (original or preprocessed)
-    # via the ingest_paths list, which carries ``source = path.name`` on
-    # each chunk (see the chunk stage above).
     ingested_sources: set[str] = set()
-    # Map source name -> staged path for registry registration.
     source_to_path: dict[str, Path] = {}
     for p in ingest_paths:
         source_to_path.setdefault(p.name, p)
-    # Also map original stems so a preprocessed ``foo.md`` can be linked
-    # back to its original ``foo.pdf`` for the registry's originalPath.
     original_by_stem: dict[str, Path] = {p.stem: p for p in staged}
     for graph, source, chunk_index in extractions:
         try:
-            stmts, conflicts, _reconciliations = await backend.write_extraction(
+            stmts, conflicts, reconciliations = await backend.write_extraction(
                 graph, source=source, chunk_index=chunk_index
             )
             total_stmts += stmts
             total_conflicts += len(conflicts)
+            total_reconciliations += len(reconciliations)
             ingested_sources.add(source)
-            # Live graph-view signal: emit a ``graph_updated`` event after
-            # every successful write so the polling client (public/graph_view.js)
-            # can refresh at its active cadence. The TaskList progress panel
-            # ignores this kind (no-op branch in chainlit_progress.progress);
-            # the JS poller is the consumer. Carries the post-write node count
-            # so the panel can update its footer even between polls.
-            if progress:
-                live_nodes = backend.node_count()
-                await progress(
-                    f"Wrote `{source}` chunk {chunk_index} → {stmts} statement(s).",
-                    {
-                        "kind": "graph_updated",
-                        "stage": "write",
-                        "source": source,
-                        "chunk_index": chunk_index,
-                        "statements": stmts,
-                        "nodes_in_graph": live_nodes,
-                    },
-                )
         except Exception as exc:  # noqa: BLE001 — per-extraction resilience
             errors.append(f"Write failed for `{source}` chunk {chunk_index}: {exc}")
             logger.error("Ingestion write error for {} chunk {}: {}", source, chunk_index, exc)
@@ -568,7 +537,8 @@ async def run_ingestion(
         await progress(
             f"Wrote {total_stmts} Cypher statement(s) to graph "
             f"`{backend.graph_name}` ({nodes_in_graph} nodes now, "
-            f"{total_conflicts} conflict(s) detected).",
+            f"{total_conflicts} conflict(s), "
+            f"{total_reconciliations} potential duplicate(s) detected).",
             {
                 "kind": "stage_end",
                 "stage": "write",
@@ -576,13 +546,11 @@ async def run_ingestion(
                 "statements": total_stmts,
                 "nodes": nodes_in_graph,
                 "conflicts": total_conflicts,
+                "reconciliations": total_reconciliations,
             },
         )
 
-    # Register successfully-ingested files in the document registry. One
-    # row per source filename (deduplicated by ``(graphName, name)`` inside
-    # ``register_ingested``), scoped to the active graph. Best-effort:
-    # registry failures never break ingestion.
+    # Register ingested files in the document registry (best-effort).
     if ingested_sources:
         graph_name = backend.graph_name
         user_id = _session_user_id()
@@ -591,8 +559,7 @@ async def run_ingestion(
 
             for src_name in sorted(ingested_sources):
                 staged_path = source_to_path.get(src_name)
-                # Link back to the original (if this was a preprocessed .md)
-                # so the registry row keeps the source file's provenance.
+                # Link preprocessed .md back to its original for provenance.
                 original_path: str | None = None
                 if staged_path is not None:
                     if staged_path.suffix.lower() == ".md":
@@ -625,6 +592,7 @@ async def run_ingestion(
         "cypher_statements": total_stmts,
         "nodes_in_graph": nodes_in_graph,
         "conflicts_detected": total_conflicts,
+        "reconciliations_found": total_reconciliations,
         "merge_mode": backend.merge_mode.value,
         "errors": errors,
     }

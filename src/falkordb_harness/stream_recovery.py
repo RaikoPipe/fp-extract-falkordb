@@ -130,22 +130,14 @@ async def replay_inflight_stream(thread_id: str) -> None:
     if stream is None:
         return
 
-    # Yield so connection_successful can finish emitting resume_thread
-    # (which replaces the frontend message list) before our update
-    # lands. A single tick is sufficient because resume_thread's emit
-    # is synchronous and awaited in the same coroutine that called
-    # on_chat_resume; a short bounded sleep adds robustness against
-    # scheduling jitter without delaying the user-visible recovery.
+    # Yield so resume_thread's emit lands before our update.
     await asyncio.sleep(0.05)
 
-    # Re-fetch: the stream may have concluded during the sleep.
+    # Re-fetch; the stream may have concluded during the sleep.
     stream = get_active_stream(thread_id)
     if stream is None:
         return
     message = stream.message
-    # message.content is kept in sync with the streamed text by
-    # stream_token (self.content += token); a rebind is atomic under
-    # CPython so reading it here from a different task is safe.
     content = message.content or ""
     if not content:
         return
@@ -153,12 +145,8 @@ async def replay_inflight_stream(thread_id: str) -> None:
     try:
         import chainlit as cl
 
-        # Force streaming=True on the snapshot we emit so the frontend
-        # renders the message as an active stream (the background task
-        # will keep sending stream_token events for the same id). Then
-        # emit an update_message with the accumulated prefix; the
-        # frontend's update_message handler merges by id, replacing the
-        # empty-output placeholder rendered by resume_thread.
+        # Force streaming=True + emit update_message so the frontend merges
+        # by id, replacing the empty placeholder rendered by resume_thread.
         message.streaming = True
         step_dict = message.to_dict()
         await cl.context.emitter.update_step(step_dict)

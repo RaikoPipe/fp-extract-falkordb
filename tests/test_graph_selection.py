@@ -46,7 +46,6 @@ def test_list_graphs_calls_db_list_graphs():
 
         assert names == ["factory_planning", "orders", "legacy"]
         fake_db.list_graphs.assert_called_once()
-        # _get_db lazily connected without selecting a graph handle.
         fake_db.select_graph.assert_not_called()
 
 
@@ -63,12 +62,9 @@ def test_list_graphs_does_not_disturb_cached_graph_handle():
         fake_ctor.return_value = fake_db
 
         backend = FalkorDBBackend(host="h", port=6379, graph_name="g1")
-        # Prime the graph handle (simulates a prior query).
         assert backend._get_graph() is fake_graph
 
-        # Now list graphs.
         assert backend.list_graphs() == ["g1"]
-        # Graph handle still cached (not invalidated by the DB-level call).
         assert backend._graph is fake_graph
 
 
@@ -87,14 +83,12 @@ def test_get_db_lazily_connects_and_drops_stale_graph_handle():
         backend = FalkorDBBackend(host="h", port=6379, graph_name="g")
         assert backend._db is None
 
-        # Simulate a stale graph handle left over from an invalidated conn.
         stale_graph = MagicMock()
         backend._graph = stale_graph
 
         db = backend._get_db()
         assert db is fake_db
         fake_ctor.assert_called_once_with(host="h", port=6379)
-        # Stale handle dropped.
         assert backend._graph is None
 
 
@@ -108,7 +102,6 @@ def test_set_active_graph_switches_name_and_invalidates_handle():
         fake_db = MagicMock()
         graph1 = MagicMock()
         graph2 = MagicMock()
-        # select_graph returns graph1 first, graph2 on the second selection.
         fake_db.select_graph.side_effect = [graph1, graph2]
         fake_ctor.return_value = fake_db
 
@@ -117,16 +110,13 @@ def test_set_active_graph_switches_name_and_invalidates_handle():
             allowed_graphs=["g1", "g2"],
         )
 
-        # Prime handle for g1.
         assert backend._get_graph() is graph1
         fake_db.select_graph.assert_called_once_with("g1")
 
-        # Switch to g2.
         backend.set_active_graph("g2")
         assert backend.graph_name == "g2"
         assert backend._graph is None  # invalidated
 
-        # Next _get_graph reselects on the SAME client.
         assert backend._get_graph() is graph2
         assert fake_ctor.call_count == 1  # no reconnect
         assert fake_db.select_graph.call_args_list[-1].args == ("g2",)
@@ -141,7 +131,6 @@ def test_set_active_graph_rejects_out_of_allowlist():
     )
     with pytest.raises(ValueError, match="not in the allowed set"):
         backend.set_active_graph("secret_graph")
-    # Active graph unchanged.
     assert backend.graph_name == "g1"
 
 
@@ -181,7 +170,6 @@ def test_set_active_graph_noop_when_already_active_and_handle_live():
         backend._get_graph()  # prime handle
 
         backend.set_active_graph("g1")
-        # Handle NOT invalidated (no-op).
         assert backend._graph is fake_graph
         assert backend.graph_name == "g1"
 
@@ -211,7 +199,6 @@ def test_create_graph_materializes_new_graph():
     with patch("knowledge.falkordb_backend.FalkorDB", autospec=True) as fake_ctor:
         fake_db = MagicMock()
         fake_graph = MagicMock()
-        # list_graphs() returns empty first, then the new graph after creation.
         fake_db.list_graphs.side_effect = [[], ["new_kg"]]
         fake_db.select_graph.return_value = fake_graph
         fake_ctor.return_value = fake_db
@@ -219,7 +206,6 @@ def test_create_graph_materializes_new_graph():
         backend = FalkorDBBackend(host="h", port=6379, graph_name="factory_planning")
         backend.create_graph("new_kg")
 
-        # Selected the new graph on the DB client and ran a write query.
         fake_db.select_graph.assert_called_with("new_kg")
         assert fake_graph.query.call_count == 1
         query, params = fake_graph.query.call_args.args
