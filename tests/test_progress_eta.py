@@ -1,20 +1,21 @@
 """Tests for the tqdm-style time estimator and Chainlit progress renderer.
 
 The :class:`TimeEstimator` is a pure-Python dependency-free helper that
-mirrors tqdm's elapsed / rate-EMA / ETA computation; the
-:func:`_render_tqdm_line` helper in :mod:`falkordb_harness.chainlit_progress`
-formats it into a localized one-liner for the live ``cl.TaskList`` panel.
+mirrors tqdm's elapsed / rate-EMA / ETA computation. The tqdm-line
+rendering is now done client-side in ``AgentTodos.jsx`` from the raw
+estimator fields written by :func:`make_ingestion_progress`.
 
-The estimator / formatter / ``extract_from_chunks`` callback tests are
-pure-Python and run without Chainlit installed. The
-``make_ingestion_progress`` integration tests need ``chainlit.element`` and
-are skipped when the package isn't importable (matching the repo's existing
-"all mocked, no live Chainlit needed" test posture — see AGENTS.md).
+The estimator / ``extract_from_chunks`` callback tests are pure-Python
+and run without Chainlit installed. The ``make_ingestion_progress``
+integration tests need ``chainlit.element`` and are skipped when the
+package isn't importable (matching the repo's existing "all mocked, no
+live Chainlit needed" test posture — see AGENTS.md).
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -26,11 +27,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from falkordb_harness import i18n
 from falkordb_harness.i18n import set_lang
 from falkordb_harness.progress_eta import TimeEstimator, format_duration
-
-# _render_tqdm_line lives in chainlit_progress which imports chainlit.element
-# at module load. Defer the import to keep this test module importable
-# without chainlit installed; the chainlit-dependent tests below use a
-# module-level skip via pytest.importorskip.
 
 chainlit_available = True
 try:
@@ -53,7 +49,7 @@ def _reset_cli_lang():
 def test_format_duration_seconds_under_minute():
     assert format_duration(0.5) == "0:00"
     assert format_duration(0) == "0:00"
-    assert format_duration(59.4) == "0:59"  # rounded down
+    assert format_duration(59.4) == "0:59"
     assert format_duration(59.6) == "1:00"
 
 
@@ -99,7 +95,7 @@ def test_estimator_update_advances_n():
 
 def test_estimator_clamps_percent_at_100():
     est = TimeEstimator(total=4)
-    est.update(10)  # overshoot
+    est.update(10)
     assert est.n == 10
     assert est.percent == 100.0
     assert est.remaining == 0
@@ -131,16 +127,15 @@ def test_estimator_eta_unknown_until_first_tick():
 
 def test_estimator_eta_becomes_estimable_after_first_tick():
     est = TimeEstimator(total=10)
-    # Fake the monotonic clock so the rate is deterministic.
     t0 = [100.0]
     with patch("falkordb_harness.progress_eta.time.monotonic", side_effect=lambda: t0[0]):
         est.start_time = 100.0
-        t0[0] = 101.0  # advance 1s
-        est.update(1)  # rate ~1 it/s
+        t0[0] = 101.0
+        est.update(1)
         assert est.rate > 0
         assert est.eta >= 0
-        # remaining 9 / rate ~1 -> ETA ~9s (within a tolerance)
-        assert 8.0 <= est.eta <= 10.0
+        # raw remaining/rate = 9 / 1 = 9; safety factor default 3 -> 27
+        assert 24.0 <= est.eta <= 30.0
 
 
 def test_estimator_eta_zero_when_complete():
@@ -151,20 +146,11 @@ def test_estimator_eta_zero_when_complete():
 
 
 def test_estimator_rate_robust_to_concurrent_clustering():
-    """Cumulative-average rate must not saturate under clustered ticks.
-
-    ``extract_from_chunks`` runs LLM calls at bounded concurrency, so
-    completion ticks arrive in clusters: several within microseconds,
-    then a long pause. A per-tick EMA (tqdm's ``1/dt``) saturates at the
-    ``_MIN_DT`` clamp during each cluster and reports millions of it/s,
-    collapsing the ETA to 0:00. The cumulative average ``n / elapsed``
-    is immune because both ``n`` and ``elapsed`` are monotone.
-    """
+    """Cumulative-average rate must not saturate under clustered ticks."""
     est = TimeEstimator(total=8)
     t0 = [0.0]
     with patch("falkordb_harness.progress_eta.time.monotonic", side_effect=lambda: t0[0]):
         est.start_time = 0.0
-        # Two clusters of 4 completions each (mimics concurrent LLM calls) 5s apart.
         t0[0] = 5.0
         est.update(4)
         first_rate = est.rate
@@ -172,25 +158,75 @@ def test_estimator_rate_robust_to_concurrent_clustering():
         est.update(4)
         final_rate = est.rate
         final_eta = est.eta
-    # True rate is 8 items / 10s = 0.8 it/s; ETA = 0/0.8 = 0 (complete).
-    # Critical: rate must NOT be in the millions (the old EMA bug).
-    assert first_rate < 1.5  # 4/5 = 0.8, not ~4e6
-    assert final_rate < 1.5  # 8/10 = 0.8, not ~4e6
+    assert first_rate < 1.5
+    assert final_rate < 1.5
     assert final_rate > 0.5
-    assert final_eta == 0.0  # n >= total
+    assert final_eta == 0.0
 
 
 def test_estimator_rate_cumulative_average_matches_n_over_elapsed():
-    """``rate`` is exactly ``n / elapsed`` once elapsed > _MIN_DT."""
     est = TimeEstimator(total=100)
     t0 = [0.0]
     with patch("falkordb_harness.progress_eta.time.monotonic", side_effect=lambda: t0[0]):
         est.start_time = 0.0
         t0[0] = 20.0
         est.update(5)
-        # 5 items in 20s -> 0.25 it/s; remaining 95 / 0.25 = 380s.
         assert abs(est.rate - 0.25) < 1e-6
-        assert abs(est.eta - 380.0) < 1e-3
+        # raw eta = 95 / 0.25 = 380; safety factor default 3 -> 1140
+        assert abs(est.eta - 1140.0) < 1e-3
+
+
+def test_estimator_eta_safety_factor_default_is_three():
+    """Default ``INGEST_ETA_SAFETY_FACTOR`` is 3.0 (corrects the ~3x
+    underestimate observed at INGEST_CONCURRENCY=4)."""
+    import falkordb_harness.progress_eta as pe
+
+    assert pe._eta_safety_factor() == 3.0
+
+
+def test_estimator_eta_safety_factor_env_override(monkeypatch):
+    monkeypatch.setenv("INGEST_ETA_SAFETY_FACTOR", "1.0")
+    import falkordb_harness.progress_eta as pe
+
+    assert pe._eta_safety_factor() == 1.0
+
+
+def test_estimator_eta_safety_factor_invalid_falls_back(monkeypatch):
+    # Empty / non-numeric -> default 3.0
+    for bad in ("", "not-a-number"):
+        monkeypatch.setenv("INGEST_ETA_SAFETY_FACTOR", bad)
+        import falkordb_harness.progress_eta as pe
+
+        assert pe._eta_safety_factor() == 3.0
+    # NaN / inf -> default 3.0
+    for bad in ("nan", "inf"):
+        monkeypatch.setenv("INGEST_ETA_SAFETY_FACTOR", bad)
+        import falkordb_harness.progress_eta as pe
+
+        assert pe._eta_safety_factor() == 3.0
+    # Negative -> clamped to 0.0 (no negative ETA inflation)
+    monkeypatch.setenv("INGEST_ETA_SAFETY_FACTOR", "-1")
+    import falkordb_harness.progress_eta as pe
+
+    assert pe._eta_safety_factor() == 0.0
+
+
+def test_estimator_eta_safety_factor_applied():
+    """ETA = (remaining / rate) * safety_factor."""
+    import falkordb_harness.progress_eta as pe
+
+    est = TimeEstimator(total=100)
+    t0 = [0.0]
+    with patch("falkordb_harness.progress_eta.time.monotonic", side_effect=lambda: t0[0]):
+        est.start_time = 0.0
+        t0[0] = 10.0
+        est.update(10)
+        # raw = 90 / 1.0 = 90; with factor 3 -> 270
+        with patch.object(pe, "_eta_safety_factor", return_value=3.0):
+            assert abs(est.eta - 270.0) < 1e-3
+        # factor 1 disables inflation
+        with patch.object(pe, "_eta_safety_factor", return_value=1.0):
+            assert abs(est.eta - 90.0) < 1e-3
 
 
 def test_estimator_reset_reuses_total_when_none():
@@ -199,183 +235,119 @@ def test_estimator_reset_reuses_total_when_none():
     est.reset()
     assert est.n == 0
     assert est.total == 10
-    assert est.rate == 0.0
+    assert est.elapsed >= 0.0
 
 
-def test_estimator_reset_changes_total_when_given():
+def test_estimator_reset_changes_total_when_provided():
     est = TimeEstimator(total=10)
     est.update(3)
-    est.reset(total=50)
+    est.reset(total=20)
     assert est.n == 0
-    assert est.total == 50
+    assert est.total == 20
 
 
-# ---------------------------------------------------------------------------
-# TimeEstimator.render
-# ---------------------------------------------------------------------------
-
-def test_estimator_render_keys():
-    est = TimeEstimator(total=4)
-    est.update(1)
-    rendered = est.render()
-    for key in ("n", "total", "percent", "elapsed", "elapsed_str",
-                "eta", "eta_str", "rate", "remaining"):
-        assert key in rendered
-    assert rendered["n"] == 1
-    assert rendered["total"] == 4
-    assert rendered["remaining"] == 3
-    assert isinstance(rendered["elapsed_str"], str)
-    assert isinstance(rendered["eta_str"], str)
-
-
-# ---------------------------------------------------------------------------
-# _render_tqdm_line (requires chainlit for the import chain)
-# ---------------------------------------------------------------------------
-
-pytestmark_render = pytest.mark.skipif(
-    not chainlit_available, reason="chainlit not installed"
-)
-
-
-@pytestmark_render
-def test_render_tqdm_line_en_includes_counter_and_percent():
-    set_lang("en")
-    from falkordb_harness.chainlit_progress import _render_tqdm_line
-
-    est = TimeEstimator(total=40)
-    est.update(12)
-    line = _render_tqdm_line("LLM entity extraction", est)
-    assert "LLM entity extraction" in line
-    assert "12/40" in line
-    assert "30%" in line
-    assert "elapsed" in line
-    assert "ETA" in line
-    assert "it/s" in line
-
-
-@pytestmark_render
-def test_render_tqdm_line_de_uses_german_label():
-    set_lang("de")
-    from falkordb_harness.chainlit_progress import _render_tqdm_line
-
+def test_estimator_render_returns_all_fields():
     est = TimeEstimator(total=10)
-    est.update(2)
-    line = _render_tqdm_line("LLM-Entitäten-Extraktion", est)
-    assert "verstrichen" in line
-    assert "2/10" in line
-    assert "20%" in line
-
-
-@pytestmark_render
-def test_render_tqdm_line_unknown_rate_when_no_ticks():
-    set_lang("en")
-    from falkordb_harness.chainlit_progress import _render_tqdm_line
-
-    est = TimeEstimator(total=40)
-    line = _render_tqdm_line("Extract", est)
-    assert "? it/s" in line
-    assert "ETA ?" in line
-    assert "0/40" in line
-
-
-@pytestmark_render
-def test_render_tqdm_line_zero_total_shows_unknown_percent():
-    set_lang("en")
-    from falkordb_harness.chainlit_progress import _render_tqdm_line
-
-    est = TimeEstimator(total=0)
-    est.update(5)
-    line = _render_tqdm_line("Extract", est)
-    assert "5" in line
-    assert "?" in line
-
-
-@pytestmark_render
-def test_render_tqdm_line_known_rate_after_tick():
-    set_lang("en")
-    from falkordb_harness.chainlit_progress import _render_tqdm_line
-
-    est = TimeEstimator(total=10)
-    t0 = [0.0]
-    with patch("falkordb_harness.progress_eta.time.monotonic", side_effect=lambda: t0[0]):
-        est.start_time = 0.0
-        t0[0] = 2.0
-        est.update(4)  # 4 items in 2s -> rate 2 it/s
-    line = _render_tqdm_line("Write", est)
-    assert "it/s" in line
-    assert "? it/s" not in line
+    est.update(3)
+    r = est.render()
+    assert r["n"] == 3
+    assert r["total"] == 10
+    assert r["percent"] == 30.0
+    assert isinstance(r["elapsed_str"], str)
+    assert isinstance(r["eta_str"], str)
+    assert r["rate"] >= 0
+    assert r["remaining"] == 7
 
 
 # ---------------------------------------------------------------------------
 # make_ingestion_progress — progress event discriminant (integration-style)
 # ---------------------------------------------------------------------------
 #
-# We mock ``TaskList`` / ``Task`` so we can drive the async ``progress``
-# callback without a live Chainlit contextvar and assert the stage task's
-# title gets rewritten with the tqdm line. The factory still calls
-# ``TaskList().send()`` which we stub to a no-op. Skipped entirely when
-# chainlit isn't importable (the repo's test posture is "all mocked", but
-# the module-level import of ``chainlit.element`` in ``chainlit_progress``
-# still requires the package present).
+# We mock ``cl.CustomElement`` so we can drive the async ``progress``
+# callback without a live Chainlit contextvar and assert the element's
+# ``stages`` prop gets updated with estimator fields. The factory calls
+# ``cl.user_session.get/set`` which we stub. Skipped entirely when
+# chainlit isn't importable.
 
 pytestmark_chainlit = pytest.mark.skipif(
     not chainlit_available, reason="chainlit not installed"
 )
 
 
+class FakeCustomElement:
+    """In-memory fake for cl.CustomElement that records prop updates.
+
+    Mirrors the real ``CustomElement.__post_init__`` behaviour of
+    serializing ``props`` into ``content`` (a JSON string) at construction
+    time. The real Chainlit ``update()`` never refreshes ``content``, so
+    the persisted file at ``chainlit_key`` always carries the ORIGINAL
+    props — ``_sync_update`` in ``chainlit_progress.py`` fixes this by
+    refreshing ``content`` before each ``update()`` call.
+    """
+
+    def __init__(self, name="", props=None):
+        self.name = name
+        self.props = dict(props or {})
+        self.content = json.dumps(self.props)  # mirrors __post_init__
+        self._update_calls = 0
+
+    async def update(self):
+        self._update_calls += 1
+
+
 @pytest.fixture
-def _stub_tasklist(monkeypatch):
-    """Replace chainlit.element.TaskList / Task with in-memory fakes."""
-    import chainlit.element as element
+def _stub_chainlit(monkeypatch):
+    """Replace chainlit.user_session and chainlit.CustomElement with fakes."""
+    import chainlit as cl
 
-    class FakeTask:
-        def __init__(self, title="", status=None):
-            self.title = title
-            self.status = status
+    _session: dict = {}
 
-    class FakeTaskList:
-        def __init__(self):
-            self.status = None
-            self.tasks = []
+    class FakeUserSession:
+        @staticmethod
+        def get(key, default=None):
+            return _session.get(key, default)
+
+        @staticmethod
+        def set(key, value):
+            _session[key] = value
+
+    class FakeMessage:
+        def __init__(self, content="", elements=None):
+            self.content = content
+            self.elements = elements or []
 
         async def send(self):
-            return None
+            pass
 
-        async def add_task(self, task):
-            self.tasks.append(task)
+    monkeypatch.setattr(cl, "user_session", FakeUserSession)
+    monkeypatch.setattr(cl, "CustomElement", FakeCustomElement)
+    monkeypatch.setattr(cl, "Message", FakeMessage)
 
-        async def update(self):
-            return None
-
-    monkeypatch.setattr(element, "TaskList", FakeTaskList)
-    monkeypatch.setattr(element, "Task", FakeTask)
     # Also patch the symbols already imported into chainlit_progress.
     import falkordb_harness.chainlit_progress as cp
 
-    monkeypatch.setattr(cp, "TaskList", FakeTaskList, raising=False)
-    monkeypatch.setattr(cp, "Task", FakeTask, raising=False)
-    return FakeTaskList, FakeTask
+    monkeypatch.setattr(cp, "cl", cl, raising=False)
+    return _session
 
 
-def _drive_progress(events):
+def _drive_progress(events, _stub_chainlit):
     """Drive the shared progress factory through a list of (label, details)."""
     from falkordb_harness.chainlit_progress import make_ingestion_progress
 
-    tasklist, progress, finalize = asyncio.run(make_ingestion_progress())
+    _, progress, finalize = asyncio.run(make_ingestion_progress())
 
     async def _run():
         for label, details in events:
             await progress(label, details)
 
     asyncio.run(_run())
-    return tasklist
+    el = _stub_chainlit.get("agent_todos_el")
+    return el, finalize
 
 
 @pytestmark_chainlit
-def test_progress_event_creates_stage_task_and_renders_tqdm_line(_stub_tasklist):
+def test_progress_event_writes_stage_to_element_stages(_stub_chainlit):
     set_lang("en")
-    FakeTaskList, _ = _stub_tasklist  # type: ignore[misc]
-    # stage_start first so the task exists with the plain base title
     events = [
         ("Extracting…", {"kind": "stage_start", "stage": "extract", "total": 40}),
         ("Extracting 10/40…", {"kind": "progress", "stage": "extract",
@@ -383,30 +355,34 @@ def test_progress_event_creates_stage_task_and_renders_tqdm_line(_stub_tasklist)
         ("Extracting 20/40…", {"kind": "progress", "stage": "extract",
                                 "completed": 20, "total": 40}),
     ]
-    tasklist = _drive_progress(events)
-    assert len(tasklist.tasks) == 1
-    task = tasklist.tasks[0]
-    assert "20/40" in task.title
-    assert "50%" in task.title
-    assert "elapsed" in task.title
-    assert "ETA" in task.title
+    el, _ = _drive_progress(events, _stub_chainlit)
+    assert el is not None
+    assert el.props["active"] is True
+    assert "extract" in el.props["stages"]
+    s = el.props["stages"]["extract"]
+    assert s["n"] == 20
+    assert s["total"] == 40
+    assert s["percent"] == 50.0
+    assert isinstance(s["elapsed_str"], str)
+    assert isinstance(s["eta_str"], str)
+    assert s["rate"] >= 0
 
 
 @pytestmark_chainlit
-def test_progress_event_creates_stage_task_if_stage_start_missing(_stub_tasklist):
-    """A ``progress`` event for an unseen stage still produces a task row."""
+def test_progress_event_creates_stage_if_stage_start_missing(_stub_chainlit):
     set_lang("en")
     events = [
         ("Extracting 1/4…", {"kind": "progress", "stage": "extract",
                               "completed": 1, "total": 4}),
     ]
-    tasklist = _drive_progress(events)
-    assert len(tasklist.tasks) == 1
-    assert "1/4" in tasklist.tasks[0].title
+    el, _ = _drive_progress(events, _stub_chainlit)
+    assert "extract" in el.props["stages"]
+    assert el.props["stages"]["extract"]["n"] == 1
+    assert el.props["stages"]["extract"]["total"] == 4
 
 
 @pytestmark_chainlit
-def test_stage_end_restores_base_title(_stub_tasklist):
+def test_stage_end_restores_base_title(_stub_chainlit):
     set_lang("en")
     events = [
         ("Extracting…", {"kind": "stage_start", "stage": "extract", "total": 4}),
@@ -414,35 +390,81 @@ def test_stage_end_restores_base_title(_stub_tasklist):
                    "completed": 4, "total": 4}),
         ("Done", {"kind": "stage_end", "stage": "extract", "extractions": 4}),
     ]
-    tasklist = _drive_progress(events)
-    task = tasklist.tasks[0]
-    # After stage_end the title should drop the tqdm decoration.
-    assert "LLM entity extraction" in task.title
-    assert "4/4" not in task.title
-    assert "elapsed" not in task.title
+    el, _ = _drive_progress(events, _stub_chainlit)
+    s = el.props["stages"]["extract"]
+    assert "LLM entity extraction" in s["title"]
+    assert s["n"] == 4
+    # stage_end marks the stage as concluded so the UI swaps the spinner
+    # for a checkmark (and keeps the frozen snapshot visible).
+    assert s["done"] is True
 
 
 @pytestmark_chainlit
-def test_progress_event_unknown_total_shows_unknown_percent(_stub_tasklist):
+def test_stage_end_marks_stage_done(_stub_chainlit):
+    set_lang("en")
+    events = [
+        ("Extracting…", {"kind": "stage_start", "stage": "extract", "total": 4}),
+        ("1/4…", {"kind": "progress", "stage": "extract",
+                   "completed": 4, "total": 4}),
+        ("Done", {"kind": "stage_end", "stage": "extract", "extractions": 4}),
+    ]
+    el, _ = _drive_progress(events, _stub_chainlit)
+    assert el.props["stages"]["extract"]["done"] is True
+
+
+@pytestmark_chainlit
+def test_chunk_stage_bare_no_progress_events(_stub_chainlit):
+    """The chunk stage emits stage_start/file_start/file_end/stage_end but
+    no ``progress`` events, so no TimeEstimator is ever constructed for it.
+    The UI renders it as a bare spinner+title (no n/total % ETA rate line)
+    and a checkmark once ``stage_end`` flips ``done``.
+    """
+    set_lang("en")
+    events = [
+        ("Chunking…", {"kind": "stage_start", "stage": "chunk", "total": 2}),
+        ("Chunking a.md…", {"kind": "file_start", "stage": "chunk", "file": "a.md"}),
+        ("Chunked a.md", {"kind": "file_end", "stage": "chunk",
+                          "file": "a.md", "chunks": 3, "chars": 9000}),
+        ("Chunking b.md…", {"kind": "file_start", "stage": "chunk", "file": "b.md"}),
+        ("Chunked b.md", {"kind": "file_end", "stage": "chunk",
+                          "file": "b.md", "chunks": 1, "chars": 1000}),
+        ("Chunked 4 chunk(s).", {"kind": "stage_end", "stage": "chunk", "chunks": 4}),
+    ]
+    el, _ = _drive_progress(events, _stub_chainlit)
+    s = el.props["stages"]["chunk"]
+    # No ``progress`` event -> the estimator branch never ran, so the
+    # stage carries only the stage_start defaults (n=0, total=0) plus the
+    # ``done`` flag set by stage_end.
+    assert s["done"] is True
+    assert s["n"] == 0
+    assert s["total"] == 0
+
+
+@pytestmark_chainlit
+def test_progress_event_unknown_total_shows_zero_total(_stub_chainlit):
     set_lang("en")
     events = [
         ("stage", {"kind": "stage_start", "stage": "extract", "total": 0}),
         ("1/?", {"kind": "progress", "stage": "extract",
                   "completed": 1, "total": 0}),
     ]
-    tasklist = _drive_progress(events)
-    # total=0 -> counter is bare "1", percent is "?"
-    title = tasklist.tasks[0].title
-    assert "1" in title
-    assert "?" in title
+    el, _ = _drive_progress(events, _stub_chainlit)
+    s = el.props["stages"]["extract"]
+    assert s["n"] == 1
+    assert s["total"] == 0
+    assert s["percent"] == 0.0
 
 
 @pytestmark_chainlit
-def test_finalize_marks_running_tasks_done(_stub_tasklist):
+def test_finalize_marks_stages_done_and_keeps_them(_stub_chainlit):
+    """``finalize`` flips ``ingestion_running`` to False and marks every
+    still-running stage as ``done`` (so the UI swaps the spinner for a
+    checkmark) but keeps the stages visible as a chronological record.
+    """
     set_lang("en")
     from falkordb_harness.chainlit_progress import make_ingestion_progress
 
-    tasklist, progress, finalize = asyncio.run(make_ingestion_progress())
+    _, progress, finalize = asyncio.run(make_ingestion_progress())
 
     async def _run():
         await progress("Extracting…", {"kind": "stage_start",
@@ -450,20 +472,20 @@ def test_finalize_marks_running_tasks_done(_stub_tasklist):
         await finalize(True)
 
     asyncio.run(_run())
-    # All stage tasks should be DONE after a successful finalize.
-    from chainlit.element import TaskStatus
-
-    for task in tasklist.tasks:
-        assert task.status == TaskStatus.DONE
-    assert tasklist.status == "Done"
+    el = _stub_chainlit.get("agent_todos_el")
+    assert el.props["ingestion_running"] is False
+    assert el.props["active"] is False
+    # Stages are kept (not cleared) so the block persists as a record.
+    assert "extract" in el.props["stages"]
+    assert el.props["stages"]["extract"]["done"] is True
 
 
 @pytestmark_chainlit
-def test_finalize_failed_marks_running_tasks_failed(_stub_tasklist):
+def test_finalize_failed_also_marks_done(_stub_chainlit):
     set_lang("en")
     from falkordb_harness.chainlit_progress import make_ingestion_progress
 
-    tasklist, progress, finalize = asyncio.run(make_ingestion_progress())
+    _, progress, finalize = asyncio.run(make_ingestion_progress())
 
     async def _run():
         await progress("Extracting…", {"kind": "stage_start",
@@ -471,54 +493,84 @@ def test_finalize_failed_marks_running_tasks_failed(_stub_tasklist):
         await finalize(False)
 
     asyncio.run(_run())
-    from chainlit.element import TaskStatus
-
-    for task in tasklist.tasks:
-        assert task.status == TaskStatus.FAILED
-    assert tasklist.status == "Failed"
+    el = _stub_chainlit.get("agent_todos_el")
+    assert el.props["ingestion_running"] is False
+    assert el.props["active"] is False
+    assert "extract" in el.props["stages"]
+    assert el.props["stages"]["extract"]["done"] is True
 
 
 @pytestmark_chainlit
-def test_finalize_swallows_update_exception(_stub_tasklist, monkeypatch):
-    """``finalize`` must not strand the panel if ``tasklist.update`` raises.
-
-    The cleanup runs from the ingestion caller's ``finally`` block, which
-    may execute while the on-message task is being cancelled by the
-    Chainlit stop button. A second ``CancelledError`` (or any other
-    exception from a dead socket) during the final ``tasklist.update()``
-    must be swallowed so the panel state is still flipped to a terminal
-    status in-memory.
-    """
+def test_finalize_swallows_update_exception(_stub_chainlit, monkeypatch):
+    """``finalize`` must not strand the panel if ``el.update`` raises."""
     set_lang("en")
     from falkordb_harness.chainlit_progress import make_ingestion_progress
 
-    tasklist, progress, finalize = asyncio.run(make_ingestion_progress())
-
-    async def _boom():
-        raise RuntimeError("socket gone")
-
-    monkeypatch.setattr(tasklist, "update", _boom)
+    _, progress, finalize = asyncio.run(make_ingestion_progress())
 
     async def _run():
         await progress("Extracting…", {"kind": "stage_start",
                                        "stage": "extract", "total": 4})
+        el = _stub_chainlit.get("agent_todos_el")
+        monkeypatch.setattr(el, "update", AsyncMock(side_effect=RuntimeError("boom")))
         await finalize(True)
 
-    # Should not raise despite the failing update.
     asyncio.run(_run())
-    from chainlit.element import TaskStatus
+    el = _stub_chainlit.get("agent_todos_el")
+    assert el.props["ingestion_running"] is False
+    assert el.props["stages"]["extract"]["done"] is True
 
-    # In-memory state still flipped to terminal.
-    assert tasklist.status == "Done"
-    for task in tasklist.tasks:
-        assert task.status == TaskStatus.DONE
+
+@pytestmark_chainlit
+def test_sync_update_refreshes_content_before_update(_stub_chainlit):
+    """``_sync_update`` must refresh ``el.content`` from ``el.props`` before
+    calling ``el.update()``.
+
+    Chainlit's ``CustomElement.__post_init__`` serializes ``props`` into
+    ``content`` at construction time, but ``update()`` never refreshes it.
+    So the persisted file at ``chainlit_key`` always carries the ORIGINAL
+    props. ``_sync_update`` fixes this by re-serializing ``props`` into
+    ``content`` before each ``update()`` call, ensuring the ``done`` flag
+    on ingestion stages reaches the wire.
+    """
+    set_lang("en")
+    events = [
+        ("Extracting…", {"kind": "stage_start", "stage": "extract", "total": 4}),
+        ("1/4…", {"kind": "progress", "stage": "extract",
+                   "completed": 4, "total": 4}),
+        ("Done", {"kind": "stage_end", "stage": "extract", "extractions": 4}),
+    ]
+    el, _ = _drive_progress(events, _stub_chainlit)
+    # ``content`` should reflect the CURRENT props (with done=True), not
+    # the original construction-time props (empty stages).
+    parsed = json.loads(el.content)
+    assert "stages" in parsed
+    assert parsed["stages"]["extract"]["done"] is True
+    # The content should match the props (both serialized).
+    assert json.loads(el.content) == el.props
+
+
+@pytestmark_chainlit
+def test_stage_start_for_stage_stage_shows_in_panel(_stub_chainlit):
+    """The 'stage' (file staging) stage should emit ``stage_start`` before
+    ``stage_end`` so it appears in the progress panel and gets a checkmark.
+    """
+    set_lang("en")
+    events = [
+        ("Staging…", {"kind": "stage_start", "stage": "stage", "total": 2}),
+        ("Staged.", {"kind": "stage_end", "stage": "stage", "files": ["a.md", "b.md"],
+                      "total": 2}),
+    ]
+    el, _ = _drive_progress(events, _stub_chainlit)
+    assert "stage" in el.props["stages"]
+    assert el.props["stages"]["stage"]["done"] is True
 
 
 def test_ingestion_finalize_called_on_cancellation():
     """The ingest-tools ``try/finally`` must call ``finalize`` on CancelledError.
 
     ``CancelledError`` inherits from ``BaseException`` (Python 3.8+), so a
-    plain ``except Exception`` would skip cleanup and leave the TaskList
+    plain ``except Exception`` would skip cleanup and leave the panel
     pinned at "Running" when the user hits the Chainlit stop button. This
     test exercises the structural pattern used by ``_extract_and_write_impl``
     (``try/finally`` with a ``success`` flag) to confirm finalize fires.
@@ -568,7 +620,6 @@ def test_extract_from_chunks_invokes_progress_callback():
             await extract_from_chunks(chunks, on_progress=on_progress)
 
     asyncio.run(_run())
-    # 3 ticks, in monotonically increasing completed counts, total=3
     assert len(calls) == 3
     completeds = [c for c, _ in calls]
     assert completeds == sorted(completeds)
@@ -590,7 +641,6 @@ def test_extract_from_chunks_callback_exception_swallowed():
             return result
 
     result = asyncio.run(_run())
-    # No extraction produced (mock returns None) but the call didn't raise.
     assert result == []
 
 

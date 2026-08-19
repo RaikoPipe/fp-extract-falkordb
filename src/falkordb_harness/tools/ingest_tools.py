@@ -241,7 +241,7 @@ async def _extract_and_write_impl(
         factory = None
     if factory is not None:
         try:
-            _tasklist, progress, finalize = await factory()
+            _, progress, finalize = await factory()
         except Exception as exc:  # noqa: BLE001 — never strand ingestion
             logger.warning("ingest progress factory failed: %s", exc)
             progress, finalize = None, None

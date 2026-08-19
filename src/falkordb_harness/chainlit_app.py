@@ -7,7 +7,6 @@ Run with:
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
 import os
@@ -545,6 +544,11 @@ async def _ui_prompt_callback(**kwargs: Any) -> str:
 
     On timeout (user didn't respond) returns ``"cancelled"`` for confirms
     and ``"(no response)"`` for questions so the agent can recover.
+
+    The ``AskActionMessage`` / ``AskUserMessage`` auto-nests under the
+    ``on_message`` run step (Chainlit's ``local_steps`` sets
+    ``parent_id`` in ``MessageBase.__post_init__``), so it renders in
+    chronological order alongside tool calls and the final answer.
     """
     kind = kwargs.get("kind", "")
     if kind == "confirm":
@@ -912,7 +916,7 @@ async def on_ingest_documents(action: Action) -> None:
     # switches on ingest_runner's discriminated ``details["kind"]`` events.
     from falkordb_harness.chainlit_progress import make_ingestion_progress
 
-    _tasklist, _progress, _finalize_progress = await make_ingestion_progress()
+    _, _progress, _finalize_progress = await make_ingestion_progress()
 
     yaml_path = os.getenv("DOCPREP_YAML", "")
     ingest_cfg = cl.user_session.get("ingestion_settings") or _default_ingestion_settings()
@@ -1459,14 +1463,25 @@ async def _build_document_manager_props() -> dict | None:
     """Build the props for the DocumentManager CustomElement.
 
     Reads from the document registry:
-    - document rows for the current thread (``threadId``): these carry
-      ``originalPath`` and an optional ``preprocessedPath``.
+    - document rows owned by the current user (``userIdentifier``),
+      across ALL their chat threads — not just the current thread. This
+      matches the visibility signal from ``/api/docs-info`` (which calls
+      ``count_for_user``), so the sidebar opens whenever the toggle
+      button is visible. Previously this was scoped to the current
+      thread only (``list_for_thread``), which caused the button to
+      appear (user has docs in another thread) while the sidebar opened
+      empty and immediately closed — the button click did nothing.
     - ingestion links for the active graph (``document_ingestions``):
-      a thread document is "ingested" into the active graph when a link
-      row exists for its id.
+      a document is "ingested" into the active graph when a link row
+      exists for its id.
 
-    Returns ``{documents: [...], lang: "en"|"de", labels: {...}}`` or
-    ``None`` if no rows (so the sidebar isn't opened empty). Each
+    Returns ``{documents: [...], lang: "en"|"de", labels: {...}}`` always
+    (when Chainlit is importable), even when there are no rows — the
+    sidebar then opens and DocumentManager.jsx renders its existing
+    "No documents yet" empty-state card. Returning ``None`` here (the
+    old behavior) made :func:`_refresh_sidebar` return early without
+    calling ``set_elements``, so the toggle button's open path posted
+    the message but the sidebar never opened — silently. Each
     document dict carries the fields the JSX table needs: ``id``,
     ``name``, ``bytes``, ``mime``, ``preprocessed`` (bool —
     ``preprocessedPath`` set), ``ingested`` (bool — ingested into the
@@ -1485,7 +1500,8 @@ async def _build_document_manager_props() -> dict | None:
 
     from falkordb_harness.chainlit_elements import _IMAGE_EXTS
     from falkordb_harness.document_registry import (
-        list_for_thread,
+        list_for_graph,
+        list_for_user,
     )
     from falkordb_harness.ingest_runner import _PLAIN_EXTS, _needs_preprocessing
 
@@ -1495,24 +1511,20 @@ async def _build_document_manager_props() -> dict | None:
     # gating matches backend capability without coupling the two modules.
     _VIEWABLE_ORIG_EXTS = _IMAGE_EXTS | _PLAIN_EXTS | {".pdf"}
 
-    try:
-        thread_id = cl.context.session.thread_id
-    except Exception:  # noqa: BLE001
-        thread_id = None
-
     selection = cl.user_session.get("graph_selection") or {}
     active_graph = selection.get("active_graph", _DEFAULT_GRAPH)
 
+    user_identifier = cl.user_session.get("user_identifier")
     docs: list[dict] = []
-    if thread_id:
-        docs.extend(await list_for_thread(thread_id))
+    if user_identifier:
+        docs.extend(await list_for_user(user_identifier))
     # Plus ingested-only provenance rows (threadId NULL) for the active
     # graph — these come from list_for_graph, which joins documents with
     # document_ingestions for the active graph. We add only the ones not
-    # already in ``docs`` (the thread row, when present, is the source
-    # of truth for the file's preprocessed/upload state).
-    from falkordb_harness.document_registry import list_for_graph
-
+    # already in ``docs`` (the user row, when present, is the source
+    # of truth for the file's preprocessed/upload state). This covers
+    # documents ingested into the active graph by another user/session
+    # whose upload thread is gone (threadId NULL).
     ingested_rows = await list_for_graph(active_graph)
     docs_by_id = {d.get("id"): d for d in docs}
     for r in ingested_rows:
@@ -1521,11 +1533,30 @@ async def _build_document_manager_props() -> dict | None:
             docs_by_id[r.get("id")] = r
 
     if not docs:
-        return None
+        # No rows for this user + active graph. Return an empty (but
+        # non-None) props set so the sidebar still opens and
+        # DocumentManager.jsx renders its "No documents yet" card.
+        # Returning None here would make _refresh_sidebar bail out before
+        # set_elements, so the toggle button's open path would be a
+        # silent no-op (the button is visible because /api/docs-info's
+        # count_for_user reported docs for the user, but those docs may
+        # belong to a different graph/thread than the active one).
+        lang = cl.user_session.get("lang") or "de"
+        return {
+            "documents": [],
+            "lang": lang,
+            "labels": {
+                "open": t("doc.action.open.tooltip"),
+                "openDisabled": t("doc.action.open.disabled_tooltip"),
+                "preprocess": t("doc.action.preprocess.tooltip"),
+                "delete": t("doc.action.delete.tooltip"),
+                "deleteConfirm": t("doc.action.delete.confirm"),
+            },
+        }
 
     # Set of document ids ingested into the active graph (drives the
-    # Ingested ids drive the "Ingested" column (built from ingested_rows
-    # directly; list_for_thread doesn't join).
+    # Ingested column; built from ingested_rows directly since
+    # list_for_user doesn't join document_ingestions).
     ingested_ids = {r.get("id") for r in ingested_rows if r.get("id")}
 
     lang = cl.user_session.get("lang") or "de"
@@ -1571,6 +1602,40 @@ async def _build_document_manager_props() -> dict | None:
     return {"documents": documents, "lang": lang, "labels": labels}
 
 
+def _extract_tool_call(tinput: Any) -> dict | None:
+    """Extract a single tool-call dict from a ``tools`` task's ``input``.
+
+    LangGraph's ``create_agent`` dispatches each tool call as its own
+    ``Send("tools", [tool_call])`` task, so the task input is a list with
+    one dict shaped like ``{"name", "args", "id", "type": "tool_call"}``.
+    Accepts both the current list shape and a bare dict (defensive against
+    future LangGraph changes). Returns ``None`` when no usable tool call is
+    found.
+    """
+    if isinstance(tinput, list):
+        for item in tinput:
+            tc = _coerce_tool_call(item)
+            if tc is not None:
+                return tc
+        return None
+    return _coerce_tool_call(tinput)
+
+
+def _coerce_tool_call(item: Any) -> dict | None:
+    """Coerce a raw item into a tool-call dict, or ``None`` if not one."""
+    if not isinstance(item, dict):
+        return None
+    name = item.get("name")
+    tc_id = item.get("id")
+    if not name or not tc_id:
+        return None
+    return {
+        "name": str(name),
+        "args": item.get("args", {}),
+        "id": str(tc_id),
+    }
+
+
 @cl.on_message
 async def on_message(message: cl.Message) -> None:
     # Re-install the per-session backend: contextvar from build_agent (in
@@ -1590,12 +1655,42 @@ async def on_message(message: cl.Message) -> None:
 
     user_content = message.content or ""
 
+    # --- Chat-flow test harness (admin only) ---------------------------
+    # Detect the magic prefix __chat_flow_test__:<scenario_name>. When
+    # present and the user is an admin, swap the real agent for a mock
+    # whose astream_events yields a synthetic LangGraph v3 event stream.
+    # The rest of on_message runs unchanged, exercising every
+    # chronological-ordering invariant against the real handler logic.
+    _CHAT_FLOW_TEST_PREFIX = "__chat_flow_test__:"
+
+    if user_content.startswith(_CHAT_FLOW_TEST_PREFIX):
+        current_user = cl.user_session.get("user")
+        role = "user"
+        if current_user is not None:
+            role = getattr(current_user, "metadata", {}).get("role") or "user"
+        if role != "admin":
+            await cl.Message(
+                content=t("chat_flow_test.not_admin"),
+            ).send()
+            return
+        scenario_name = user_content[len(_CHAT_FLOW_TEST_PREFIX):].strip()
+        from falkordb_harness.chat_flow_test import build_mock_agent, get_scenario
+
+        scenario = get_scenario(scenario_name)
+        if scenario is None:
+            await cl.Message(
+                content=t("chat_flow_test.not_found", name=scenario_name),
+            ).send()
+            return
+        agent = build_mock_agent(scenario)
+        user_content = ""
+
     if message.elements:
         # Resolve the current thread id + user identifier once for the
         # document-registry uploads below. ``cl.context.session.thread_id``
-        # is the same id Chainlit assigns to ``response_msg.thread_id``
-        # (constructed later in this handler); reading it here lets us
-        # register uploads before the assistant message exists.
+        # is the same id Chainlit assigns to every answer message's
+        # ``thread_id`` (constructed later in this handler); reading it here
+        # lets us register uploads before the assistant messages exist.
         try:
             _thread_id = cl.context.session.thread_id
         except Exception:  # noqa: BLE001 — older Chainlit / no context
@@ -1667,16 +1762,48 @@ async def on_message(message: cl.Message) -> None:
             ).send()
             # Sidebar not refreshed — toggle re-reads registry on open.
 
-    response_msg = cl.Message(content="")
-    await response_msg.send()
+    # Assistant answer messages — one cl.Message per contiguous span of
+    # user-facing assistant text (pre-tool narration, final answer, and any
+    # intermediate answer spans). Chainlit's @on_message decorator wraps
+    # the handler in a "run" Step (pushed onto local_steps); every cl.Message
+    # created here is auto-parented to that step by MessageBase.__post_init__,
+    # and cl.Step children use _on_message_step_id as their parent_id so they
+    # nest under the same container. In cot="tool_call" mode (the configured
+    # mode, see .chainlit/config.toml) the on_message run step is a
+    # transparent container that renders its children in array/creation order
+    # — so each answer message lands in its true chronological position
+    # relative to the tool steps, and streaming into one message never moves
+    # another. This mirrors the Claude Code / Claude.ai chat flow where the
+    # agent freely interleaves text and tool calls, each text bubble rendered
+    # where it was produced.
+    from chainlit.step import local_steps as _local_steps
 
-    # Register the in-flight stream so on_chat_resume can replay it after
-    # reconnect. Cleared in the finally block once the stream concludes.
-    _stream_thread_id = response_msg.thread_id
-    register_stream(_stream_thread_id, response_msg)
+    _on_message_steps = _local_steps.get() or []
+    _on_message_step_id = (
+        _on_message_steps[-1].id if _on_message_steps else None
+    )
+
+    _answer_messages: list[cl.Message] = []
+    _stream_thread_id: str | None = None
+
+    async def _new_answer_msg() -> cl.Message:
+        """Create and send a fresh assistant answer message, registering it
+        for stream recovery. Each contiguous span of user-facing assistant
+        text gets its own message so it renders in its true chronological
+        position (Chainlit appends to the on_message run step's children in
+        arrival order). parent_id is set by Chainlit to the on_message run
+        step automatically (via local_steps)."""
+        nonlocal _stream_thread_id
+        msg = cl.Message(content="")
+        await msg.send()
+        _answer_messages.append(msg)
+        if _stream_thread_id is None:
+            _stream_thread_id = msg.thread_id
+        register_stream(_stream_thread_id, msg)
+        return msg
 
     # Lazy factory so extract_and_write (inside LangGraph's tool coroutine)
-    # can build a live TaskList via user_session. Cleared after the stream.
+    # can build live progress via the AgentTodos element. Cleared after the stream.
     from falkordb_harness.chainlit_progress import make_ingestion_progress
 
     async def _ingest_progress_factory():
@@ -1686,20 +1813,25 @@ async def on_message(message: cl.Message) -> None:
 
     active_steps: dict[str, cl.Step] = {}
     full_response = ""
-    # Tool text streams into a collapsible "Thinking" Step; replayed into
-    # response_msg as the visible answer after the stream ends.
-    _any_tool_called = False
+    # v3 streaming: text/reasoning/tool-call deltas arrive as typed
+    # content-block events on the ``messages`` stream mode, so the
+    # reasoning-vs-answer distinction is made per-block (not deferred to
+    # run end as in v2). Tool execution events come from the ``tasks``
+    # projection (TasksTransformer), which yields per-node task
+    # start/result payloads.
     # Claude-style tool-call history: preserve full AIMessage(tool_calls) +
     # ToolMessage pairs so the agent sees exactly what it called and what
     # each tool returned on subsequent turns.
-    _pending_tool_calls: dict[str, dict] = {}  # run_id -> {name, args, tool_call_id}
-    _tool_results: dict[str, str] = {}          # run_id -> output
     _tool_call_batches: list[list[dict]] = []   # each batch: [{name, args, id, result}, ...]
-    _current_batch_run_ids: list[str] = []      # run_ids in the current in-flight batch
-    _in_tool_batch: bool = False
     thinking_step: cl.Step | None = None
     thinking_text: str = ""
-    # Visual elements collected during the stream, attached to the final msg.
+    # The answer message currently being streamed into.
+    # ``_answer_messages`` is the authoritative list; this is the live
+    # handle for stream_token. Reset on each new model message so a new
+    # answer span gets its own message (created lazily on first text).
+    _active_answer_msg: cl.Message | None = None
+    # Visual elements collected during the stream, attached to the last
+    # answer message so they render with the streamed text.
     pending_elements: list = []
 
     # Same-tool chain aggregation: consecutive calls to the SAME tool collapse
@@ -1714,7 +1846,7 @@ async def on_message(message: cl.Message) -> None:
 
         Non-reentrant: harmless to call when no chain is open. The step
         itself is left as-is on the chat (its content is already
-        persisted); only the locals are cleared so the next on_tool_start
+        persisted); only the locals are cleared so the next tool start
         builds a fresh step.
         """
         nonlocal _chain_step, _chain_tool, _chain_count
@@ -1723,234 +1855,468 @@ async def on_message(message: cl.Message) -> None:
         _chain_count = 0
         run_index.clear()
 
-    def _flush_tool_batch() -> None:
-        """Flush pending tool calls/results as Claude-style AIMessage+ToolMessage pairs.
+    def _flush_tool_batch(batch: list[dict]) -> None:
+        """Record a completed tool batch for Claude-style history.
 
-        Each batch becomes one AIMessage(tool_calls=[...]) followed by one
-        ToolMessage per tool call. The batch is appended to _tool_call_batches
+        Each batch becomes one AIMessage(tool_calls=[...]) followed by
+        one ToolMessage per tool call, appended to ``_tool_call_batches``
         for later inclusion in chat_history.
         """
-        nonlocal _in_tool_batch
-        if not _current_batch_run_ids:
-            return
-        batch: list[dict] = []
-        for rid in _current_batch_run_ids:
-            tc = _pending_tool_calls.get(rid)
-            result = _tool_results.get(rid, "")
-            if tc:
-                batch.append({**tc, "result": result})
         if batch:
             _tool_call_batches.append(batch)
-        _current_batch_run_ids.clear()
-        _pending_tool_calls.clear()
-        _tool_results.clear()
-        _in_tool_batch = False
+
+    async def _ensure_thinking_step() -> cl.Step:
+        """Lazily create the Thinking step on first reasoning text."""
+        nonlocal thinking_step
+        if thinking_step is None:
+            thinking_step = cl.Step(
+                name=t("thinking.label"),
+                type="tool",
+                parent_id=_on_message_step_id,
+                default_open=False,
+            )
+            try:
+                thinking_step.icon = "brain"
+            except Exception:
+                pass
+            await thinking_step.send()
+        return thinking_step
 
     agent_input = {"messages": chat_history + [HumanMessage(content=user_content)]}
     from langgraph.errors import GraphRecursionError
 
     from falkordb_harness.agent import _DEFAULT_RECURSION_LIMIT
 
-    logger.error("DBG on_message: about to call astream_events, agent=%r", agent)
+    logger.error("DBG on_message: about to call astream_events v3, agent=%r", agent)
     try:
-        event_stream = agent.astream_events(
+        from langgraph.stream.transformers import TasksTransformer
+
+        run = await agent.astream_events(
             agent_input,
-            version="v2",
+            version="v3",
             config={"recursion_limit": _DEFAULT_RECURSION_LIMIT},
+            transformers=[TasksTransformer],
         )
     except Exception as _e:
         logger.error("DBG on_message: astream_events() raised %r", _e, exc_info=True)
         raise
-    logger.error("DBG on_message: astream_events returned, entering loop")
+    logger.error("DBG on_message: astream_events v3 returned, entering loop")
+
+    # Per-tool-call-id → step mapping for in-flight tool calls.
+    _call_id_to_step: dict[str, cl.Step] = {}
+    _call_id_to_n: dict[str, int] = {}
+    # Open batch (one per AIMessage that emitted tool_calls). Each batch is a
+    # list of {name, args, id, result} entries; once all results arrive it is
+    # flushed to _tool_call_batches for Claude-style history. Multiple batches
+    # may be open concurrently because Pregel dispatches each tool call as its
+    # own Send-task, and a new model message can arrive before the prior
+    # batch's results all land — so we track batches by call_id, not as a
+    # single "current" list.
+    _open_batches: dict[str, list[dict]] = {}  # batch_key -> entries
+    _call_id_to_batch: dict[str, str] = {}     # tool_call_id -> batch_key
+    _batch_counter: int = 0
+    # Entries whose result hasn't landed yet, keyed by tool_call_id, so the
+    # GraphRecursionError / except paths can flush partial batches.
+    _pending_results: dict[str, dict] = {}  # tool_call_id -> entry awaiting result
+
     try:
-        async with contextlib.aclosing(event_stream):
-            async for event in event_stream:
-                kind = event.get("event")
+        async with run:
+            # Two concurrent consumers share the caller-driven pump:
+            #   - raw events (messages/values) for text/reasoning/model output
+            #   - run.tasks projection for tool execution start/result
+            # asyncio.gather drives both; each awaiting cursor advances
+            # the shared graph pump via the mux's single-flight lock.
 
-                # Non-tool events break the chain; on_tool_end completes the
-                # in-flight call and is exempted.
-                if kind not in ("on_tool_start", "on_tool_end"):
-                    if _chain_step is not None:
-                        await _close_chain_step()
-                    # Flush any completed tool batch when the model starts
-                    # generating text (or any non-tool event arrives).
-                    if _in_tool_batch and _current_batch_run_ids:
-                        _flush_tool_batch()
+            async def _consume_raw():
+                """Consume raw protocol events for text, reasoning, and
+                model message boundaries."""
+                nonlocal _active_answer_msg, thinking_text, full_response
+                async for event in run:
+                    method = event.get("method")
+                    if method == "values":
+                        # State snapshots — extract ToolMessages that
+                        # weren't paired via tasks (e.g. from
+                        # log_attachments or checkpoint replay). The
+                        # tasks projection is the primary path; this is
+                        # a safety net for whole-message values events.
+                        data = event.get("params", {}).get("data", {})
+                        msgs = data.get("messages", []) if isinstance(data, dict) else []
+                        for m in msgs:
+                            if isinstance(m, ToolMessage):
+                                # Already handled via tasks; skip.
+                                pass
+                        continue
+                    if method != "messages":
+                        continue
+                    data = event.get("params", {}).get("data")
+                    if not isinstance(data, tuple) or len(data) != 2:
+                        continue
+                    payload, metadata = data
+                    node = (metadata or {}).get("langgraph_node", "")
+                    # Skip the log_attachments diagnostic — it passes through
+                    # messages without model output. Was a parent wrapper
+                    # node ("log_attachments"); now a middleware
+                    # before_agent node ("log_attachments.before_agent").
+                    if node == "log_attachments" or node == "log_attachments.before_agent":
+                        continue
 
-                if kind == "on_chat_model_stream":
-                    metadata = event.get("metadata", {})
-                    if metadata.get("langgraph_node") in ("model", "log_attachments"):
-                        if metadata.get("langgraph_node") == "log_attachments":
-                            continue
-                    chunk = event.get("data", {}).get("chunk")
-                    if chunk:
-                        raw = chunk.content if hasattr(chunk, "content") else chunk
-                        if isinstance(raw, list):
-                            token = "".join(
-                                part.get("text", "")
-                                if isinstance(part, dict) and "text" in part
-                                else ""
-                                for part in raw
-                            )
-                        elif isinstance(raw, str):
-                            token = raw
+                    # Case 1: whole AIMessage (non-streaming model or
+                    # checkpoint replay). Route by tool_calls presence.
+                    if isinstance(payload, AIMessage):
+                        _ai = payload
+                        _has_tc = bool(getattr(_ai, "tool_calls", None))
+                        _text = _ai.content if isinstance(_ai.content, str) else ""
+                        if _has_tc:
+                            # Reasoning run: text goes to thinking step.
+                            # (Batch opening from the tasks projection's
+                            # ``model`` task result is the authoritative
+                            # batch driver; the raw messages stream only
+                            # carries the text here.)
+                            if _text:
+                                thinking_text += _text
+                                ts = await _ensure_thinking_step()
+                                ts.output = thinking_text
+                                await ts.update()
                         else:
-                            token = str(raw) if raw else ""
-                        if token:
-                            full_response += token
-                            if _any_tool_called:
-                                thinking_text += token
-                                if thinking_step is None:
-                                    thinking_step = cl.Step(
-                                        name=t("thinking.label"),
-                                        type="tool",
-                                        parent_id=response_msg.id,
-                                        default_open=False,
-                                    )
-                                    try:
-                                        thinking_step.icon = "brain"
-                                    except Exception:
-                                        pass
-                                    await thinking_step.send()
-                                thinking_step.output = thinking_text
-                                await thinking_step.update()
-                            else:
-                                await response_msg.stream_token(token)
+                            # Answer span: flush text to a fresh answer
+                            # message so it lands after all tools.
+                            if _text:
+                                _active_answer_msg = await _new_answer_msg()
+                                full_response += _text
+                                await _active_answer_msg.stream_token(_text)
+                        continue
 
-                elif kind == "on_tool_start":
-                    run_id = event.get("run_id", "")
-                    tool_name = event.get("name", "tool")
-                    tool_input = event.get("data", {}).get("input", "")
-                    _icon, _lang, _open = _step_meta(tool_name)
+                    # Case 2: protocol event dict (streaming content-block
+                    # deltas from a real streaming LLM).
+                    if isinstance(payload, dict) and "event" in payload:
+                        evt_type = payload.get("event")
+                        if evt_type == "message-start":
+                            # New model message: reset the active answer
+                            # message so the next text block creates a
+                            # fresh container.
+                            _active_answer_msg = None
+                        elif evt_type == "content-block-start":
+                            content = payload.get("content", {})
+                            blk_type = content.get("type") if isinstance(content, dict) else None
+                            if blk_type == "tool_call":
+                                # Tool call block starting — the model is
+                                # emitting a tool call. The actual
+                                # execution comes via tasks projection.
+                                pass
+                            elif blk_type == "text":
+                                # Text block starting — create answer msg
+                                # lazily on first delta.
+                                pass
+                            elif blk_type == "reasoning":
+                                # Reasoning block starting — ensure
+                                # thinking step exists.
+                                await _ensure_thinking_step()
+                        elif evt_type == "content-block-delta":
+                            delta = payload.get("delta", {})
+                            if not isinstance(delta, dict):
+                                continue
+                            delta_type = delta.get("type")
+                            if delta_type == "text-delta":
+                                token = delta.get("text", "")
+                                if token:
+                                    if _active_answer_msg is None:
+                                        _active_answer_msg = await _new_answer_msg()
+                                    full_response += token
+                                    await _active_answer_msg.stream_token(token)
+                            elif delta_type == "reasoning-delta":
+                                token = delta.get("reasoning", "")
+                                if token:
+                                    thinking_text += token
+                                    ts = await _ensure_thinking_step()
+                                    ts.output = thinking_text
+                                    await ts.update()
+                        elif evt_type == "content-block-finish":
+                            content = payload.get("content", {})
+                            blk_type = content.get("type") if isinstance(content, dict) else None
+                            if blk_type == "tool_call":
+                                # Tool call block finished. The tasks
+                                # projection's ``model`` task result is the
+                                # authoritative batch driver — nothing to
+                                # collect here.
+                                pass
+                        elif evt_type == "message-finish":
+                            # Model message done. The tasks projection
+                            # will fire for the tools node if there were
+                            # tool calls.
+                            pass
+                        elif evt_type == "message-error":
+                            err = payload.get("error", "unknown error")
+                            logger.error("Model stream error: %s", err)
+                        continue
 
-                    _any_tool_called = True
-                    _in_tool_batch = True
-                    _current_batch_run_ids.append(run_id)
-                    _pending_tool_calls[run_id] = {
-                        "name": tool_name,
-                        "args": tool_input,
-                        "tool_call_id": run_id,
-                    }
+                    # Case 3: ToolMessage in the messages stream (rare;
+                    # usually comes via tasks). Skip — handled by tasks.
+                    if isinstance(payload, ToolMessage):
+                        continue
 
-                    # Same-tool chain: reuse the open step if the tool matches
-                    # and no non-tool event broke the chain; else start fresh.
-                    if _chain_step is not None and _chain_tool != tool_name:
-                        await _close_chain_step()
+            async def _consume_tasks():
+                """Consume the run.tasks projection for tool execution.
 
-                    if _chain_step is None:
-                        step = cl.Step(name=tool_name, type="tool")
-                        step.parent_id = response_msg.id
-                        if _icon:
+                Drives batch lifecycle from ``model`` task results (each
+                AIMessage with ``tool_calls`` opens a new batch) and pairs
+                each ``tools`` task (one tool call per task, dispatched via
+                ``Send("tools", [tool_call])``) with its single-ToolMessage
+                result. This matches the real LangGraph v3 protocol shape;
+                the previous implementation expected the pre-1.x shape where
+                one ``tools`` task carried the whole AIMessage and returned
+                all ToolMessages at once.
+                """
+                nonlocal _chain_step, _chain_tool, _chain_count, _batch_counter
+
+                def _open_batch(tool_calls: list[dict]) -> str:
+                    """Open a new batch for the given tool_calls.
+
+                    Returns the batch key. Each tool_call_id is mapped to
+                    this batch so result events can find their batch. The
+                    batch entry is pre-populated with empty results; results
+                    fill in as ``tools`` task results arrive.
+                    """
+                    nonlocal _batch_counter
+                    _batch_counter += 1
+                    bkey = f"batch-{_batch_counter}"
+                    entries: list[dict] = []
+                    for tc in tool_calls:
+                        entry = {
+                            "name": tc["name"],
+                            "args": tc.get("args", {}),
+                            "id": tc["id"],
+                            "result": "",
+                        }
+                        entries.append(entry)
+                        _call_id_to_batch[tc["id"]] = bkey
+                        _pending_results[tc["id"]] = entry
+                    _open_batches[bkey] = entries
+                    return bkey
+
+                def _close_batch(bkey: str) -> None:
+                    """Flush a completed batch to _tool_call_batches and
+                    clean up its call_id mappings."""
+                    entries = _open_batches.pop(bkey, None)
+                    if not entries:
+                        return
+                    _flush_tool_batch(list(entries))
+                    for e in entries:
+                        _call_id_to_batch.pop(e["id"], None)
+                        _pending_results.pop(e["id"], None)
+
+                def _maybe_close_batch_for_call(tc_id: str) -> None:
+                    """If all of tc_id's batch results are in, flush it."""
+                    bkey = _call_id_to_batch.get(tc_id)
+                    if bkey is None:
+                        return
+                    entries = _open_batches.get(bkey)
+                    if not entries:
+                        return
+                    if all(e["result"] != "" or e["id"] not in _pending_results for e in entries):
+                        # All results landed (or were flushed) — close.
+                        if all(e["id"] not in _pending_results for e in entries):
+                            _close_batch(bkey)
+
+                def _ensure_batch_for_call(tc_id: str, tc: dict) -> str:
+                    """Return the batch for tc_id, opening a fallback batch
+                    if the model task result hasn't arrived yet."""
+                    bkey = _call_id_to_batch.get(tc_id)
+                    if bkey is not None:
+                        return bkey
+                    # Model task result hasn't fired yet — open a singleton
+                    # fallback batch so this call isn't lost. It'll merge
+                    # with siblings only if they also fall back; the model
+                    # task result typically arrives first, so this is rare.
+                    return _open_batch([tc])
+
+                async for task in run.tasks:
+                    tname = task.get("name")
+                    has_result = "result" in task
+
+                    # ``model`` task result carries the AIMessage that
+                    # triggered the next batch of tool calls. Use it as the
+                    # authoritative batch opener.
+                    if tname == "model" and has_result:
+                        tresult = task.get("result")
+                        if not isinstance(tresult, dict):
+                            continue
+                        mmsgs = tresult.get("messages", [])
+                        ai = None
+                        for m in mmsgs:
+                            if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
+                                ai = m
+                        if ai is None:
+                            continue
+                        # Only open a batch for tool_calls whose ids aren't
+                        # already mapped (idempotent across re-emits / replays).
+                        new_calls = [
+                            tc for tc in ai.tool_calls
+                            if tc["id"] not in _call_id_to_batch
+                        ]
+                        if new_calls:
+                            _open_batch(new_calls)
+                        continue
+
+                    if tname != "tools":
+                        continue
+
+                    if not has_result:
+                        # Task start: input is [tool_call_dict] (one call).
+                        tinput = task.get("input")
+                        tc = _extract_tool_call(tinput)
+                        if tc is None:
+                            continue
+                        tool_name = tc["name"]
+                        tool_input = tc.get("args", {})
+                        tool_call_id = tc["id"]
+                        _icon, _lang, _open = _step_meta(tool_name)
+
+                        # write_todos: capture the agent's plan.
+                        if tool_name == "write_todos" and isinstance(tool_input, dict):
+                            todos = tool_input.get("todos", [])
+                            if isinstance(todos, list):
+                                from falkordb_harness.chainlit_progress import (
+                                    _get_or_create_todos_element,
+                                )
+                                await _get_or_create_todos_element(
+                                    initial_todos=todos,
+                                    ingestion_running=False,
+                                )
+
+                        # Ensure this call belongs to a batch.
+                        _ensure_batch_for_call(tool_call_id, tc)
+
+                        # Same-tool chain: reuse the open step if the tool
+                        # matches; else start fresh. Consecutive calls to
+                        # the SAME tool collapse into one cl.Step.
+                        if _chain_step is not None and _chain_tool != tool_name:
+                            await _close_chain_step()
+                        if _chain_step is None:
+                            step = cl.Step(name=tool_name, type="tool")
+                            step.parent_id = _on_message_step_id
+                            if _icon:
+                                try:
+                                    step.icon = _icon
+                                except Exception as exc:  # noqa: BLE001
+                                    logger.debug("step.icon unsupported: %s", exc)
+                            if _lang:
+                                step.language = _lang
+                            if _open:
+                                try:
+                                    step.default_open = True
+                                except Exception as exc:  # noqa: BLE001
+                                    logger.debug("step.default_open unsupported: %s", exc)
                             try:
-                                step.icon = _icon
-                            except Exception as exc:  # noqa: BLE001 — older Chainlit
-                                logger.debug("step.icon unsupported: %s", exc)
-                        if _lang:
-                            step.language = _lang
-                        if _open:
+                                step.tags = [tool_name]
+                            except Exception as exc:  # noqa: BLE001
+                                logger.debug("step.tags unsupported: %s", exc)
+                            step.input = ""
+                            step.output = ""
+                            await step.send()
+                            _chain_step = step
+                            _chain_tool = tool_name
+                            _chain_count = 0
+                        else:
+                            step = _chain_step
+
+                        _chain_count += 1
+                        n = _chain_count
+                        _call_id_to_n[tool_call_id] = n
+                        _call_id_to_step[tool_call_id] = step
+
+                        if n >= 2:
                             try:
-                                step.default_open = True
-                            except Exception as exc:  # noqa: BLE001 — older Chainlit
-                                logger.debug("step.default_open unsupported: %s", exc)
-                        try:
-                            step.tags = [tool_name]
-                        except Exception as exc:  # noqa: BLE001 — older Chainlit
-                            logger.debug("step.tags unsupported: %s", exc)
-                        step.input = ""
-                        step.output = ""
-                        await step.send()
-                        _chain_step = step
-                        _chain_tool = tool_name
-                        _chain_count = 0
-                    else:
-                        step = _chain_step
+                                step.name = t("tools.chain.header", tool=tool_name, n=n)
+                            except Exception as exc:  # noqa: BLE001
+                                logger.debug("step.name unsupported: %s", exc)
+                            try:
+                                if f"x{n}" not in (step.tags or []):
+                                    step.tags = (step.tags or []) + [f"x{n}"]
+                            except Exception as exc:  # noqa: BLE001
+                                logger.debug("step.tags append unsupported: %s", exc)
 
-                    _chain_count += 1
-                    n = _chain_count
-                    run_index[run_id] = n
-                    active_steps[run_id] = step
-
-                    if n >= 2:
-                        try:
-                            step.name = t("tools.chain.header", tool=tool_name, n=n)
-                        except Exception as exc:  # noqa: BLE001 — older Chainlit
-                            logger.debug("step.name unsupported: %s", exc)
-                        try:
-                            if f"x{n}" not in (step.tags or []):
-                                step.tags = (step.tags or []) + [f"x{n}"]
-                        except Exception as exc:  # noqa: BLE001
-                            logger.debug("step.tags append unsupported: %s", exc)
-
-                    # Append this call's input as a numbered section.
-                    try:
-                        from falkordb_harness.chainlit_formatting import (
-                            format_tool_input,
-                        )
-                        formatted_in = format_tool_input(tool_name, tool_input)
-                    except Exception:
-                        formatted_in = str(tool_input)[:2000]
-                    header = t("tools.chain.call_input", n=n)
-                    if step.input:
-                        step.input += "\n\n"
-                    step.input += f"{header}\n{formatted_in}"
-                    try:
-                        await step.update()
-                    except Exception as exc:  # noqa: BLE001 — never block the stream
-                        logger.debug("chain step.input update failed: %s", exc)
-
-                elif kind == "on_tool_end":
-                    run_id = event.get("run_id", "")
-                    tool_name = event.get("name") or "tool"
-                    step = active_steps.pop(run_id, None)
-                    n = run_index.pop(run_id, 0)
-                    output = event.get("data", {}).get("output", "")
-                    # Store tool result for Claude-style history preservation.
-                    _tool_results[run_id] = str(output) if output is not None else ""
-                    if step:
+                        # Append input as a numbered section.
                         try:
                             from falkordb_harness.chainlit_formatting import (
-                                format_tool_output,
+                                format_tool_input,
                             )
-                            formatted_out = format_tool_output(tool_name, output)
+                            formatted_in = format_tool_input(tool_name, tool_input)
                         except Exception:
-                            formatted_out = str(output)[:2000]
-                        header = t("tools.chain.call_output", n=n or 1)
-                        if step.output:
-                            step.output += "\n\n"
-                        step.output += f"{header}\n{formatted_out}"
+                            formatted_in = str(tool_input)[:2000]
+                        header = t("tools.chain.call_input", n=n)
+                        if step.input:
+                            step.input += "\n\n"
+                        step.input += f"{header}\n{formatted_in}"
                         try:
                             await step.update()
-                        except Exception as exc:  # noqa: BLE001 — never block
-                            logger.debug("chain step.output update failed: %s", exc)
-
-                    # Build visual elements for the final assistant message.
-                    # Builders are fail-safe; collected (not sent) to keep the
-                    # chat compact — the Step shows the formatted output.
-                    await _collect_visual_elements(
-                        tool_name, output, pending_elements
-                    )
-                    # Register preprocessed docs when the agent ran
-                    # preprocess_document directly (extract_and_write
-                    # registers inside run_ingestion). Best-effort.
-                    if tool_name == "preprocess_document":
-                        await _register_preprocessed_from_tool_output(output)
-                    # reset_graph wipes graph data; clear the registry's
-                    # ingested rows for the active graph to match. Best-effort.
-                    if tool_name == "reset_graph":
-                        try:
-                            selection = cl.user_session.get(
-                                "graph_selection"
-                            ) or {}
-                            active = selection.get(
-                                "active_graph", _DEFAULT_GRAPH
-                            )
-                            from falkordb_harness.document_registry import (
-                                clear_ingested_for_graph,
-                            )
-
-                            await clear_ingested_for_graph(active)
                         except Exception as exc:  # noqa: BLE001
-                            logger.debug("clear_ingested failed: %s", exc)
+                            logger.debug("chain step.input update failed: %s", exc)
+                    else:
+                        # Task result: a single ToolMessage (one per task).
+                        tresult = task.get("result")
+                        if not isinstance(tresult, dict):
+                            continue
+                        rmsgs = tresult.get("messages", [])
+                        for tm in rmsgs:
+                            if not isinstance(tm, ToolMessage):
+                                continue
+                            tc_id = tm.tool_call_id
+                            tool_name = tm.name or "tool"
+                            output = tm.content
+                            step = _call_id_to_step.pop(tc_id, None)
+                            n = _call_id_to_n.pop(tc_id, 0)
+                            if step:
+                                try:
+                                    from falkordb_harness.chainlit_formatting import (
+                                        format_tool_output,
+                                    )
+                                    formatted_out = format_tool_output(tool_name, output)
+                                except Exception:
+                                    formatted_out = str(output)[:2000]
+                                header = t("tools.chain.call_output", n=n or 1)
+                                if step.output:
+                                    step.output += "\n\n"
+                                step.output += f"{header}\n{formatted_out}"
+                                try:
+                                    await step.update()
+                                except Exception as exc:  # noqa: BLE001
+                                    logger.debug("chain step.output update failed: %s", exc)
+                            # Record the result into the batch entry.
+                            entry = _pending_results.pop(tc_id, None)
+                            if entry is not None:
+                                entry["result"] = (
+                                    str(output) if output is not None else ""
+                                )
+                            # Visual elements + side effects.
+                            await _collect_visual_elements(
+                                tool_name, output, pending_elements
+                            )
+                            if tool_name == "preprocess_document":
+                                await _register_preprocessed_from_tool_output(output)
+                            if tool_name == "reset_graph":
+                                try:
+                                    selection = cl.user_session.get(
+                                        "graph_selection"
+                                    ) or {}
+                                    active = selection.get(
+                                        "active_graph", _DEFAULT_GRAPH
+                                    )
+                                    from falkordb_harness.document_registry import (
+                                        clear_ingested_for_graph,
+                                    )
+                                    await clear_ingested_for_graph(active)
+                                except Exception as exc:  # noqa: BLE001
+                                    logger.debug("clear_ingested failed: %s", exc)
+                            # If this call's batch is fully resolved, flush it.
+                            _maybe_close_batch_for_call(tc_id)
+
+                # Drain any batches left open (e.g. model produced tool_calls
+                # but the run ended — recursion limit — before all results
+                # landed). Partial entries keep their empty result string.
+                for bkey in list(_open_batches.keys()):
+                    _close_batch(bkey)
+
+            await asyncio.gather(_consume_raw(), _consume_tasks())
     except GraphRecursionError:
         # Recursion budget exhausted (repeat-guard normally prevents this).
         # Surface a friendly message + partial response instead of a traceback.
@@ -1958,49 +2324,86 @@ async def on_message(message: cl.Message) -> None:
             "GraphRecursionError: recursion limit (%d) reached",
             _DEFAULT_RECURSION_LIMIT,
         )
-        # Flush any pending tool batch before storing history.
-        if _in_tool_batch and _current_batch_run_ids:
-            _flush_tool_batch()
+        # Flush any open batches before storing history.
+        for bkey in list(_open_batches.keys()):
+            entries = _open_batches.pop(bkey, None)
+            if entries:
+                _flush_tool_batch(list(entries))
+                for e in entries:
+                    _call_id_to_batch.pop(e["id"], None)
+                    _pending_results.pop(e["id"], None)
         if not full_response:
             full_response = t("error.recursion")
-            await response_msg.stream_token(full_response)
+        _rm = await _new_answer_msg()
+        if not _rm.content:
+            await _rm.stream_token(full_response)
     except Exception as exc:
         logger.error("Unexpected error in agent streaming: %s", exc, exc_info=True)
+        _rm = await _new_answer_msg()
         if full_response:
-            await response_msg.stream_token(t("error.interrupted.partial"))
+            await _rm.stream_token(t("error.interrupted.partial"))
         else:
             full_response = t("error.unexpected")
-            await response_msg.stream_token(full_response)
-        for step in active_steps.values():
+            await _rm.stream_token(full_response)
+        for step in _call_id_to_step.values():
             step.output = t("error.interrupted.step")
             await step.update()
-        active_steps.clear()
+        _call_id_to_step.clear()
         await _close_chain_step()
     finally:
-        # Deregister the in-flight stream (response_msg.update below persists
-        # the full text for a normal resume). Finally guarantees cleanup even
-        # if an except handler raised.
-        deregister_stream(_stream_thread_id)
+        # Deregister the in-flight stream (the update() calls below persist the
+        # full text for a normal resume). Finally guarantees cleanup even if an
+        # except handler raised. With multiple answer messages per turn, the
+        # registry entry points at whichever message was registered last (each
+        # _new_answer_msg overwrites it); the prior spans have already finished
+        # streaming by the time a later one starts.
+        if _stream_thread_id is not None:
+            deregister_stream(_stream_thread_id)
         # Drop the per-turn factory so a stale closure can't be reused. Cleared
         # here (not at end of on_message) so CancelledError still drops it.
         cl.user_session.set("ingest_progress_factory", None)
+        # Collapse the pinned AgentTodos panel so it doesn't linger
+        # between turns. The element stays in user_session for the next
+        # turn to re-populate if the agent re-plans. Keep ``stages`` so
+        # the concluded ingestion run remains visible as a chronological
+        # record; only clear the todos plan (the agent rewrites it next
+        # turn via ``write_todos``).
+        _todo_el = cl.user_session.get("agent_todos_el")
+        if _todo_el is not None:
+            _todo_el.props["todos"] = []
+            _todo_el.props["ingestion_running"] = False
+            try:
+                from falkordb_harness.chainlit_progress import _sync_update
+                await _sync_update(_todo_el)
+            except Exception:  # noqa: BLE001 — never strand cleanup
+                pass
 
-    await response_msg.update()
+    # Fallback: if no answer span was ever produced but we captured
+    # reasoning text, surface it rather than leaving the user with an
+    # empty response. Under normal v3 flow the final answer streams as
+    # text-delta events; this branch covers edge cases where the model
+    # produced only reasoning blocks (e.g. a reasoning-only run that
+    # hit recursion before the final answer). Reasoning text already
+    # lives in the thinking Step; only surface it as an answer if no
+    # answer span was ever produced.
+    if thinking_text and not _answer_messages:
+        _rm = await _new_answer_msg()
+        _rm.content = thinking_text
+        await _rm.update()
 
-    # Attach visual elements collected during the stream so they render with
-    # the streamed text (not as a trailing element-only message).
-    if pending_elements:
-        try:
-            response_msg.elements = pending_elements
-            await response_msg.update()
-        except Exception as exc:  # noqa: BLE001 — never break on element send
-            logger.debug("element attach failed: %s", exc)
-
-    # Tools streamed their answer into the thinking step; replay into
-    # response_msg so the user sees it in the main message.
-    if _any_tool_called and thinking_text and not response_msg.content:
-        response_msg.content = thinking_text
-        await response_msg.update()
+    # Persist every answer message (each may still be marked streaming). The
+    # visual elements attach to the last answer message so they render with
+    # the final streamed text rather than as a trailing element-only message.
+    if _answer_messages:
+        for _am in _answer_messages:
+            await _am.update()
+        if pending_elements:
+            _last = _answer_messages[-1]
+            try:
+                _last.elements = pending_elements
+                await _last.update()
+            except Exception as exc:  # noqa: BLE001 — never break on element send
+                logger.debug("element attach failed: %s", exc)
 
     # Claude-style history: preserve full tool-call/tool-result pairs so the
     # agent sees exactly what it called and what each tool returned on
@@ -2013,14 +2416,14 @@ async def on_message(message: cl.Message) -> None:
             tool_calls.append({
                 "name": tc["name"],
                 "args": tc["args"],
-                "id": tc["tool_call_id"],
+                "id": tc["id"],
                 "type": "tool_call",
             })
         chat_history.append(AIMessage(content="", tool_calls=tool_calls))
         for tc in batch:
             chat_history.append(ToolMessage(
                 content=tc["result"],
-                tool_call_id=tc["tool_call_id"],
+                tool_call_id=tc["id"],
             ))
     chat_history.append(AIMessage(content=full_response))
 

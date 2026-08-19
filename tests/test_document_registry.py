@@ -322,6 +322,84 @@ def test_list_for_graph_returns_ingested_documents(tmp_registry):
 
 
 # ---------------------------------------------------------------------------
+# list_for_user
+# ---------------------------------------------------------------------------
+def test_list_for_user_returns_rows_across_threads(tmp_registry):
+    """list_for_user returns the user's documents across ALL threads,
+    not just one — this is what the document sidebar uses so the toggle
+    button (visibility driven by count_for_user) opens a non-empty
+    sidebar even when the current thread is fresh and the user's docs
+    live in a previous thread.
+    """
+    from falkordb_harness.document_registry import list_for_user
+
+    _run(
+        tmp_registry.register_upload(
+            thread_id="t1", user_identifier="u1", name="a.pdf",
+            original_path="/o/a.pdf", checksum="1",
+        )
+    )
+    _run(
+        tmp_registry.register_upload(
+            thread_id="t2", user_identifier="u1", name="b.pdf",
+            original_path="/o/b.pdf", checksum="2",
+        )
+    )
+    docs = _run(list_for_user("u1"))
+    assert len(docs) == 2
+    names = {d["name"] for d in docs}
+    assert names == {"a.pdf", "b.pdf"}
+
+
+def test_list_for_user_filters_by_user(tmp_registry):
+    from falkordb_harness.document_registry import list_for_user
+
+    _run(
+        tmp_registry.register_upload(
+            thread_id="t1", user_identifier="u1", name="a.pdf",
+            original_path="/o/a.pdf", checksum="1",
+        )
+    )
+    _run(
+        tmp_registry.register_upload(
+            thread_id="t2", user_identifier="u2", name="b.pdf",
+            original_path="/o/b.pdf", checksum="2",
+        )
+    )
+    assert len(_run(list_for_user("u1"))) == 1
+    assert len(_run(list_for_user("u2"))) == 1
+    assert _run(list_for_user("u3")) == []
+
+
+def test_list_for_user_empty_identifier_returns_empty(tmp_registry):
+    from falkordb_harness.document_registry import list_for_user
+
+    _run(
+        tmp_registry.register_upload(
+            thread_id="t1", user_identifier="u1", name="a.pdf",
+            original_path="/o/a.pdf", checksum="1",
+        )
+    )
+    assert _run(list_for_user("")) == []
+    assert _run(list_for_user(None)) == []
+
+
+def test_list_for_user_marks_preprocessed_bool(tmp_registry):
+    from falkordb_harness.document_registry import list_for_user
+
+    _run(
+        tmp_registry.register_preprocessed(
+            thread_id="t1", user_identifier="u1", name="a.pdf",
+            original_path="/o/a.pdf", preprocessed_path="/p/a.md",
+        )
+    )
+    docs = _run(list_for_user("u1"))
+    assert len(docs) == 1
+    assert docs[0]["preprocessedPath"] == "/p/a.md"
+    assert docs[0]["preprocessed"] in (1, True)
+
+
+# ---------------------------------------------------------------------------
 # get / get_ingestion
 # ---------------------------------------------------------------------------
 def test_get_returns_row(tmp_registry):

@@ -15,12 +15,12 @@ from pathlib import Path
 
 from deepagents import create_deep_agent
 from deepagents.backends.filesystem import FilesystemBackend
+from langchain.agents.middleware import TodoListMiddleware
+from langchain.agents.middleware.types import AgentMiddleware
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AnyMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
-from langgraph.graph import START, StateGraph
-from langgraph.graph.message import MessagesState
 from langgraph.types import Checkpointer
 
 from falkordb_harness._loop_guard import RepeatGuardMiddleware
@@ -98,22 +98,25 @@ def _summarise_part(part: object) -> object:
     return part
 
 
-def _log_attachments(state: dict) -> dict:
-    """Pre-graph node that logs how the last human message arrived.
+def _log_attachments(state: dict) -> None:
+    """Log how the last human message arrived.
 
     Inspects ``state["messages"]`` and emits the type and a compact
     representation of the content of the last ``HumanMessage``. This is purely
     diagnostic and does not modify state.
+
+    Factored out of :class:`LogAttachmentsMiddleware` so the diagnostic logic
+    stays readable and unit-testable without instantiating the middleware.
     """
-    messages: list[AnyMessage] = state.get("messages", [])
+    messages: list[AnyMessage] = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
     if not messages:
         logger.info("attachments: no messages in state")
-        return {}
+        return
 
     last = messages[-1]
     if not isinstance(last, HumanMessage):
         logger.info("attachments: last message is %s (not HumanMessage)", type(last).__name__)
-        return {}
+        return
 
     content = last.content
     if isinstance(content, str):
@@ -142,49 +145,40 @@ def _log_attachments(state: dict) -> dict:
             "attachments: additional_kwargs = %s",
             json.dumps(_summarise_part(last.additional_kwargs), default=repr),
         )
-    return {}
+
+
+class LogAttachmentsMiddleware(AgentMiddleware):
+    """Diagnostic middleware that logs the raw wire format of the last
+    ``HumanMessage`` before the agent execution starts.
+
+    Replaces the previous pre-graph ``log_attachments`` wrapper node. Running
+    as a ``before_agent`` middleware hook (instead of a parent ``StateGraph``
+    wrapping the deep agent) keeps the agent at the run stream's root scope so
+    ``TasksTransformer``-based consumers (the Chainlit ``on_message`` handler)
+    see the inner ``tools`` / ``model`` task events at scope ``()``. The prior
+    parent-graph wrapping placed those tasks at the ``('agent',)`` subgraph
+    namespace, where the root-scoped ``TasksTransformer`` filtered them out —
+    silently dropping every tool-call step and the Claude-style tool-call
+    history.
+
+    The middleware node is named ``log_attachments.before_agent`` inside the
+    agent graph (LangChain's ``create_agent`` registers ``before_agent`` hooks
+    as ``f"{m.name}.before_agent"`` nodes). It returns no state updates, so it
+    emits no ``messages`` events on the v3 stream.
+    """
+
+    name = "log_attachments"
+
+    def before_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:
+        _log_attachments(state)  # type: ignore[arg-type]
+        return None
+
+    async def abefore_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:
+        _log_attachments(state)  # type: ignore[arg-type]
+        return None
 
 SYSTEM_PROMPT = """\
 You are a knowledge-graph assistant for a factory-planning FalkorDB database.
-
-You can:
-- Inspect raw source files before ingestion (file_metadata, read_excerpt)
-- Preprocess binary/scanned/image documents into Markdown \
-(preprocess_document)
-- Ingest preprocessed Markdown into the graph (chunk_documents, \
-extract_and_write) — and estimate how long ingestion will take before \
-confirming (estimate_ingestion_time)
-- Query the graph with raw Cypher (cypher_query) or natural language (nl_query)
-- Search by full-text or vector similarity (search)
-- Inspect the graph schema, nodes, edges, and node count \
-(get_schema)
-- Discover which knowledge graphs exist in the FalkorDB instance (list_graphs) \
-and switch the active graph among the user's enabled set — switching requires \
-prior user confirmation via request_graph_switch followed by use_graph
-- Create a new knowledge graph (create_graph) when the user wants to ingest \
-data into a new graph — allowed at any time, regardless of whether a graph \
-is currently active, no confirmation needed, decide on user sentiment
-- Read graph descriptions (describe_graph) — the first-contact point for \
-understanding existing KGs — and revise the active graph's description after \
-every ingestion (update_graph_description)
-- Manage merge conflicts via cypher_query: list nodes with a non-null \
-``conflicts`` property, and resolve a specific conflict entry by rewriting \
-its JSON string to set ``resolved: true`` and ``resolved_at`` and SETting \
-the full ``n.conflicts`` list back in one Cypher statement. Each conflict \
-entry carries a stable ``id`` of the form ``<property>:<detected_at>``. See \
-the cypher_query tool docstring for the exact schema and query patterns.
-- Manage duplicate detection: reconciliation runs automatically during \
-ingestion. After ingestion, report duplicates found alongside conflicts. \
-Offer an interactive walkthrough: present each duplicate one-by-one (plain \
-name, indexed name, cosine similarity, LLM confidence) and ask the user to \
-accept or reject. Use resolve_duplicate(plain_name, action) where action is \
-"accept" (merge nodes, transfer relationships, record property conflicts in \
-n.conflicts), "reject" (dismiss the link), or "keep_separate" (same as reject \
-but the user considers the entities distinct). Use get_reconciliations to list \
-outstanding duplicates at any time.
-- Reset the graph (reset_graph) — use only when explicitly asked
-- Ask the user a clarifying question (ask_user) or request explicit \
-confirmation before ingestion (request_ingestion_confirmation)
 
 SESSION FILE ISOLATION (mandatory):
 Raw sources and preprocessed Markdown are stored on disk under per-session \
@@ -288,17 +282,58 @@ stays accurate. The description is the first thing read when understanding \
 the graph.
 Err on the side of showing the user too much summary rather than too little.
 
+TASK PLANNING WITH write_todos (mandatory for multi-step work):
+- Use ``write_todos`` to create and maintain a structured task list for EVERY \
+multi-step operation — the user sees your plan live in a pinned panel above the \
+chat input. This is NOT optional for complex work; it is the primary way the \
+user tracks your progress.
+- You MUST use ``write_todos`` for these workflows (they are always multi-step):
+  * The PRE-INGESTION REVIEW ROUTINE (steps 0-6b above) — break it into \
+concrete todos: discover files, inspect metadata, read excerpts, preprocess \
+binary files, summarize findings, estimate time, confirm, ingest, update \
+description.
+  * Any ingestion run (extract_and_write) — mark the ingestion step as \
+in_progress before calling the tool, and completed after it returns.
+  * Preprocessing one or more documents (preprocess_document) — one todo per \
+file, marked in_progress/completed as each finishes.
+  * Graph creation + first ingestion — plan the create→review→ingest→describe \
+sequence.
+  * Reconciliation walkthroughs (resolve_duplicate) — one todo per duplicate \
+pair.
+  * Any user request that spans 3+ distinct actions.
+- Mark a todo as in_progress BEFORE beginning work on it. Mark it completed \
+IMMEDIATELY after finishing. Never batch completions.
+- When the ingestion progress panel appears (the "Progress" section in the \
+pinned panel), your todo list and the progress section render together — the \
+user sees both your plan and the live pipeline ETA simultaneously. Keep your \
+todos in sync with the pipeline stages.
+- For simple single-step queries (a quick Cypher lookup, a schema question, a \
+count), skip write_todos — it adds overhead with no benefit.
+
 Guidelines:
 - Before querying, call get_schema to understand available labels and relationships.
 - Prefer nl_query for open-ended questions; use cypher_query when the user \
 provides Cypher or when you can construct a precise query.
 - Always report results clearly, including counts, conflicts detected, and \
 reconciliation links.
+- You may create a new knowledge graph (create_graph) at any time, regardless \
+of whether a graph is currently active. No user confirmation is needed — \
+derive the name and description from the user's intent.
 - Reconciliation applies to Resources only and never auto-merges duplicates; \
 always leave adjudication to the human via resolve_duplicate.
 - When accepting a merge, warn the user that conflicting properties are stored \
 in the surviving node's conflicts list and offer to resolve them.
-- Present duplicates one at a time; do not batch-accept or batch-reject.
+- Present duplicates one at a time; do not batch-accept or batch-reject. \
+Use resolve_duplicate(plain_name, action) where action is "accept" (merge \
+nodes, transfer relationships, record property conflicts in n.conflicts), \
+"reject" (dismiss the link), or "keep_separate" (same as reject but the user \
+considers the entities distinct). Use get_reconciliations to list outstanding \
+duplicates at any time.
+- Merge conflicts are stored as a ``conflicts`` JSON list on nodes. Each entry \
+has a stable ``id`` of the form ``<property>:<detected_at>``. Resolve a \
+conflict by rewriting its JSON to set ``resolved: true`` and ``resolved_at``, \
+then SET the full ``n.conflicts`` list back in one Cypher statement. See the \
+cypher_query tool docstring for the exact schema.
 - Never reset the graph without explicit user confirmation.
 - To switch the active graph: (1) call list_graphs to see what exists, (2) \
 call request_graph_switch(name) — this asks the user to confirm via a \
@@ -646,26 +681,23 @@ def build_agent(
     else:
         backend = FilesystemBackend(root_dir=str(data_dir), virtual_mode=True)
 
+    # Build the middleware stack. Order: LogAttachmentsMiddleware first so
+    # the diagnostic log fires before any other before_agent hook; then
+    # RepeatGuardMiddleware (loop-breaker); then TodoListMiddleware
+    # (deepagents v0.7+ no longer auto-adds it — see AGENTS.md).
+    middleware: list[AgentMiddleware] = [RepeatGuardMiddleware(), TodoListMiddleware()]
+    if _LOG_ATTACHMENTS:
+        # Prepend so the attachment log fires before other before_agent hooks.
+        middleware.insert(0, LogAttachmentsMiddleware())
+
     agent = create_deep_agent(
         model=llm,
         tools=tools,
         system_prompt=system_prompt,
         backend=backend,
-        middleware=[RepeatGuardMiddleware()],
+        middleware=middleware,
     )
-
-    if not _LOG_ATTACHMENTS:
-        return agent
-
-    # Wrap in a parent graph whose first node logs the raw wire format of
-    # the last HumanMessage (inspect how `langgraph dev` delivers uploads).
-    parent = StateGraph(MessagesState)
-    parent.add_node("log_attachments", _log_attachments)
-    parent.add_node("agent", agent)
-    parent.add_edge(START, "log_attachments")
-    parent.add_edge("log_attachments", "agent")
-    checkpointer: Checkpointer | None = getattr(agent, "checkpointer", None)
-    return parent.compile(checkpointer=checkpointer)
+    return agent
 
 
 # Alias for LangGraph Studio / langgraph.json.

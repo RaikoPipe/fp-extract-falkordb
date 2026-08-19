@@ -118,6 +118,13 @@ services:
       # Docker-out-of-Docker: the chainlit container creates sibling
       # python-runner-<thread> containers via the host daemon.
       - /var/run/docker.sock:/var/run/docker.sock
+      # Live source — no rebuild needed for code edits:
+      - ./src:/app/src
+      - ./public:/app/public
+      - ./.chainlit:/.chainlit
+      - ./chainlit.md:/app/chainlit.md
+      - ./chainlit_en-US.md:/app/chainlit_en-US.md
+      - ./chainlit_de-DE.md:/app/chainlit_de-DE.md
     depends_on:
       falkordb:
         condition: service_healthy

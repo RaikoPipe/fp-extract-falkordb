@@ -25,13 +25,14 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import aiofiles
 from chainlit.data import BaseDataLayer
 from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
 from chainlit.data.storage_clients.base import BaseStorageClient
 from chainlit.data.utils import queue_until_user_message
+from chainlit.user import PersistedUser
 
 logger = logging.getLogger("falkordb_harness.data_layer")
 
@@ -426,7 +427,65 @@ class TagsJsonSQLAlchemyDataLayer(SQLAlchemyDataLayer):
     write is still valid JSON for a JSON column; list out on read skips
     re-parsing). The override is intentionally narrow — only ``tags`` is
     touched; everything else delegates to the parent.
+
+    Also overrides :meth:`get_user` to inject ``role``/``email``/
+    ``accountStatus`` from the dedicated columns into the returned
+    ``PersistedUser.metadata``. Chainlit's stock
+    :meth:`SQLAlchemyDataLayer.get_user` reads only the ``metadata`` JSON
+    column, but :mod:`falkordb_harness.auth` stores ``role`` on a
+    dedicated column (with ``metadata`` left as ``"{}"`` at insert time).
+    Without this override, the persisted user returned to Chainlit's
+    ``authenticate_user`` flow has empty metadata, so
+    ``cl.context.session.user.metadata.get("role")`` is ``None`` and every
+    admin-gated check (``on_chat_start`` tool gating, the
+    ``__chat_flow_test__`` guard, ``build_agent``'s role-based tools)
+    silently fails for admins — even though the JWT carried the role and
+    ``get_user_role`` (which reads the dedicated column) works. Merging
+    the dedicated columns back into metadata here is the centralized fix
+    that keeps ``verify_credentials``' ``User.metadata`` (the JWT source
+    of truth) and the persisted user in sync.
     """
+
+    async def get_user(self, identifier: str) -> Optional[PersistedUser]:  # type: ignore[override]
+        user = await super().get_user(identifier)
+        if user is None:
+            return None
+        # Re-query the dedicated columns (role/email/accountStatus) and
+        # merge them into the metadata dict. We don't parse the row in
+        # super().get_user because that one only selects the JSON
+        # ``metadata`` column; the dedicated columns are read here in a
+        # single round-trip. Any key already present in metadata wins
+        # (last_graph etc.), but role/email/accountStatus are only ever
+        # written via auth.py to the dedicated columns, so overwriting
+        # them with the authoritative column value is correct.
+        from sqlalchemy import text
+
+        async with self.engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text(
+                        'SELECT "role", "email", "accountStatus" '
+                        'FROM users WHERE "identifier" = :i'
+                    ),
+                    {"i": identifier},
+                )
+            ).fetchone()
+        merged = dict(user.metadata or {})
+        if row is not None:
+            role, email, status = row
+            if role is not None:
+                merged["role"] = role
+            if email is not None:
+                merged["email"] = email
+            if status is not None:
+                merged["accountStatus"] = status
+        return PersistedUser(
+            id=user.id,
+            identifier=user.identifier,
+            createdAt=user.createdAt,
+            display_name=user.display_name,
+            metadata=merged,
+        )
 
     @queue_until_user_message()
     async def create_step(self, step_dict):  # type: ignore[override]

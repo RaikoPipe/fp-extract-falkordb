@@ -708,6 +708,48 @@ async def list_for_graph(graph_name: str) -> list[dict[str, Any]]:
         return []
 
 
+async def list_for_user(user_identifier: str) -> list[dict[str, Any]]:
+    """Return all document rows owned by ``user_identifier``.
+
+    User-scoped counterpart to :func:`count_for_user` — returns the actual
+    rows (count_for_user only returns the count). Covers uploaded +
+    preprocessed rows across ALL the user's chat threads, so the document
+    sidebar can show files the user uploaded in a previous thread even
+    when the current thread is empty. Without this the floating toggle
+    button (visibility driven by ``/api/docs-info``, which calls
+    ``count_for_user``) would be visible while the sidebar opened empty
+    — the button click did nothing because :func:`_build_document_manager_props`
+    only looked at the current thread and returned ``None``.
+
+    Ordered by ``createdAt`` ascending (oldest first). Each row carries
+    the documents-table columns plus a boolean ``preprocessed``
+    (``preprocessedPath IS NOT NULL``). Returns ``[]`` on error.
+    """
+    if not user_identifier:
+        return []
+    await _ensure_tables()
+    try:
+        async with _engine().connect() as conn:
+            rows = (
+                await conn.execute(
+                    text(
+                        """
+                        SELECT *,
+                               ("preprocessedPath" IS NOT NULL) AS preprocessed
+                          FROM documents
+                         WHERE "userIdentifier" = :u
+                         ORDER BY "createdAt" ASC
+                        """
+                    ),
+                    {"u": user_identifier},
+                )
+            ).fetchall()
+        return [_row_to_dict(r) for r in rows]
+    except Exception as exc:  # noqa: BLE001
+        logger.error("list_for_user failed: %s", exc)
+        return []
+
+
 async def list_ingested_graphs_for(document_id: str) -> list[str]:
     """Return the graph names a document has been ingested into."""
     await _ensure_tables()

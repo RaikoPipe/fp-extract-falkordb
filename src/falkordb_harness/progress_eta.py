@@ -17,14 +17,49 @@ other, then a long pause until the next batch. A per-tick EMA (tqdm's
 it/s, which collapses the ETA to 0:00. The cumulative average is immune to
 clustering because both ``n`` and ``elapsed`` are monotone and unaffected
 by the inter-tick gap distribution.
+
+The cumulative average has a known residual bias: ``start_time`` is set on
+the first progress event (first chunk completion), but the concurrency
+pool is started before any chunk completes, so the first batch of
+``concurrency`` chunks finishes near-simultaneously and inflates the early
+rate. Under the default ``INGEST_CONCURRENCY=4`` this produces a
+~3x underestimate of remaining time. :func:`_eta_safety_factor` applies a
+conservative multiplier (default ``3.0``, configurable via
+``INGEST_ETA_SAFETY_FACTOR``) to the ETA so the displayed value is an
+upper bound rather than an over-optimistic one.
 """
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 
 _MIN_DT = 1e-6
+
+
+def _eta_safety_factor() -> float:
+    """Conservative multiplier applied to the raw ``remaining / rate`` ETA.
+
+    The cumulative-average rate is biased high during the first batch of a
+    concurrent extraction run (the first ``concurrency`` chunks all complete
+    near the same wall-clock moment, before steady-state pacing kicks in),
+    which makes the naive ETA underestimate remaining time by roughly the
+    concurrency factor. We inflate the ETA so the user sees a conservative
+    upper bound rather than an over-optimistic one. Default ``3.0`` matches
+    the observed ~3x underestimate at the default ``INGEST_CONCURRENCY=4``;
+    override via the ``INGEST_ETA_SAFETY_FACTOR`` env var (``1.0`` disables).
+    """
+    raw = os.getenv("INGEST_ETA_SAFETY_FACTOR", "")
+    if not raw:
+        return 3.0
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return 3.0
+    if v != v or v in (float("inf"), float("-inf")):  # NaN / inf guards
+        return 3.0
+    return max(v, 0.0)
 
 
 def format_duration(seconds: float) -> str:
@@ -132,10 +167,19 @@ class TimeEstimator:
         """Estimated remaining seconds (``-1.0`` if not yet estimable).
 
         Returns ``-1.0`` when no items have completed or the total is
-        unknown / zero, matching tqdm's "unknown" sentinel. The ETA is
+        unknown / zero, matching tqdm's "unknown" sentinel. The raw ETA is
         ``remaining / rate`` using the cumulative-average rate, which is
         stable under the clustered-completion pattern of concurrent
-        extraction (see module docstring).
+        extraction (see module docstring). It is then inflated by
+        :func:`_eta_safety_factor` (default ``3.0``, configurable via
+        ``INGEST_ETA_SAFETY_FACTOR``) to correct the systematic
+        underestimation caused by the first-batch warmup bias: the
+        estimator's ``start_time`` is set on the first progress event
+        (the first chunk completion), but ``extract_from_chunks`` starts
+        the concurrency pool before any chunk completes, so the first
+        ``concurrency`` chunks finish near-simultaneously and skew the
+        cumulative-average rate high. The safety factor makes the
+        displayed ETA a conservative upper bound.
         """
         if self.total <= 0:
             return -1.0
@@ -144,7 +188,7 @@ class TimeEstimator:
         r = self.rate
         if r <= 0:
             return -1.0
-        return self.remaining / r
+        return (self.remaining / r) * _eta_safety_factor()
 
     def render(self) -> dict[str, str | float]:
         """Return a dict of display-ready fields for the UI layer.

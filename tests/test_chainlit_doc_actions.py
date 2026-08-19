@@ -577,3 +577,87 @@ def test_on_window_message_still_refreshes_sidebar():
         "on_window_message must call _refresh_sidebar — it is the sole "
         "legitimate entry point (the user's explicit click on the toggle)"
     )
+
+
+# ---------------------------------------------------------------------------
+# _build_document_manager_props — cross-thread scoping
+# ---------------------------------------------------------------------------
+# The floating toggle button's visibility is driven by /api/docs-info,
+# which calls count_for_user (user-scoped, across ALL threads). The
+# sidebar content builder (_build_document_manager_props) must use the
+# same user-scoped query (list_for_user), not list_for_thread (current
+# thread only). Otherwise the button is visible while the sidebar opens
+# empty and immediately closes — the click does nothing.
+#
+# This is a regression test for the bug where the sidebar did not open
+# on button click when the user's documents lived in a different thread
+# than the current one.
+
+
+def test_build_document_manager_props_uses_user_scope_not_thread():
+    """_build_document_manager_props must read list_for_user, not
+    list_for_thread, so its scoping matches /api/docs-info's
+    count_for_user signal.
+    """
+    import inspect
+
+    import falkordb_harness.chainlit_app as app
+
+    src = _clean_source(inspect.getsource(app._build_document_manager_props))
+    assert "list_for_user" in src, (
+        "_build_document_manager_props must use list_for_user (user-scoped) "
+        "so the sidebar opens whenever the toggle button is visible "
+        "(/api/docs-info uses count_for_user)"
+    )
+    assert "list_for_thread" not in src, (
+        "_build_document_manager_props must not use list_for_thread — it "
+        "scopes to the current thread only, causing the sidebar to open "
+        "empty when the user's docs are in a previous thread"
+    )
+
+
+def test_build_document_manager_props_returns_docs_from_other_thread(
+    tmp_registry, monkeypatch
+):
+    """End-to-end: a user who uploaded in thread 't_old' starts a fresh
+    chat (thread 't_new'). The sidebar must still list their document.
+    """
+    _install_cl_stubs(monkeypatch, user_identifier="u1", thread_id="t_new")
+    # Register a doc in a DIFFERENT thread than the current session's.
+    _run(
+        tmp_registry.register_upload(
+            thread_id="t_old", user_identifier="u1", name="a.pdf",
+            original_path="/data/originals/t_old/a.pdf", checksum="c1",
+        )
+    )
+    # No ingested rows for the active graph.
+    import falkordb_harness.chainlit_app as app
+
+    props = _run_with_ctx(app._build_document_manager_props())
+    assert props is not None, (
+        "sidebar must open when the user has documents in another thread"
+    )
+    assert len(props["documents"]) == 1
+    assert props["documents"][0]["name"] == "a.pdf"
+
+
+def test_build_document_manager_props_empty_when_no_docs(
+    tmp_registry, monkeypatch
+):
+    """A user with zero documents gets a non-None props set with an empty
+    documents list, so the sidebar opens and renders DocumentManager.jsx's
+    "No documents yet" empty-state card (instead of silently doing nothing).
+    """
+    _install_cl_stubs(monkeypatch, user_identifier="u1", thread_id="t1")
+
+    import falkordb_harness.chainlit_app as app
+
+    props = _run_with_ctx(app._build_document_manager_props())
+    assert props is not None, (
+        "_build_document_manager_props must not return None when there are "
+        "no docs — that makes _refresh_sidebar bail out before set_elements, "
+        "so the toggle button's open path is a silent no-op"
+    )
+    assert props["documents"] == []
+    assert "labels" in props
+    assert props["lang"] in ("en", "de")

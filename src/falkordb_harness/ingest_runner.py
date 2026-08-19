@@ -293,6 +293,11 @@ async def run_ingestion(
     # --- Stage 1: stage files into originals/<thread_id>/ ---
     originals = thread_originals_dir(thread_id)
     staged: list[Path] = []
+    if progress:
+        await progress(
+            f"Staging {len(file_paths)} file(s) into `originals/`…",
+            {"kind": "stage_start", "stage": "stage", "total": len(file_paths)},
+        )
     for src in file_paths:
         src = Path(src)
         if not src.exists() or not src.is_file():

@@ -277,20 +277,6 @@ STRINGS: dict[str, dict[str, str]] = {
     "ingest.summary.errors.header": {"en": "- Errors ({n}):", "de": "- Fehler ({n}):"},
     "ingest.summary.errors.more": {"en": "  - …and {n} more", "de": "  - …und {n} weitere"},
 
-    # --- tqdm-style progress line (chainlit_progress.py) -----------------
-    # These build the live progress line shown in the TaskList during long
-    # stages (extract / write). ``{elapsed}`` and ``{eta}`` are pre-formatted
-    # by TimeEstimator (e.g. "1:05", "?" when unknown); ``{rate}`` is a
-    # formatted it/s string. The line is re-rendered on every per-chunk /
-    # per-extraction tick. See :func:`falkordb_harness.chainlit_progress._render_tqdm_line`.
-    "ingest.progress.line": {
-        "en": "{title}  —  {counter} {percent}  [{elapsed} elapsed, ETA {eta}, {rate}]",
-        "de": "{title}  —  {counter} {percent}  [{elapsed} verstrichen, ETA {eta}, {rate}]",
-    },
-    "ingest.progress.eta_unknown": {"en": "?", "de": "?"},
-    "ingest.progress.rate_unknown": {"en": "? it/s", "de": "? it/s"},
-    "ingest.progress.percent_unknown": {"en": "?", "de": "?"},
-
     # --- Debug "Run Showcase" button (public/debug_button.js) --------------
     "debug.button.label": {
         "en": "Run Showcase",
@@ -367,32 +353,14 @@ STRINGS: dict[str, dict[str, str]] = {
     # sidebar content itself is driven by _build_document_manager_props,
     # whose labels come from the doc.action.* keys below.
 
-    # --- Task sidebar (public/tasks_toggle.js) ------------------------------
-    # The toggle button does its own localization via <html lang>; these
-    # keys are kept for server-side reference and future i18n migration.
-    "tasks_sidebar.title": {
-        "en": "Task History",
-        "de": "Aufgabenverlauf",
+    # --- Agent todos panel (AgentTodos.jsx) --------------------------------
+    "agent_todos.plan": {
+        "en": "Plan",
+        "de": "Plan",
     },
-    "tasks_sidebar.toggle.open": {
-        "en": "Task History",
-        "de": "Aufgabenverlauf",
-    },
-    "tasks_sidebar.toggle.close": {
-        "en": "Close",
-        "de": "Schließen",
-    },
-    "tasks_sidebar.toggle.open_title": {
-        "en": "Open task history",
-        "de": "Aufgabenverlauf öffnen",
-    },
-    "tasks_sidebar.toggle.close_title": {
-        "en": "Close task history",
-        "de": "Aufgabenverlauf schließen",
-    },
-    "tasks_sidebar.toggle.no_tasks": {
-        "en": "No tasks yet",
-        "de": "Noch keine Aufgaben",
+    "agent_todos.progress": {
+        "en": "Progress",
+        "de": "Fortschritt",
     },
 
     # --- Document manager row actions (DocumentManager.jsx + callbacks) ---
@@ -605,6 +573,28 @@ STRINGS: dict[str, dict[str, str]] = {
     "graph.description.empty": {
         "en": "(no description yet)",
         "de": "(noch keine Beschreibung)",
+    },
+
+    # --- Chat-flow test harness (chainlit_app.py on_message) ---------------
+    "chat_flow_test.not_admin": {
+        "en": "Chat-flow test is admin-only. Your role does not permit this action.",
+        "de": "Chat-Flow-Test ist nur für Admins. Ihre Rolle erlaubt diese Aktion nicht.",
+    },
+    "chat_flow_test.not_found": {
+        "en": "Unknown chat-flow test scenario: `{name}`.",
+        "de": "Unbekanntes Chat-Flow-Test-Szenario: `{name}`.",
+    },
+    "chat_flow_test.button.label": {
+        "en": "Test Chat Flow",
+        "de": "Chat-Flow testen",
+    },
+    "chat_flow_test.button.tooltip": {
+        "en": "Run a mock showcase event stream to verify chat ordering (admin only)",
+        "de": "Mock-Showcase-Event-Stream ausführen, um Chat-Reihenfolge zu prüfen (nur Admin)",
+    },
+    "chat_flow_test.button.not_admin": {
+        "en": "Admin access required",
+        "de": "Admin-Zugriff erforderlich",
     },
 }
 

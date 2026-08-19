@@ -6,20 +6,40 @@ requires-python = ">=3.10"
 dependencies = [
     "falkordb>=1.0.0",
     "openai>=2.0.0",
-    "pydantic>=2.0.0",
+    # Bumped from >=2.0.0 → langgraph >= 1.2 requires pydantic >= 2.7.4
+    "pydantic>=2.7.4",
     "python-dotenv>=1.0.0",
     "unstructured[all-docs]",
     "json-repair",
     "pyyaml>=6.0",
     "typing-extensions>=4.0.0",
     "loguru>=0.7.0",
-    # LangChain deep-agent harness
-    "langchain>=0.3.0",
-    "langchain-core>=0.3.0",
-    "langchain-anthropic>=0.3.0",
-    "langchain-openai>=1.4.0",
-    "langgraph>=0.2.0",
-    "deepagents",
+
+    # ── LangChain deep-agent harness ──────────────────────────────
+    # All floors bumped to the 1.x line for v3 stream_events support.
+    # See: https://docs.langchain.com/oss/python/releases/changelog
+    #
+    # langchain >= 1.3.0   — v3 stream_events support for agents
+    # langchain-core >= 1.4.7 — required by langgraph >= 1.2; contains
+    #                          ChatModelStream with typed content blocks
+    # langgraph >= 1.2.0   — v3 event streaming API (beta), typed
+    #                        per-channel projections (messages, tools,
+    #                        subgraphs, lifecycle)
+    # deepagents >= 0.7.0  — latest; v3 streaming added in 0.6.0, 0.7
+    #                        brings 65% fewer input tokens, configurable
+    #                        middleware override. Breaking changes (see
+    #                        notes below) are documented and manageable.
+    #
+    # langchain-anthropic >= 1.0.0 — 1.x line for langchain 1.x compat
+    # langchain-openai >= 1.4.0    — already on 1.x line (unchanged)
+    # ────────────────────────────────────────────────────────────────
+    "langchain>=1.3.0,<2",
+    "langchain-core>=1.4.7,<2",
+    "langchain-anthropic>=1.0.0,<2",
+    "langchain-openai>=1.4.0,<2",
+    "langgraph>=1.2.0,<2",
+    "deepagents>=0.7.0,<1",
+
     # Document preprocessing pipeline (git submodule). The [ollama] extra
     # pulls the OpenAI client used for Ollama's OpenAI-compatible VLM fallback
     # endpoint, reusing OLLAMA_API_BASE / OLLAMA_API_KEY already configured in
@@ -30,9 +50,13 @@ dependencies = [
 
 [project.optional-dependencies]
 chainlit = [
-    "chainlit>=1.1.0",
+    # Bumped from >=1.1.0 → 1.x predates langchain 1.x and will have import
+    # errors with langchain >= 1.3. Chainlit 2.x is the current line; its
+    # test deps already require langchain >= 1.0.0. Latest is 2.11.1.
+    "chainlit>=2.0.0,<3",
     "anyio>=4.14.2",
-    "starlette>=0.45.0",
+    # Bumped from >=0.45.0 → chainlit 2.11.1 requires starlette >= 0.47.2
+    "starlette>=0.47.2",
     # Visual data-display elements. Both degrade gracefully — the
     # chainlit_elements helpers return None when a lib is missing, so the
     # app still runs (with Markdown fallback) without them.
