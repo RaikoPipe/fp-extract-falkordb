@@ -20,8 +20,8 @@ List the files under `originals/<your_session_id>/`. If the directory is empty, 
 **Step 2 — Inspect files:**
 For each file found, inspect its metadata (size, type, page/line counts) and read a small excerpt (first 20 lines or so). Report what each file contains in 1-2 sentences.
 
-**Step 3 — Preprocess (if needed):**
-If any file is a binary format (PDF, DOCX, image, etc.), convert it to Markdown. Plain `.md`/`.txt` files can be skipped — they are already LLM-ready.
+**Step 3 — Preprocess:**
+Convert every file to Markdown under `preprocessed/<your_session_id>/`. Binary formats (PDF, DOCX, image, etc.) go through docprep; plain `.md`/`.txt`/`.csv`/`.json`/`.html`/`.py` files are copied verbatim (no VLM call) — `preprocess_document` handles both cases.
 
 **Step 4 — Chunk preview:**
 Preview the chunks that would be produced from the preprocessed directory (or the originals directory if no preprocessing was needed). Report the chunk count.

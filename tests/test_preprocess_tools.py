@@ -255,3 +255,60 @@ def test_preprocess_falls_back_to_default_yaml(tmp_path, monkeypatch):
 
     passed_config = fake.call_args[0][1]
     assert passed_config.fallback_provider == "ollama"
+
+
+# --------------------------------------------------------------------------
+# Plain-text copy path (no docprep / no VLM call)
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize("ext", [".txt", ".md", ".csv", ".json", ".html", ".py"])
+def test_preprocess_plain_text_copied_verbatim(tmp_path, ext):
+    """Plain-text formats are copied verbatim to preprocessed/<stem>.md
+    without invoking docprep (no VLM call). The copy populates output_path
+    so the document registry / sidebar marks the file Preprocessed ✓.
+
+    No docprep patch is needed: the plain-text short-circuit in
+    ``_preprocess_document_impl`` returns before the lazy
+    ``from docprep.entrypoint import convert`` import, so docling is never
+    pulled in.
+    """
+    src = Path(os.getenv("ORIGINALS_DIR")) / f"notes{ext}"
+    src.write_text("plain body content\n", encoding="utf-8")
+
+    out = json.loads(_call(preprocess_document, path=f"originals/notes{ext}"))
+
+    assert out["already_exists"] is False
+    assert out["pipeline_used"] == "plain-copy"
+    assert out["output_path"].replace("\\", "/") == "preprocessed/_unscoped/notes.md"
+    out_path = Path(os.getenv("DATA_DIR")) / out["output_path"]
+    assert out_path.read_text(encoding="utf-8") == "plain body content\n"
+    assert out["markdown_char_count"] == out_path.stat().st_size
+
+
+def test_preprocess_plain_text_noop_when_md_exists(tmp_path):
+    """A pre-existing preprocessed/<stem>.md short-circuits the copy too."""
+    src = Path(os.getenv("ORIGINALS_DIR")) / "notes.txt"
+    src.write_text("new body\n", encoding="utf-8")
+    out_dir = Path(os.getenv("PREPROCESSED_DIR")) / "_unscoped"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "notes.md").write_text("old body\n", encoding="utf-8")
+
+    out = json.loads(_call(preprocess_document, path="originals/notes.txt"))
+
+    assert out["already_exists"] is True
+    # Existing .md is preserved (no overwrite without overwrite=True).
+    assert (out_dir / "notes.md").read_text() == "old body\n"
+
+
+def test_preprocess_plain_text_overwrite_replaces_existing(tmp_path):
+    src = Path(os.getenv("ORIGINALS_DIR")) / "notes.txt"
+    src.write_text("new body\n", encoding="utf-8")
+    out_dir = Path(os.getenv("PREPROCESSED_DIR")) / "_unscoped"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "notes.md").write_text("old body\n", encoding="utf-8")
+
+    out = json.loads(
+        _call(preprocess_document, path="originals/notes.txt", overwrite=True)
+    )
+
+    assert out["already_exists"] is False
+    assert (out_dir / "notes.md").read_text() == "new body\n"

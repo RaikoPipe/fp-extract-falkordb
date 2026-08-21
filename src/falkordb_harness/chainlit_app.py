@@ -2147,6 +2147,35 @@ async def on_message(message: cl.Message) -> None:
                                 ai = m
                         if ai is None:
                             continue
+                        # write_todos: forward the model's emitted todo list
+                        # to the AgentTodos panel HERE, on the model task
+                        # result, rather than waiting for the ``tools``
+                        # task-start. The model task result always fires
+                        # before tool execution and is the authoritative
+                        # source of the new plan (the agent's tool-call
+                        # args). The ``tools`` task-start branch below is
+                        # unreliable for this: (1) fast / Command-returning
+                        # tools like write_todos can have their task-start
+                        # skipped when result arrives in the same
+                        # projection batch (``if not has_result`` gates it
+                        # out), and (2) same-tool chain aggregation in the
+                        # ``tools`` branch collapses repeated write_todos
+                        # calls, so only the first call's args reach the
+                        # panel via that path. Forwarding here ensures the
+                        # panel sees every status update the model emits.
+                        for _wt_tc in ai.tool_calls:
+                            if _wt_tc.get("name") != "write_todos":
+                                continue
+                            _wt_args = _wt_tc.get("args", {}) or {}
+                            _wt_todos = _wt_args.get("todos", [])
+                            if isinstance(_wt_todos, list):
+                                from falkordb_harness.chainlit_progress import (
+                                    _get_or_create_todos_element,
+                                )
+                                await _get_or_create_todos_element(
+                                    initial_todos=_wt_todos,
+                                    ingestion_running=False,
+                                )
                         # Only open a batch for tool_calls whose ids aren't
                         # already mapped (idempotent across re-emits / replays).
                         new_calls = [

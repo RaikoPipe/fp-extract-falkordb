@@ -32,9 +32,12 @@ from typing import Any
 
 from loguru import logger
 
-# File extensions that are already LLM-ready text and do NOT need docprep
-# preprocessing. Everything else (PDF, DOCX, PPTX, images, Excel, ...) is
-# routed through docprep first.
+# File extensions that are already LLM-ready text. These are NOT routed
+# through docprep (no VLM/OCR call); instead they are copied verbatim into
+# ``preprocessed/<thread_id>/<stem>.md`` so the document registry records a
+# ``preprocessedPath`` and the Chainlit sidebar marks them Preprocessed ✓.
+# Everything else (PDF, DOCX, PPTX, images, Excel, ...) is routed through
+# docprep first.
 _PLAIN_EXTS = {".txt", ".md", ".csv", ".json", ".html", ".py"}
 
 
@@ -104,7 +107,11 @@ def _ensure_session_backend() -> None:
 
 
 def _needs_preprocessing(path: Path) -> bool:
-    """Return True if ``path`` is a binary/non-text format requiring docprep."""
+    """Return True if ``path`` is a binary/non-text format requiring docprep.
+
+    Plain-text formats (``_PLAIN_EXTS``) are copied to ``preprocessed/``
+    verbatim instead of going through docprep — see :func:`_copy_plain_one`.
+    """
     return path.suffix.lower() not in _PLAIN_EXTS
 
 
@@ -213,6 +220,65 @@ async def _preprocess_one(
             "pipeline": result.pipeline_used,
             "pages": result.page_count,
             "chars": len(result.markdown),
+        },
+    )
+    return out_path
+
+
+async def _copy_plain_one(
+    src: Path,
+    out_dir: Path,
+    progress: ProgressFn | None,
+) -> Path | None:
+    """Copy a plain-text source to ``preprocessed/<stem>.md`` verbatim.
+
+    Plain-text formats (``_PLAIN_EXTS``) are already LLM-ready and do not
+    need docprep. They are copied into the ``preprocessed/`` tree as
+    ``<stem>.md`` so the document registry records a ``preprocessedPath``
+    and the Chainlit document sidebar marks the file Preprocessed ✓. The
+    content is copied byte-for-byte (no re-encoding) so non-UTF-8 text
+    survives intact; the ``.md`` extension is cosmetic — ingestion reads
+    via :func:`knowledge.chunking.read_document`, which decodes text.
+
+    Returns the path to the produced ``.md`` file, or ``None`` on failure
+    (the error is logged + reported via the progress callback).
+    """
+    out_path = out_dir / (src.stem + ".md")
+    if out_path.exists():
+        await progress(
+            f"Preprocessed `{src.name}` (cached)",
+            {
+                "kind": "file_end",
+                "stage": "preprocess",
+                "file": src.name,
+                "cached": True,
+                "output": str(out_path),
+            },
+        )
+        return out_path
+
+    await progress(
+        f"Copying plain-text `{src.name}` → `preprocessed/`…",
+        {"kind": "file_start", "stage": "preprocess", "file": src.name},
+    )
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, out_path)
+    except OSError as exc:
+        await progress(
+            f"Copying `{src.name}` failed: {exc}",
+            {"kind": "error", "stage": "preprocess", "file": src.name, "error": str(exc)},
+        )
+        return None
+
+    await progress(
+        f"Copied `{src.name}` → `{out_path.name}` (plain text, no docprep)",
+        {
+            "kind": "file_end",
+            "stage": "preprocess",
+            "file": src.name,
+            "output": str(out_path),
+            "pipeline": "plain-copy",
         },
     )
     return out_path
@@ -336,54 +402,51 @@ async def run_ingestion(
             "errors": errors or ["No files to ingest."],
         }
 
-    # --- Stage 2: preprocess binary files -> preprocessed/<thread_id>/*.md ---
+    # --- Stage 2: preprocess files -> preprocessed/<thread_id>/*.md ---
+    # Binary/non-text files go through docprep; plain-text files are copied
+    # verbatim. Both produce a ``preprocessed/<stem>.md`` that is registered
+    # in the document registry so the sidebar marks them Preprocessed ✓.
     pre_out = thread_preprocessed_dir(thread_id)
     preprocessed_count = 0
-    ingest_paths: list[Path] = []  # files to chunk (md + plain text)
-    bin_files = [s for s in staged if _needs_preprocessing(s)]
-    if progress and bin_files:
+    ingest_paths: list[Path] = []  # files to chunk (preprocessed .md output)
+    if progress and staged:
         await progress(
-            f"Preprocessing {len(bin_files)} file(s) via docprep…",
-            {"kind": "stage_start", "stage": "preprocess", "total": len(bin_files)},
+            f"Preprocessing {len(staged)} file(s)…",
+            {"kind": "stage_start", "stage": "preprocess", "total": len(staged)},
         )
     for src in staged:
         if _needs_preprocessing(src):
             md = await _preprocess_one(
                 src, pre_out, docprep_yaml, overwrite_preprocessed, progress
             )
-            if md is not None:
-                ingest_paths.append(md)
-                preprocessed_count += 1
-                # Register the preprocessed output in the document registry
-                # (single source of truth for the sidebar). Best-effort:
-                # errors are swallowed inside register_preprocessed, so a
-                # registry failure never breaks ingestion.
-                try:
-                    from falkordb_harness.document_registry import (
-                        register_preprocessed,
-                    )
-
-                    await register_preprocessed(
-                        thread_id=_session_thread_id(),
-                        user_identifier=_session_user_id(),
-                        name=src.name,
-                        original_path=str(src),
-                        preprocessed_path=str(md),
-                    )
-                except Exception as exc:  # noqa: BLE001 — never block ingestion
-                    logger.debug("register_preprocessed failed: {}", exc)
-            else:
-                errors.append(f"Preprocessing failed for `{src.name}`")
         else:
-            ingest_paths.append(src)
-            if progress:
-                await progress(
-                    f"`{src.name}` is plain text — no preprocessing needed.",
-                    {"kind": "info", "stage": "preprocess", "file": src.name},
+            md = await _copy_plain_one(src, pre_out, progress)
+        if md is not None:
+            ingest_paths.append(md)
+            preprocessed_count += 1
+            # Register the preprocessed output in the document registry
+            # (single source of truth for the sidebar). Best-effort:
+            # errors are swallowed inside register_preprocessed, so a
+            # registry failure never breaks ingestion.
+            try:
+                from falkordb_harness.document_registry import (
+                    register_preprocessed,
                 )
-    if progress and bin_files:
+
+                await register_preprocessed(
+                    thread_id=_session_thread_id(),
+                    user_identifier=_session_user_id(),
+                    name=src.name,
+                    original_path=str(src),
+                    preprocessed_path=str(md),
+                )
+            except Exception as exc:  # noqa: BLE001 — never block ingestion
+                logger.debug("register_preprocessed failed: {}", exc)
+        else:
+            errors.append(f"Preprocessing failed for `{src.name}`")
+    if progress and staged:
         await progress(
-            f"Preprocessed {preprocessed_count}/{len(bin_files)} file(s).",
+            f"Preprocessed {preprocessed_count}/{len(staged)} file(s).",
             {"kind": "stage_end", "stage": "preprocess", "files": preprocessed_count},
         )
 

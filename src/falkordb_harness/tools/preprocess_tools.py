@@ -24,6 +24,7 @@ its Markdown twin.
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 from langchain_core.tools import tool
@@ -34,6 +35,13 @@ from falkordb_harness.tools._paths import (
 from falkordb_harness.tools._paths import thread_preprocessed_dir, virtual_path
 from falkordb_harness.tools._paths import resolve as _resolve
 from falkordb_harness.tools._retry import with_retry
+
+# File extensions that are already LLM-ready text. The tool copies these
+# verbatim into ``preprocessed/`` as ``<stem>.md`` instead of running them
+# through docprep — no VLM/OCR call is made. The copy still populates the
+# document registry's ``preprocessedPath`` so the sidebar marks the file
+# Preprocessed ✓. Mirrors ``ingest_runner._PLAIN_EXTS``; keep in sync.
+_PLAIN_EXTS = {".txt", ".md", ".csv", ".json", ".html", ".py"}
 
 
 def _current_thread_id() -> str | None:
@@ -65,9 +73,13 @@ def preprocess_document(
     the result as ``<stem>.md`` into the ``preprocessed/`` tree, where
     ``chunk_documents`` / ``extract_and_write`` pick it up by default. Use
     this for scanned PDFs, images, Excel charts, and any office/binary format
-    that needs OCR or VLM interpretation before extraction. Plain
-    ``.txt``/``.md`` sources are already LLM-ready — do NOT preprocess them
-    (it wastes a VLM call).
+    that needs OCR or VLM interpretation before extraction.
+
+    Plain-text formats (``.txt``/``.md``/``.csv``/``.json``/``.html``/``.py``)
+    are already LLM-ready and are copied verbatim into ``preprocessed/`` as
+    ``<stem>.md`` instead of running through docprep — no VLM call is made.
+    The copy still populates the document registry so the sidebar marks the
+    file Preprocessed ✓.
 
     Args:
         path: File path under DATA_DIR (relative or virtual absolute), e.g.
@@ -161,6 +173,34 @@ def _preprocess_document_impl(path: str, yaml_path: str, overwrite: bool) -> str
                 "output_path": out_virtual,
                 "source": virtual_path(resolved),
                 "markdown_char_count": out_path.stat().st_size,
+            },
+            ensure_ascii=False,
+        )
+
+    # Plain-text formats are already LLM-ready — copy verbatim instead of
+    # running docprep (no VLM/OCR call). The copied ``.md`` still populates
+    # the registry's ``preprocessedPath`` so the sidebar marks it ✓.
+    if resolved.suffix.lower() in _PLAIN_EXTS:
+        try:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(resolved, out_path)
+        except OSError as exc:
+            return json.dumps(
+                {"error": f"Failed to copy plain-text file: {exc}"},
+                ensure_ascii=False,
+            )
+        return json.dumps(
+            {
+                "already_exists": False,
+                "output_path": out_virtual,
+                "source": virtual_path(resolved),
+                "pipeline_used": "plain-copy",
+                "format_detected": resolved.suffix.lower(),
+                "page_count": None,
+                "escalated": False,
+                "warnings": [],
+                "markdown_char_count": out_path.stat().st_size,
+                "processing_time_seconds": 0.0,
             },
             ensure_ascii=False,
         )

@@ -591,13 +591,23 @@ def test_same_tool_chain_aggregates_search(monkeypatch):
 
 
 def test_create_graph_breaks_write_todos_chain(monkeypatch):
-    """create_graph (different tool) must be a separate Step from write_todos."""
+    """create_graph (different tool) must be a separate Step from write_todos.
+
+    The showcase flow now emits two write_todos calls (R1: initial plan,
+    R2b: status update) with create_graph between them. The chain must
+    break at create_graph, yielding two distinct write_todos steps rather
+    than one aggregated ``write_todos x 2`` step.
+    """
     _, _, step_factory, _, _ = _run_showcase_flow(monkeypatch)
 
     wt_steps = [s for s in step_factory.created if s.name and "write_todos" in str(s.name)]
     cg_steps = [s for s in step_factory.created if s.name and "create_graph" in str(s.name)]
-    assert len(wt_steps) == 1, f"expected 1 write_todos step, got {len(wt_steps)}"
+    assert len(wt_steps) == 2, f"expected 2 write_todos steps, got {len(wt_steps)}"
     assert len(cg_steps) == 1, f"expected 1 create_graph step, got {len(cg_steps)}"
+    # The two write_todos steps must be distinct (the chain broke between them).
+    assert wt_steps[0].id != wt_steps[1].id, (
+        "expected two distinct write_todos steps (chain broken by create_graph)"
+    )
     assert wt_steps[0].id != cg_steps[0].id
 
 
@@ -641,6 +651,44 @@ def test_write_todos_creates_element(monkeypatch):
     # client-side portal pins it above the composer.
     assert first["ingestion_running"] is False
     assert bool(first["todos"]) is True
+    # Real TodoListMiddleware schema uses ``content`` (not ``label``);
+    # verify the fixture matches the production schema so the JSX
+    # renderer (which reads todo.content) shows non-empty labels.
+    assert all("content" in t for t in first["todos"]), (
+        "showcase todos must use the 'content' key (TodoListMiddleware schema)"
+    )
+
+
+def test_write_todos_subsequent_call_updates_panel(monkeypatch):
+    """A second write_todos call with updated statuses must reach
+    _get_or_create_todos_element so the AgentTodos panel reflects
+    progress (not frozen on the initial all-pending plan).
+
+    Guards against the bug where the v3 ``tools`` task-start branch
+    alone was unreliable for repeated write_todos calls (fast /
+    Command-returning tools, same-tool chain aggregation). The fix
+    forwards write_todos args from the model task result branch in
+    _consume_tasks, which always fires before tool execution.
+    """
+    _, _, _, _, todos_created = _run_showcase_flow(monkeypatch)
+
+    write_todos_calls = [
+        c for c in todos_created
+        if any(t.get("status") == "completed" for t in c["todos"])
+    ]
+    assert len(write_todos_calls) >= 1, (
+        "expected a second write_todos call carrying at least one "
+        "completed todo (the mid-flow status update)"
+    )
+    updated = write_todos_calls[0]
+    statuses = [t.get("status") for t in updated["todos"]]
+    assert "completed" in statuses, (
+        "the updated todo list must contain a completed item"
+    )
+    assert "in_progress" in statuses, (
+        "the updated todo list must contain an in_progress item "
+        "(the agent advances the next task when marking one done)"
+    )
 
 
 def test_tool_steps_parent_id_is_on_message_step(monkeypatch):
@@ -662,14 +710,15 @@ def test_claude_style_history(monkeypatch):
     """chat_history must contain Claude-style AIMessage(tool_calls) +
     ToolMessage pairs plus a final AIMessage(answer).
 
-    The showcase_flow has 6 batches of tool calls:
-    R1: [write_todos]                → 1 tool
-    R2: [create_graph]               → 1 tool
-    R3: [file_metadata, file_metadata, read_excerpt] → 3 tools
-    R4: [get_schema, list_graphs]   → 2 tools
-    R5: [nl_query, search, search]   → 3 tools
-    R6: [get_reconciliations, update_graph_description] → 2 tools
-    R7: final answer (no tools)
+    The showcase_flow has 7 batches of tool calls:
+    R1:   [write_todos]                          → 1 tool (initial plan)
+    R2:   [create_graph]                         → 1 tool
+    R2b:  [write_todos]                          → 1 tool (status update)
+    R3:   [file_metadata, file_metadata, read_excerpt] → 3 tools
+    R4:   [get_schema, list_graphs]              → 2 tools
+    R5:   [nl_query, search, search]             → 3 tools
+    R6:   [get_reconciliations, update_graph_description] → 2 tools
+    R7:   final answer (no tools)
     """
     session, _, _, _, _ = _run_showcase_flow(monkeypatch)
     history = session.get("chat_history")
@@ -684,13 +733,13 @@ def test_claude_style_history(monkeypatch):
     tool_msgs = [m for m in history if isinstance(m, ToolMessage)]
     ai_answer = [m for m in history if isinstance(m, AIMessage) and not getattr(m, "tool_calls", None)]
 
-    # 6 batches → 6 AIMessage(tool_calls=[...]).
-    assert len(ai_with_tc) == 6, (
-        f"expected 6 AIMessage with tool_calls (one per batch), got {len(ai_with_tc)}"
+    # 7 batches → 7 AIMessage(tool_calls=[...]).
+    assert len(ai_with_tc) == 7, (
+        f"expected 7 AIMessage with tool_calls (one per batch), got {len(ai_with_tc)}"
     )
-    # 1+1+3+2+3+2 = 12 ToolMessages.
-    assert len(tool_msgs) == 12, (
-        f"expected 12 ToolMessages, got {len(tool_msgs)}"
+    # 1+1+1+3+2+3+2 = 13 ToolMessages.
+    assert len(tool_msgs) == 13, (
+        f"expected 13 ToolMessages, got {len(tool_msgs)}"
     )
     # 1 final answer AIMessage.
     assert len(ai_answer) == 1, (
@@ -698,7 +747,7 @@ def test_claude_style_history(monkeypatch):
     )
 
     # Verify tool call counts per batch.
-    expected_tc_counts = [1, 1, 3, 2, 3, 2]
+    expected_tc_counts = [1, 1, 1, 3, 2, 3, 2]
     for i, (ai, expected) in enumerate(zip(ai_with_tc, expected_tc_counts)):
         assert len(ai.tool_calls) == expected, (
             f"batch {i}: expected {expected} tool_calls, got {len(ai.tool_calls)}"

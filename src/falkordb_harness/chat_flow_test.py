@@ -140,17 +140,36 @@ def _task_result(task_id: str, name: str, result_data: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 _SHOWCASE_TODOS = [
-    {"label": "Create throwaway graph", "status": "pending"},
-    {"label": "Discover and inspect files", "status": "pending"},
-    {"label": "Preprocess if needed", "status": "pending"},
-    {"label": "Chunk preview", "status": "pending"},
-    {"label": "Ingest", "status": "pending"},
-    {"label": "Inspect graph schema", "status": "pending"},
-    {"label": "Query the graph", "status": "pending"},
-    {"label": "Search", "status": "pending"},
-    {"label": "Reconciliation", "status": "pending"},
-    {"label": "Update description", "status": "pending"},
-    {"label": "Report", "status": "pending"},
+    {"content": "Create throwaway graph", "status": "in_progress"},
+    {"content": "Discover and inspect files", "status": "pending"},
+    {"content": "Preprocess if needed", "status": "pending"},
+    {"content": "Chunk preview", "status": "pending"},
+    {"content": "Ingest", "status": "pending"},
+    {"content": "Inspect graph schema", "status": "pending"},
+    {"content": "Query the graph", "status": "pending"},
+    {"content": "Search", "status": "pending"},
+    {"content": "Reconciliation", "status": "pending"},
+    {"content": "Update description", "status": "pending"},
+    {"content": "Report", "status": "pending"},
+]
+
+# Mid-flow todo update: after create_graph completes, mark it done and
+# advance the next task to in_progress. Exercises the bug where the
+# AgentTodos panel must be re-updated on a subsequent write_todos call
+# (the v3 tools task-start branch alone is unreliable for this — see
+# chainlit_app.py _consume_tasks model-task-result branch).
+_SHOWCASE_TODOS_UPDATED = [
+    {"content": "Create throwaway graph", "status": "completed"},
+    {"content": "Discover and inspect files", "status": "in_progress"},
+    {"content": "Preprocess if needed", "status": "pending"},
+    {"content": "Chunk preview", "status": "pending"},
+    {"content": "Ingest", "status": "pending"},
+    {"content": "Inspect graph schema", "status": "pending"},
+    {"content": "Query the graph", "status": "pending"},
+    {"content": "Search", "status": "pending"},
+    {"content": "Reconciliation", "status": "pending"},
+    {"content": "Update description", "status": "pending"},
+    {"content": "Report", "status": "pending"},
 ]
 
 _PRE_TOOL_TEXT = "I'll start by planning the showcase steps."
@@ -319,6 +338,22 @@ async def _showcase_flow() -> list[tuple[str, dict]]:
             description="Throwaway graph for end-to-end showcase run.",
         ),
     )])
+
+    # --- R2b: write_todos (status update) -------------------------
+    # The agent re-emits write_todos with updated statuses after
+    # create_graph completed. This exercises the model-task-result
+    # branch in _consume_tasks that forwards write_todos args to the
+    # AgentTodos panel — without it, the panel would stay frozen on
+    # the initial all-pending plan (the bug this test now guards
+    # against).
+    r2b = _ai("Graph created. Updating the plan.", tool_calls=[
+        {"name": "write_todos", "args": {"todos": _SHOWCASE_TODOS_UPDATED}, "id": "call-wt2", "type": "tool_call"},
+    ])
+    _add_msg(r2b)
+    _add_values()
+
+    # T2b: write_todos (second call)
+    _add_tool_batch(r2b, [("write_todos", "call-wt2", "Todos written.")])
 
     # --- R3: file_metadata × 2 + read_excerpt ---------------------
     r3 = _ai(_R3_TEXT, tool_calls=[

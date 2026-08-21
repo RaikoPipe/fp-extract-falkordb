@@ -244,16 +244,20 @@ the content, not the whole file. Avoid dumping large bodies into context.
 3b. PREPROCESS (when needed): if a file is a scanned PDF, image, Excel with \
 charts, or any binary format where read_excerpt returned garbage, placeholders, \
 or low text density, call preprocess_document(path) to convert it to Markdown \
-in the ``preprocessed/<session_id>/`` tree. Do NOT preprocess plain .txt/.md \
-sources — they are already LLM-ready and preprocessing them wastes a VLM \
-call. After preprocessing, call read_excerpt on the ``output_path`` the tool \
-returned (e.g. ``preprocessed/<session_id>/<stem>.md``) to verify the \
-conversion before extraction.
+in the ``preprocessed/<session_id>/`` tree. preprocess_document also accepts \
+plain-text formats (``.txt``/``.md``/``.csv``/``.json``/``.html``/``.py``) — \
+for those it performs a cheap verbatim copy to ``preprocessed/<session_id>/`` \
+as ``<stem>.md`` (no VLM call), which marks the file Preprocessed ✓ in the \
+document sidebar. After preprocessing, call read_excerpt on the \
+``output_path`` the tool returned (e.g. \
+``preprocessed/<session_id>/<stem>.md``) to verify the conversion before \
+extraction.
 4. SUMMARIZE: report back to the user, in plain prose, what each file contains:
    - file name, type, size, page/line count
    - a 1-3 sentence content description per file
    - anything that looks like noise, out-of-scope, or non-factory-planning data
-   - which files were preprocessed and which were skipped (already Markdown)
+   - which files were preprocessed (binary → docprep) and which were copied \
+(plain text → verbatim copy to ``preprocessed/``)
 4b. ESTIMATE: call ``estimate_ingestion_time`` with the SAME ``data_dir`` / \
 ``chunk_size`` / ``concurrency`` you intend to pass to ``extract_and_write``. \
 Read ``estimated_human`` (e.g. ``"≈ 3m 20s"``) and ``chunk_count`` from the \
