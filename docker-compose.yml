@@ -21,6 +21,11 @@ services:
       # publish chainlit on 8001 instead. The container still listens on
       # 8000 internally (EXPOSE 8000). Update APP_BASE_URL below to match.
       - "8001:8000"
+    # Linux: make host.docker.internal resolve to the host bridge so the
+    # container can reach LLM/embedding services (vLLM, Ollama) running on
+    # the host. Not needed on Docker Desktop (macOS/Windows).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     # Secrets are loaded literally (no ${} interpolation) from .env.secrets
     # via env_file, so values containing $, /, @, etc. survive intact.
     # Create .env.secrets from .env.example (secret vars marked below) and

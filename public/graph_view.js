@@ -112,7 +112,7 @@
     fetch("/api/graph-info", { credentials: "same-origin" })
       .then(function (r) {
         if (!r.ok) throw new Error("status " + r.status);
-        if (!toggleBtnEl) toggleBtnEl = ensureToggle();
+        toggleBtnEl = ensureToggle();
         toggleBtnEl.style.display = "flex";
       })
       .catch(function (err) {
@@ -122,7 +122,7 @@
         }
         // Other errors: keep the button visible (FalkorDB may be down
         // but the link is still useful once it comes back).
-        if (!toggleBtnEl) toggleBtnEl = ensureToggle();
+        toggleBtnEl = ensureToggle();
         toggleBtnEl.style.display = "flex";
       })
       .finally(function () { fetching = false; });

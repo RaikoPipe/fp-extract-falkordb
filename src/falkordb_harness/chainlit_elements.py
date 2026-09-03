@@ -259,12 +259,13 @@ def build_source_elements_from_row(row: dict, data_dir: Path):
     Sibling of :func:`build_source_elements` for the "Open" sidebar button.
     ``row`` is a :mod:`document_registry` row dict (absolute on-disk paths in
     ``preprocessedPath`` / ``originalPath``). Prefers the preprocessed
-    Markdown (renders as a ``cl.Text``); falls back to the original (``cl.Pdf``
-    for PDFs, ``cl.Image`` for images, ``cl.Text`` for plain text). The path
-    must resolve under ``data_dir`` (containment guard via :func:`_safe_resolve`
-    on the root-relative form of the path) — paths outside the data dir are
-    skipped. Returns ``[]`` when ``chainlit`` is missing or no usable file is
-    found (the caller sends a chat message instead).
+    Markdown (renders as a ``cl.Text`` in the side panel, like PDFs/images);
+    falls back to the original (``cl.Pdf`` for PDFs, ``cl.Image`` for images,
+    ``cl.Text`` for plain text, all in the side panel). The path must resolve
+    under ``data_dir`` (containment guard via :func:`_safe_resolve` on the
+    root-relative form of the path) — paths outside the data dir are
+    skipped. Returns ``[]`` when ``chainlit`` is missing or no usable file
+    is found (the caller sends a chat message instead).
     """
     try:
         import chainlit as cl
@@ -288,7 +289,7 @@ def build_source_elements_from_row(row: dict, data_dir: Path):
                     cl.Text(
                         name=t("element.preprocessed.name", name=pre_abs.name),
                         content=content[:20000],
-                        display="inline",
+                        display="side",
                         language="markdown",
                     )
                 )
@@ -317,7 +318,7 @@ def build_source_elements_from_row(row: dict, data_dir: Path):
                         cl.Text(
                             name=src_abs.name,
                             content=content[:20000],
-                            display="inline",
+                            display="side",
                         )
                     )
     return elements

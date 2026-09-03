@@ -3,7 +3,7 @@
 The ``DocumentManager`` sidebar renders three per-row buttons that dispatch
 ``@cl.action_callback`` handlers in :mod:`falkordb_harness.chainlit_app`:
 
-- ``on_open_document``       — render the file inline as a Chainlit element.
+- ``on_open_document``       — render the file in the side panel as a Chainlit element.
 - ``on_preprocess_document`` — run docprep on a single uploaded original.
 - ``on_delete_document``     — remove the row + on-disk file via the registry.
 
@@ -295,8 +295,8 @@ def test_on_preprocess_document_missing_row_posts_not_found(tmp_registry, monkey
 # ---------------------------------------------------------------------------
 # on_open_document
 # ---------------------------------------------------------------------------
-def test_on_open_document_renders_inline_text(tmp_registry, tmp_path, monkeypatch):
-    # Preprocessed markdown row → builds a cl.Text element.
+def test_on_open_document_renders_text_element(tmp_registry, tmp_path, monkeypatch):
+    # Preprocessed markdown row → builds a cl.Text element in the side panel.
     out_md = tmp_path / "preprocessed" / "a.md"
     out_md.parent.mkdir(parents=True)
     out_md.write_text("# hello markdown", encoding="utf-8")
@@ -313,10 +313,14 @@ def test_on_open_document_renders_inline_text(tmp_registry, tmp_path, monkeypatc
 
     _run_with_ctx(app.on_open_document(_action("open_document", rid)))
 
-    # A message with at least one element was sent.
+    # A message with at least one side-panel element was sent.
     sent_with_elements = [m for m in recorder.sent if m["elements"]]
-    assert sent_with_elements, "expected an inline element to be attached"
+    assert sent_with_elements, "expected a side-panel element to be attached"
     assert any("Showing" in m["content"] for m in recorder.sent)
+    for el in sent_with_elements[0]["elements"]:
+        assert getattr(el, "display", None) == "side", (
+            "markdown must render in the side panel, not inline"
+        )
 
 
 def test_on_open_document_ingested_hint(tmp_registry, monkeypatch):

@@ -611,23 +611,14 @@ async def on_chat_start() -> None:
 
     graphs = _list_available_graphs()
 
-    # Preselect last-used graph (per-user, persisted). Falls to _NO_GRAPH
-    # when absent or no longer on the instance. No cl.Message sent —
-    # preserves starter view.
-    identifier = cl.user_session.get("user_identifier")
+    # New chat always starts with no graph selected — the previously-used
+    # graph is NOT preselected. The persisted last_graph remains available
+    # for chat RESUME (on_chat_resume restores it from thread metadata) and
+    # for the /api/docs-info toggle-button visibility signal, but a fresh
+    # chat is a clean slate so documents from a prior session's graph don't
+    # leak into the new one. The user re-selects a graph via the dropdown.
     initial_active = _NO_GRAPH
     initial_allowed: list[str] = []
-    if identifier:
-        try:
-            from falkordb_harness.graph_descriptions import get_last_graph
-
-            last = await get_last_graph(identifier)
-        except Exception:  # noqa: BLE001 — never block chat start
-            last = None
-        if last and last in graphs:
-            initial_active = last
-            initial_allowed = [last]
-        # else: fall to no-graph state (not factory_planning)
 
     settings = _build_settings_widgets(graphs, initial_active, initial_allowed)
     await settings.send()
@@ -1185,10 +1176,11 @@ async def _resolve_doc_row(action: Action) -> dict | None:
 
 @cl.action_callback("open_document")
 async def on_open_document(action: Action) -> None:
-    """Render a document inline as a Chainlit element (the "Open" button).
+    """Render a document in the side panel (the "Open" button).
 
-    Prefers the preprocessed Markdown (renders as a ``cl.Text``); falls back
-    to the original (``cl.Pdf`` / ``cl.Image`` / ``cl.Text`` by extension).
+    Prefers the preprocessed Markdown (renders as a ``cl.Text`` in the
+    side panel, like PDFs/images); falls back to the original (``cl.Pdf`` /
+    ``cl.Image`` / ``cl.Text`` by extension, all in the side panel).
     Ingested rows have no thread-scoped preview file — the user is told to
     ask the assistant for an excerpt via chat instead.
     """
@@ -1512,7 +1504,26 @@ async def _build_document_manager_props() -> dict | None:
     _VIEWABLE_ORIG_EXTS = _IMAGE_EXTS | _PLAIN_EXTS | {".pdf"}
 
     selection = cl.user_session.get("graph_selection") or {}
-    active_graph = selection.get("active_graph", _DEFAULT_GRAPH)
+    active_graph = selection.get("active_graph") or _NO_GRAPH
+
+    # When no graph is selected (the default on a new chat), return the
+    # empty-state props WITHOUT querying the registry. list_for_user would
+    # otherwise surface every document the user ever uploaded across all
+    # threads, leaking a prior session's documents into the new chat. The
+    # sidebar then opens to DocumentManager.jsx's "No documents yet" card.
+    if active_graph == _NO_GRAPH:
+        lang = cl.user_session.get("lang") or "de"
+        return {
+            "documents": [],
+            "lang": lang,
+            "labels": {
+                "open": t("doc.action.open.tooltip"),
+                "openDisabled": t("doc.action.open.disabled_tooltip"),
+                "preprocess": t("doc.action.preprocess.tooltip"),
+                "delete": t("doc.action.delete.tooltip"),
+                "deleteConfirm": t("doc.action.delete.confirm"),
+            },
+        }
 
     user_identifier = cl.user_session.get("user_identifier")
     docs: list[dict] = []
@@ -1654,6 +1665,20 @@ async def on_message(message: cl.Message) -> None:
     logger.error("DBG on_message: agent=%r chat_history=%r", agent, chat_history)
 
     user_content = message.content or ""
+
+    # --- Empty-input guard ---------------------------------------------
+    # No-op + toast on an empty (or whitespace-only) chat submit with no
+    # attachments. File-only submissions (elements present, text empty)
+    # are legitimate (the upload path below appends file markers to
+    # user_content), so the guard only fires when there is neither text
+    # nor elements. Runs before the chat-flow-test harness so that admin
+    # test path (which reassigns user_content="") is unaffected.
+    if not user_content.strip() and not message.elements:
+        try:
+            await cl.context.emitter.send_toast(t("chat.empty_input"), type="warning")
+        except Exception:  # noqa: BLE001, S110 — toast is best-effort; never block the no-op
+            pass
+        return
 
     # --- Chat-flow test harness (admin only) ---------------------------
     # Detect the magic prefix __chat_flow_test__:<scenario_name>. When

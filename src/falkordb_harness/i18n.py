@@ -287,6 +287,12 @@ STRINGS: dict[str, dict[str, str]] = {
         "de": "Composer mit einem End-to-End-Showcase-Prompt füllen (nur Admin)",
     },
 
+    # --- Empty-input guard (chainlit_app.py on_message) -------------------
+    "chat.empty_input": {
+        "en": "Please enter a message before sending.",
+        "de": "Bitte geben Sie eine Nachricht ein, bevor Sie senden.",
+    },
+
     # --- Upload receipt (chainlit_app.py on_message) ----------------------
     "upload.receipt": {
         "en": "Received **{n_new}** file(s). **{n_total}** total file(s) ready for ingestion into graph `{graph}`.",
