@@ -60,30 +60,30 @@ async def nl_query(question: str) -> str:
 
 
 @tool
-def fulltext_search(query: str, label: str = "Resource", k: int = 10) -> str:
-    """Run a full-text search over node properties.
+async def search(query: str, mode: str = "fulltext", k: int = 10) -> str:
+    """Search the knowledge graph for nodes matching a query.
 
-    Searches nodes with the given label using RediSearch full-text indexing.
-    Returns up to k matching nodes with relevance scores.
+    Two modes:
+    - ``fulltext``: RediSearch keyword matching. Fast, no LLM call. Best for
+      exact names, keywords, or entity lookups (e.g. "CNC", "Hall A").
+    - ``vector``: embedding-based semantic similarity. Slower (one embedding
+      call). Best when keywords don't overlap with the target (e.g. "cooling
+      equipment" matching "chiller", "heat exchanger").
+
+    Returns up to ``k`` matching nodes with relevance/similarity scores.
     """
-    return with_retry(lambda: _fulltext_search_impl(query, label, k))
+    return await awith_retry(lambda: _search_impl(query, mode, k))
 
 
-def _fulltext_search_impl(query: str, label: str, k: int) -> str:
-    results = get_searcher().fulltext_search(query)
-    return json.dumps(results[:k], indent=2, ensure_ascii=False, default=str)
-
-
-@tool
-async def vector_search(query: str, k: int = 10) -> str:
-    """Run a vector similarity search using an embedding of the query.
-
-    Embeds the query text and finds the nearest neighbours in the graph's
-    vector index. Returns up to k matching nodes with similarity scores.
-    """
-    return await awith_retry(lambda: _vector_search_impl(query, k))
-
-
-async def _vector_search_impl(query: str, k: int) -> str:
-    results = await get_searcher().vector_search(query)
+async def _search_impl(query: str, mode: str, k: int) -> str:
+    searcher = get_searcher()
+    if mode == "fulltext":
+        results = searcher.fulltext_search(query)
+    elif mode == "vector":
+        results = await searcher.vector_search(query)
+    else:
+        return json.dumps(
+            {"error": f"Unknown mode '{mode}'. Use 'fulltext' or 'vector'."},
+            ensure_ascii=False,
+        )
     return json.dumps(results[:k], indent=2, ensure_ascii=False, default=str)

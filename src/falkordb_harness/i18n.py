@@ -35,16 +35,16 @@ STRINGS: dict[str, dict[str, str]] = {
         "de": "Graph",
     },
     "settings.tab.ingestion.label": {
-        "en": "Ingestion (Expert Settings)",
-        "de": "Ingestion (Experten-Einstellungen)",
+        "en": "Developer Settings",
+        "de": "Entwickler-Einstellungen",
     },
     "settings.active_graph.label": {
         "en": "Active knowledge graph",
         "de": "Aktiver Wissensgraph",
     },
     "settings.active_graph.desc": {
-        "en": "The graph all queries and ingestion target. Use the checkboxes below to enable more graphs for switching.",
-        "de": "Der Graph, auf den alle Anfragen und die Ingestion abzielen. Aktivieren Sie weitere Graphen über die Kontrollkästchen unten, um zwischen ihnen wechseln zu können.",
+        "en": "The graph all queries and ingestion target.",
+        "de": "Der Graph, auf den alle Anfragen und die Ingestion abzielen.",
     },
     "settings.allowed_graphs.label": {
         "en": "Enabled knowledge graphs (in scope for the assistant)",
@@ -65,6 +65,18 @@ STRINGS: dict[str, dict[str, str]] = {
     "settings.new_graph_name.desc": {
         "en": "Type a name and hit Save to create a new empty graph on the FalkorDB instance. It will be added to the dropdowns and set as the active graph. Leave blank to skip.",
         "de": "Geben Sie einen Namen ein und klicken Sie auf Speichern, um einen neuen leeren Graphen auf der FalkorDB-Instanz anzulegen. Er wird zu den Dropdowns hinzugefügt und als aktiver Graph gesetzt. Leer lassen, um zu überspringen.",
+    },
+    "settings.new_graph_description.label": {
+        "en": "Knowledge graph description",
+        "de": "Beschreibung des Wissensgraphen",
+    },
+    "settings.new_graph_description.placeholder": {
+        "en": "optional short description",
+        "de": "optionale Kurzbeschreibung",
+    },
+    "settings.new_graph_description.desc": {
+        "en": "Optional 1-3 sentence summary seeded as the new graph's description (the agent can revise it later). Leave blank to skip.",
+        "de": "Optionale 1-3 Sätze Zusammenfassung, die als Beschreibung des neuen Graphen gesetzt wird (der Assistent kann sie später überarbeiten). Leer lassen, um zu überspringen.",
     },
     "settings.label_filter.label": {
         "en": "Default node-label filter (for list_nodes / search)",
@@ -265,6 +277,22 @@ STRINGS: dict[str, dict[str, str]] = {
     "ingest.summary.errors.header": {"en": "- Errors ({n}):", "de": "- Fehler ({n}):"},
     "ingest.summary.errors.more": {"en": "  - …and {n} more", "de": "  - …und {n} weitere"},
 
+    # --- Debug "Run Showcase" button (public/debug_button.js) --------------
+    "debug.button.label": {
+        "en": "Run Showcase",
+        "de": "Showcase ausführen",
+    },
+    "debug.button.tooltip": {
+        "en": "Fill the composer with an end-to-end showcase prompt (admin only)",
+        "de": "Composer mit einem End-to-End-Showcase-Prompt füllen (nur Admin)",
+    },
+
+    # --- Empty-input guard (chainlit_app.py on_message) -------------------
+    "chat.empty_input": {
+        "en": "Please enter a message before sending.",
+        "de": "Bitte geben Sie eine Nachricht ein, bevor Sie senden.",
+    },
+
     # --- Upload receipt (chainlit_app.py on_message) ----------------------
     "upload.receipt": {
         "en": "Received **{n_new}** file(s). **{n_total}** total file(s) ready for ingestion into graph `{graph}`.",
@@ -285,6 +313,22 @@ STRINGS: dict[str, dict[str, str]] = {
         "en": "Tool calls ({n})",
         "de": "Tool-Aufrufe ({n})",
     },
+    # Same-tool chain aggregate step: "<tool> x N" header + per-call I/O headings.
+    "tools.chain.header": {
+        "en": "{tool} x {n}",
+        "de": "{tool} x {n}",
+    },
+    "tools.chain.call_input": {
+        "en": "### Call {n} input",
+        "de": "### Aufruf {n} Eingabe",
+    },
+    "tools.chain.call_output": {
+        "en": "### Call {n} output",
+        "de": "### Aufruf {n} Ausgabe",
+    },
+
+    # --- Thinking step (chainlit_app.py on_message) -----------------------
+    "thinking.label": {"en": "Thinking", "de": "Nachdenken"},
 
     # --- Recursion / error messages (chainlit_app.py on_message) ---------
     "error.recursion": {
@@ -309,14 +353,20 @@ STRINGS: dict[str, dict[str, str]] = {
         "en": "Documents — {active}",
         "de": "Dokumente — {active}",
     },
-    # --- Persistent "open document sidebar" button (OpenDocsButton.jsx) ---
-    "sidebar.open_button.label": {
-        "en": "Documents",
-        "de": "Dokumente",
+    # NOTE: the document-sidebar toggle button (public/docs_toggle.js) does
+    # its own localization via <html lang> rather than these keys, so no
+    # sidebar.open_button.* entries are needed here. The DocumentManager
+    # sidebar content itself is driven by _build_document_manager_props,
+    # whose labels come from the doc.action.* keys below.
+
+    # --- Agent todos panel (AgentTodos.jsx) --------------------------------
+    "agent_todos.plan": {
+        "en": "Plan",
+        "de": "Plan",
     },
-    "sidebar.open_button.title": {
-        "en": "Open document sidebar",
-        "de": "Dokumenten-Seitenleiste öffnen",
+    "agent_todos.progress": {
+        "en": "Progress",
+        "de": "Fortschritt",
     },
 
     # --- Document manager row actions (DocumentManager.jsx + callbacks) ---
@@ -410,18 +460,8 @@ STRINGS: dict[str, dict[str, str]] = {
     "fmt.schema.heading.node_labels": {"en": "Node Labels", "de": "Knoten-Labels"},
     "fmt.schema.heading.rel_types": {"en": "Relationship Types", "de": "Beziehungs-Typen"},
     "fmt.schema.heading.prop_keys": {"en": "Property Keys", "de": "Eigenschafts-Schlüssel"},
-    "fmt.node_count.one": {
-        "en": "**{n}** nodes in the graph.",
-        "de": "**{n}** Knoten im Graphen.",
-    },
 
     # --- Visual elements (chainlit_elements.py) ---------------------------
-    "chart.nodes_by_label.title": {"en": "Nodes by label", "de": "Knoten nach Label"},
-    "chart.nodes_by_label.x": {"en": "Label", "de": "Label"},
-    "chart.nodes_by_label.y": {"en": "Node count", "de": "Knotenanzahl"},
-    "chart.rel_by_type.title": {"en": "Relationships by type", "de": "Beziehungen nach Typ"},
-    "chart.rel_by_type.x": {"en": "Relationship type", "de": "Beziehungstyp"},
-    "chart.rel_by_type.y": {"en": "Count", "de": "Anzahl"},
     "chart.search_scores.title": {"en": "Search relevance scores", "de": "Suchrelevanz-Scores"},
     "chart.search_scores.x": {"en": "Node", "de": "Knoten"},
     "chart.search_scores.y": {"en": "Relevance", "de": "Relevanz"},
@@ -447,58 +487,120 @@ STRINGS: dict[str, dict[str, str]] = {
     "lang.name.en": {"en": "English", "de": "Englisch"},
     "lang.name.de": {"en": "German", "de": "Deutsch"},
 
-    # --- Welcome / acknowledgement popup (chainlit_app.py + WelcomeModal.jsx) ---
+    # --- Welcome / acknowledgement warning (auth.py registration form) ---
     "welcome.title": {
         "en": "Test Build — Please Read",
         "de": "Test-Build — Bitte lesen",
     },
     "welcome.intro": {
-        "en": "This is a **test build**, not a production system. Please read the following points before continuing.",
-        "de": "Dies ist ein **Test-Build**, kein Produktivsystem. Bitte lesen Sie die folgenden Hinweise, bevor Sie fortfahren.",
+        "en": "This is a test build for research purposes only, not a production system. The following is provided in good faith to ensure informed use. Use is permitted for consortial partners in full compliance with the cooperation contract of 13 June 2025 and the open-source software agreement of 18 August 2025.",
+        "de": "Dies ist ein Test-Build ausschließlich für Forschungszwecke, kein Produktivsystem. Das Folgende wird nach Treu und Glauben bereitgestellt, um eine informierte Nutzung zu gewährleisten. Die Nutzung ist Konsortialpartnern gestattet, sofern sie vollständig dem Kooperationsvertrag vom 13. Juni 2025 und der Open-Source-Softwarevereinbarung vom 18. August 2025 entspricht.",
     },
     "welcome.risk.cloud.title": {
-        "en": "Cloud LLM provider (no DSGVO / GDPR conformity)",
-        "de": "Cloud-LLM-Anbieter (keine DSGVO-Konformität)",
+        "en": "Cloud LLM; no GDPR / DSGVO conformity",
+        "de": "Cloud-LLM; keine GDPR-/DSGVO-Konformität",
     },
     "welcome.risk.cloud.body": {
-        "en": "Ollama Cloud is hardcoded as the LLM provider for this test build. All input you send to the chat is processed by Ollama Cloud services. This means your data leaves the controlled environment and is processed by a third-party cloud provider, so there is **no DSGVO / GDPR conformity** (incl. Art. 44 cross-border and Art. 28 processor concerns).",
-        "de": "Ollama Cloud ist für diesen Test-Build fest als LLM-Anbieter konfiguriert. Sämtliche Eingaben, die Sie im Chat tätigen, werden von den Cloud-Diensten von Ollama verarbeitet. Ihre Daten verlassen dabei die kontrollierte Umgebung und werden durch einen Drittanbieter verarbeitet — es besteht **keine DSGVO-/GDPR-Konformität** (inkl. Art. 44 Datenübermittlung in Drittländer und Art. 28 Auftragsverarbeitung).",
+        "en": "All input is processed by a third-party cloud provider (Ollama Cloud), so data leaves the controlled environment. No transfer mechanism (Art. 44) or processor agreement (Art. 28) is in place. GDPR conformity cannot be guaranteed.",
+        "de": "Sämtliche Eingaben werden von einem Drittanbieter-Cloud-Dienst (Ollama Cloud) verarbeitet, sodass die Daten die kontrollierte Umgebung verlassen. Es liegt kein Übermittlungsmechanismus (Art. 44) und keine Auftragsverarbeitungsvereinbarung (Art. 28) vor. Eine DSGVO-/GDPR-Konformität kann nicht gewährleistet werden.",
     },
     "welcome.risk.compliance.title": {
-        "en": "No data-processing agreement (DPA / AVV)",
-        "de": "Keine Auftragsverarbeitungsvereinbarung (AVV)",
+        "en": "No DPA / AVV",
+        "de": "Kein DPA / AVV",
     },
     "welcome.risk.compliance.body": {
-        "en": "No data-processing agreement (DPA / AVV) with the cloud provider is in place for this test build. Processing of personal data is therefore not compliant and must not be used for such data.",
-        "de": "Für diesen Test-Build liegt keine Auftragsverarbeitungsvereinbarung (AVV) mit dem Cloud-Anbieter vor. Die Verarbeitung personenbezogener Daten ist daher nicht konform und darf für solche Daten nicht verwendet werden.",
+        "en": "No data-processing agreement with the cloud provider exists. Processing of personal data is non-compliant and must not be undertaken.",
+        "de": "Es besteht keine Auftragsverarbeitungsvereinbarung mit dem Cloud-Anbieter. Die Verarbeitung personenbezogener Daten ist nicht konform und darf nicht vorgenommen werden.",
     },
     "welcome.risk.retention.title": {
-        "en": "Unknown retention / logging on the provider side",
-        "de": "Unbekannte Speicher- und Protokollierungsdauer beim Anbieter",
+        "en": "Unknown provider-side retention",
+        "de": "Unbekannte Anbieter-Speicherdauer",
     },
     "welcome.risk.retention.body": {
-        "en": "There are no guarantees regarding retention, deletion, or logging on the provider side. Inputs may be stored, logged, or used for model improvement by the cloud service.",
-        "de": "Es gibt keine Garantien bezüglich Speicherung, Löschung oder Protokollierung auf Seiten des Anbieters. Eingaben können durch den Cloud-Dienst gespeichert, protokolliert oder zur Modellverbesserung verwendet werden.",
+        "en": "No guarantees exist regarding retention, deletion, or logging. Inputs may be stored, logged, or used for model improvement by the provider.",
+        "de": "Es bestehen keine Garantien bezüglich Speicherung, Löschung oder Protokollierung. Eingaben können durch den Anbieter gespeichert, protokolliert oder zur Modellverbesserung verwendet werden.",
     },
     "welcome.risk.no_audit.title": {
-        "en": "No prompt / reply audit logging",
-        "de": "Keine Protokollierung von Anfragen und Antworten",
+        "en": "No audit logging",
+        "de": "Keine Audit-Protokollierung",
     },
     "welcome.risk.no_audit.body": {
-        "en": "This test build does not keep an audit log of what is sent to or received from the provider. There is no transparency over the data transmitted.",
-        "de": "Dieser Test-Build führt kein Audit-Log über die an den Anbieter gesendeten oder von ihm empfangenen Daten. Es gibt keine Transparenz über die übermittelten Daten.",
+        "en": "This build keeps no log of content sent to or received from the provider. Transparency over transmitted data is limited.",
+        "de": "Dieser Build führt kein Protokoll über Inhalte, die an den Anbieter gesendet oder von ihm empfangen werden. Die Transparenz über übermittelte Daten ist eingeschränkt.",
     },
     "welcome.risk.not_hardened.title": {
         "en": "Not security-hardened",
         "de": "Nicht sicherheitstechnisch gehärtet",
     },
     "welcome.risk.not_hardened.body": {
-        "en": "This is a test build: it is not security-hardened, has no rate limiting, and is not intended for processing personal or confidential data.",
-        "de": "Dies ist ein Test-Build: nicht sicherheitstechnisch gehärtet, ohne Rate-Limiting und nicht für die Verarbeitung personenbezogener oder vertraulicher Daten vorgesehen.",
+        "en": "No rate limiting, access controls, or production-grade security measures are implemented.",
+        "de": "Es sind kein Rate-Limiting, keine Zugriffskontrollen oder produktionsgradige Sicherheitsmaßnahmen implementiert.",
+    },
+    "welcome.closing": {
+        "en": "This build must not be used to process personal, confidential, or otherwise sensitive data.",
+        "de": "Dieser Build darf nicht zur Verarbeitung personenbezogener, vertraulicher oder anderweitig sensibler Daten verwendet werden.",
     },
     "welcome.ack.label": {
         "en": "I understand and acknowledge.",
         "de": "Ich verstehe und bestätige dies.",
+    },
+    "welcome.ack.missing": {
+        "en": "You must acknowledge the warning to register.",
+        "de": "Sie müssen den Hinweis bestätigen, um sich zu registrieren.",
+    },
+
+    # --- Graph lifecycle policy (graph_admin_tools / chainlit_app) ---------
+    "graph.none": {
+        "en": "(no graph selected)",
+        "de": "(kein Graph ausgewählt)",
+    },
+    "graph.switch.confirm": {
+        "en": (
+            "Switch the active knowledge graph to `{name}`? Queries and "
+            "ingestion will target `{name}` from now on."
+        ),
+        "de": (
+            "Aktiven Wissensgraph auf `{name}` wechseln? Anfragen und "
+            "Ingestion zielen ab jetzt auf `{name}`."
+        ),
+    },
+    "graph.badge.label": {
+        "en": "Knowledge graph: {name}",
+        "de": "Wissensgraph: {name}",
+    },
+    "graph.badge.none": {
+        "en": "No knowledge graph selected",
+        "de": "Kein Wissensgraph ausgewählt",
+    },
+    "graph.badge.fetch_error": {
+        "en": "Knowledge graph unavailable",
+        "de": "Wissensgraph nicht verfügbar",
+    },
+    "graph.description.empty": {
+        "en": "(no description yet)",
+        "de": "(noch keine Beschreibung)",
+    },
+
+    # --- Chat-flow test harness (chainlit_app.py on_message) ---------------
+    "chat_flow_test.not_admin": {
+        "en": "Chat-flow test is admin-only. Your role does not permit this action.",
+        "de": "Chat-Flow-Test ist nur für Admins. Ihre Rolle erlaubt diese Aktion nicht.",
+    },
+    "chat_flow_test.not_found": {
+        "en": "Unknown chat-flow test scenario: `{name}`.",
+        "de": "Unbekanntes Chat-Flow-Test-Szenario: `{name}`.",
+    },
+    "chat_flow_test.button.label": {
+        "en": "Test Chat Flow",
+        "de": "Chat-Flow testen",
+    },
+    "chat_flow_test.button.tooltip": {
+        "en": "Run a mock showcase event stream to verify chat ordering (admin only)",
+        "de": "Mock-Showcase-Event-Stream ausführen, um Chat-Reihenfolge zu prüfen (nur Admin)",
+    },
+    "chat_flow_test.button.not_admin": {
+        "en": "Admin access required",
+        "de": "Admin-Zugriff erforderlich",
     },
 }
 

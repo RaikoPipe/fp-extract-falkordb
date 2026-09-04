@@ -1,27 +1,12 @@
 """Similarity-based reconciliation for plain-name resource nodes.
 
-Before inserting a new resource whose name does not match an existing node by
-exact name, determine whether it is a duplicate of an indexed resource by:
-
-1. Embedding the new node's description and running a cosine similarity search
-   against all ``Resource`` nodes where ``name_has_index=true``.
-2. Applying a cosine cutoff (default 0.70) to keep only the top-k candidates.
-3. Running an LLM pairwise comparison of the description + properties of the
-   new node against each surviving candidate, producing a confidence factor.
-4. Picking the candidate with the highest confidence. If that confidence is
-   above the threshold (default 0.90), the new node is inserted as a distinct
-   node with a ``POSSIBLE_DUPLICATE_OF`` reference to the matched node, an
-   alias on the indexed node, and a canonical name on the plain node — all
-   documented in ``reconciliations.jsonl`` for human review.
-
-A post-hoc pass (:func:`reconcile_existing_plain_nodes`) iterates existing
-plain-name resource nodes and runs the same pipeline, so plain names ingested
-before their indexed counterpart arrived can be reconciled later.
-
-This module also provides :func:`coalesce_description`, which merges an
-existing description with a newly discovered one via an LLM call. Coalescing
-runs on every name-match merge (both merge modes) and re-embeds the node so
-the cosine search stays accurate as descriptions evolve.
+Embeds a new plain-name Resource, runs a cosine search against indexed
+Resource nodes, and LLM-pairwise-compares the top candidates; above a
+confidence threshold the new node is linked via ``POSSIBLE_DUPLICATE_OF``
+and the match is logged. A post-hoc pass
+(:func:`reconcile_existing_plain_nodes`) iterates existing plain-name nodes
+that lack the link. :func:`coalesce_description` LLM-merges two descriptions
+of the same resource on every name-match merge and re-embeds the node.
 """
 
 from __future__ import annotations
@@ -31,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from knowledge._clients import chat_client, embedding_client
+from knowledge._textutils import strip_code_fence, utc_now_iso
 from knowledge.graph_models.factory_graph_model import Resource
 
 
@@ -232,11 +218,7 @@ async def llm_pairwise_confidence(
     raw = (response.choices[0].message.content or "").strip()
 
     if raw.startswith("```"):
-        lines = raw.split("\n")
-        lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        raw = "\n".join(lines)
+        raw = strip_code_fence(raw)
 
     try:
         parsed = _json.loads(raw)
@@ -289,8 +271,6 @@ async def reconcile_new_node(
 
     Returns a :class:`ReconciliationDecision`.
     """
-    from datetime import datetime, timezone
-
     rows = backend.vector_search(
         embedding,
         label=_RESOURCE_LABEL,
@@ -338,7 +318,7 @@ async def reconcile_new_node(
             candidates=candidates,
         )
 
-    detected_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    detected_at = utc_now_iso()
     record = _build_record(
         new_node.name,
         cand.name,

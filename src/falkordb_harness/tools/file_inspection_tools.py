@@ -27,8 +27,7 @@ from falkordb_harness.tools._paths import resolve as _resolve
 from falkordb_harness.tools._retry import with_retry
 from knowledge.chunking import SUPPORTED_EXTENSIONS, TEXT_EXTENSIONS
 
-# Cap on a single excerpt's returned characters. Prevents large bodies from
-# flooding the LLM context during pre-ingestion review.
+# Cap excerpt size to protect the LLM context budget.
 _EXCERPT_CHAR_CAP = 8000
 
 # Cap on raw bytes returned in "bytes" mode.
@@ -122,7 +121,6 @@ def _file_metadata_impl(path: str) -> str:
         "size_human": _human_size(size_bytes),
     }
 
-    # Page count: PDF/DOCX only.
     if ftype == "pdf":
         meta["page_count"] = _pdf_page_count(resolved)
     elif ftype == "docx":
@@ -130,7 +128,6 @@ def _file_metadata_impl(path: str) -> str:
     else:
         meta["page_count"] = None
 
-    # Text counts: only for genuinely text-like files.
     if ftype == "text":
         try:
             text = resolved.read_text(encoding="utf-8", errors="replace")
@@ -164,7 +161,6 @@ def _excerpt_lines(path_obj: Path, offset: int, limit: int) -> str:
         return f"Line offset {offset} exceeds file length ({len(lines)} lines)"
     end = min(offset + limit, len(lines))
     chunk = "".join(lines[offset:end])
-    # cat -n style formatting, 1-indexed.
     rendered = "".join(
         f"{i + 1}: {ln}" for i, ln in enumerate(lines[offset:end], start=offset)
     )

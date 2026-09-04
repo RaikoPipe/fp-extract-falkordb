@@ -70,9 +70,7 @@ def test_file_metadata_text(tmp_path):
     assert out["size_bytes"] == f.stat().st_size
     assert out["page_count"] is None
     assert out["char_count"] == len("hello world\nsecond line\n\nthird para")
-    # words: hello, world, second, line, third, para = 6
     assert out["word_count"] == 6
-    # 3 newlines -> 4 lines
     assert out["line_count"] == 4
     assert out["encoding"] == "utf-8"
 
@@ -84,7 +82,6 @@ def test_file_metadata_pdf_page_count(tmp_path):
     assert out["file_type"] == "pdf"
     assert out["extension"] == ".pdf"
     assert out["page_count"] == 3
-    # text counts are null for PDF
     assert out["char_count"] is None
     assert out["word_count"] is None
 
@@ -180,7 +177,6 @@ def test_read_excerpt_bytes_capped(tmp_path):
     f = tmp_path / "originals" / "big.bin"
     f.write_bytes(b"\x00" * 2048)
     out = _call(read_excerpt, path="originals/big.bin", mode="bytes", limit=2048)
-    # Should be capped at 512 bytes regardless of the large limit requested.
     assert "of 2048" in out
     # hex string length for 512 bytes = 512 * 2 + 511 spaces = 1535 chars
     assert len(out) < 4000

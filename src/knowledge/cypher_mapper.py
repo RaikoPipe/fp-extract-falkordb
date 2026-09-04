@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Iterator
 
 from pydantic import BaseModel
 
+from knowledge._textutils import utc_now_iso
 from knowledge.graph_models.factory_graph_model import (
     AmbiguousDuration,
     ControlStrategy,
@@ -182,11 +182,18 @@ def _relationship_merges(
 
 def _iter_entities(
     graph: FactoryPlanningGraph,
+    *,
+    label: str | None = None,
 ) -> Iterator[tuple[BaseModel, str]]:
-    """Yield ``(entity, label)`` for every entity in the extraction graph."""
-    for field_name, _cls, label in _ENTITY_LISTS:
+    """Yield ``(entity, label)`` for every entity in the extraction graph.
+
+    When ``label`` is given, only entities of that label are yielded.
+    """
+    for field_name, _cls, ent_label in _ENTITY_LISTS:
+        if label is not None and ent_label != label:
+            continue
         for entity in getattr(graph, field_name, []) or []:
-            yield entity, label
+            yield entity, ent_label
 
 
 def extraction_to_cypher(
@@ -194,28 +201,19 @@ def extraction_to_cypher(
 ) -> list[tuple[str, dict[str, Any]]]:
     """Convert a full extraction to a list of Cypher MERGE statements.
 
-    First creates/updates all nodes, then creates relationships.
-    Equivalent to ``extraction_to_cypher_with_mode(graph, MergeMode.OVERWRITE)``.
+    Nodes first, then relationships. Equivalent to
+    ``extraction_to_cypher_with_mode(graph, MergeMode.OVERWRITE)`` for the
+    relationship half; the node half is the plain overwrite MERGEs.
     """
-    statements: list[tuple[str, dict[str, Any]]] = []
-
-    for entity, label in _iter_entities(graph):
-        statements.append(model_to_cypher_merge(entity, label))
-
-    for entity, label in _iter_entities(graph):
-        statements.extend(_relationship_merges(entity, label))
-
+    statements = [model_to_cypher_merge(e, lbl) for e, lbl in _iter_entities(graph)]
+    rel_statements, _ = extraction_to_cypher_with_mode(graph, MergeMode.OVERWRITE)
+    statements.extend(rel_statements)
     return statements
 
 
 # ---------------------------------------------------------------------------
 # Conflict-detecting merge mode
 # ---------------------------------------------------------------------------
-
-def _now_iso() -> str:
-    """Current UTC timestamp in ISO-8601 (second precision)."""
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
 
 def _scalar_fields(entity: BaseModel) -> dict[str, Any]:
     """Return non-None, non-reference scalar fields of ``entity``."""
@@ -246,24 +244,14 @@ def build_conflict_merge(
 ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
     """Convert one Pydantic entity to a conflict-aware MERGE + SET statement.
 
-    Policy: first-writer-wins, except for fields listed in
-    :data:`_COALESCED_FIELDS` (e.g. ``description``), which are handled via
-    caller-supplied coalesced values.
+    First-writer-wins for scalar fields: a null existing value is written,
+    an equal value is a no-op, a differing non-null existing value is kept
+    and the incoming value is recorded as a conflict in ``n.conflicts``.
+    Fields in :data:`_COALESCED_FIELDS` (e.g. ``description``) are instead
+    written from caller-supplied ``coalesced_values`` with no conflict.
 
-    - For each scalar field on ``entity``:
-        * If the field is in ``coalesced_values``, that value is written via
-          ``SET`` (the caller — the async backend — computed it via an LLM
-          coalesce call). No conflict is recorded for coalesced fields.
-        * If the existing node does not have the property (or it is null),
-          the incoming value is written via ``SET``.
-        * If the existing value equals the incoming value, nothing happens.
-        * If the existing value differs and is non-null, the incoming value
-          is **not** written; instead a conflict record is appended to
-          ``n.conflicts`` (a JSON-serialised list property).
-
-    Returns ``(cypher_query, parameters, conflicts)`` where ``conflicts`` is
-    the list of newly-detected conflict dicts (also embedded in the query so
-    they land in-graph in the same round-trip).
+    Returns ``(cypher_query, parameters, conflicts)`` — ``conflicts`` is also
+    embedded in the query so it lands in-graph in the same round-trip.
     """
     coalesced_values = coalesced_values or {}
     data = entity.model_dump(exclude_none=True)
@@ -283,7 +271,6 @@ def build_conflict_merge(
 
         existing = existing_props.get(key)
         if existing is None:
-            # No prior value — write it.
             param_key = f"p_{key}"
             params[param_key] = _serialize_value(incoming)
             set_parts.append(f"n.{key} = ${param_key}")
@@ -291,11 +278,9 @@ def build_conflict_merge(
 
         incoming_ser = _serialize_value(incoming)
         if existing == incoming_ser:
-            # Agreement — no-op.
             continue
 
-        # Conflict: keep existing, record incoming.
-        detected_at = _now_iso()
+        detected_at = utc_now_iso()
         conflict = {
             "id": f"{key}:{detected_at}",
             "property": key,
@@ -376,29 +361,13 @@ def extraction_to_cypher_with_mode(
 ]:
     """Convert an extraction to Cypher statements under ``mode``.
 
-    Returns ``(relationship_statements, node_entries)``:
-
-    - ``relationship_statements`` — MERGE statements for cross-reference
-      relationships (identical in both modes; v1 does not detect conflicts on
-      edges).
-    - ``node_entries`` — one ``(fetch_query, fetch_params, entity, label)``
-      tuple per entity node, in the conflict mode; empty in overwrite mode.
-
-    ``source`` and ``chunk_index`` are stored on each conflict record for
-    provenance. They are accepted here for symmetry but are normally applied
-    per-entity in :func:`build_conflict_merge`.
-
-    Callers in overwrite mode should ignore the second return value and run
-    the overwrite node MERGEs via :func:`extraction_to_cypher` (or
-    :func:`model_to_cypher_merge` directly).
-
-    In conflict mode, the caller is expected to:
-
-    1. For each entry, run ``fetch_query`` to obtain the existing node props.
-    2. Call :func:`build_conflict_merge` with those props to produce the
-       write statement + detected conflicts.
-    3. Run the write statement, append conflicts to the JSONL log.
-    4. Finally run all ``relationship_statements``.
+    Returns ``(relationship_statements, node_entries)``. Relationship MERGEs
+    are identical in both modes (no edge-conflict detection). ``node_entries``
+    holds one ``(fetch_query, fetch_params, entity, label)`` per entity in
+    conflict mode (empty in overwrite mode); the caller fetches each node,
+    feeds the props to :func:`build_conflict_merge`, runs the write, then
+    runs all relationship statements. ``source``/``chunk_index`` are stored
+    on each conflict record for provenance.
     """
     rel_statements: list[tuple[str, dict[str, Any]]] = []
     for entity, label in _iter_entities(graph):

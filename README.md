@@ -1,605 +1,173 @@
-# fp-extract-falkordb
+# factory-kg-agent
 
-Factory-planning knowledge graph extraction pipeline. Ingests domain documents, extracts structured entities via an LLM into a Pydantic graph model, and writes them to **FalkorDB** as Cypher `MERGE` statements with built-in entity deduplication.
+Factory-planning knowledge graph extraction pipeline. Ingests domain documents, extracts structured entities via an LLM into a Pydantic graph model, and writes them to **FalkorDB** as Cypher `MERGE` statements with built-in entity deduplication. A Chainlit chat app exposes the pipeline as an interactive agent.
 
-Supports two merge modes:
+---
+
+## Setup & running Chainlit
+
+The primary way to use the system is the Chainlit web app (Docker, recommended) or running it directly with `chainlit run`.
+
+### Option A — Docker (recommended)
+
+```bash
+# 1. Clone submodules (docprep document-to-markdown pipeline)
+git submodule update --init --recursive
+
+# 2. Copy config templates
+cp .env.example .env
+cp .env.secrets.example .env.secrets
+
+# 3. Generate a JWT signing secret and put it in .env.secrets
+chainlit create-secret           # paste the printed value into CHAINLIT_AUTH_SECRET
+
+# 4. (optional) bootstrap the first admin in .env / .env.secrets
+#    .env:                FIRST_ADMIN_USERNAME=admin
+#                         FIRST_ADMIN_EMAIL=admin@example.com
+#    .env.secrets:        FIRST_ADMIN_PASSWORD=<a strong password>
+
+# 5. Build and start everything (FalkorDB + Chainlit)
+docker compose up -d --build
+```
+
+Then open **http://localhost:8001** → `/register` to create an account → `/login`.
+
+Containers:
+- FalkorDB — `localhost:6379` (graph DB), web UI at `localhost:3000`
+- Chainlit — published on host port `8001` → container `8000`
+
+### Option B — Local (no Docker)
+
+```bash
+# 1. Start FalkorDB separately (e.g. via its docker image alone), then:
+pip install -e ".[chainlit]"
+
+# 2. Configure
+cp .env.example .env
+cp .env.secrets.example .env.secrets
+chainlit create-secret           # → CHAINLIT_AUTH_SECRET in .env.secrets
+
+# 3. Run the app
+chainlit run src/falkordb_harness/chainlit_app.py --host 0.0.0.0 --port 8000
+```
+
+### What Chainlit gives you
+
+A chat UI backed by a LangChain deep-agent with 16 tools: preprocess a source document, chunk it, extract entities into FalkorDB, run Cypher / natural-language / fulltext / vector searches, inspect the graph schema, list and resolve merge conflicts, and run similarity-based reconciliation.
+
+Two separate LLM configs apply (see `.env.example`):
+- `LLM_MODEL` — entity extraction + NL-to-Cypher (bare Ollama tag, e.g. `glm-5.2:cloud`)
+- `AGENT_LLM_MODEL` — the agent's reasoning (default `glm-5.2:cloud`; also accepts `anthropic/...`, `openai/...`)
+
+First-run accounts: visit `/register` (disable with `REGISTER_ENABLED=0`). Chat history is persisted in a local SQLite DB (`DATABASE_URL`); uploaded files live in `ELEMENTS_DIR` under `DATA_DIR`. For multi-host deployments, point `DATABASE_URL` at Postgres and add a `postgres` service to `docker-compose.yml`.
+
+### CLI alternatives (no UI)
+
+```bash
+# Ingest documents
+python scripts/ingest.py --ingest --data-dir ./data --merge-mode conflict
+
+# Cypher / NL search REPL
+python scripts/ingest.py --search
+
+# Headless agent
+falkordb-agent
+falkordb-agent --single "How many nodes are in the graph?"
+```
+
+---
+
+## How the system works
+
+### Merge modes
+
+Ingestion writes entities to FalkorDB as `MERGE` statements in one of two modes:
 
 | Mode | Behavior | Flag |
 |---|---|---|
 | `overwrite` (default) | Last-write-wins. Re-ingestion silently replaces prior property values. | `--merge-mode overwrite` |
-| `conflict` | First-writer-wins. Existing non-null values are preserved; disagreements are isolated as **conflicts** (in-graph `conflicts` list + append-only JSONL audit log) for human review. | `--merge-mode conflict` |
+| `conflict` | First-writer-wins. Existing non-null values are preserved; disagreements are isolated as **conflicts** (in-graph `conflicts` list) for human review. | `--merge-mode conflict` |
 
-An optional **similarity-based reconciliation** step catches plain-name resource nodes (e.g. "Machine") that refer to the same physical entity as an indexed resource (e.g. "AKL-01"). Enabled with `--recon`; details below.
+An optional similarity-based reconciliation step catches plain-name resource nodes (e.g. "Machine") that refer to the same physical entity as an indexed one (e.g. "AKL-01"). Enable with `--recon`.
 
----
-
-## Quick start
-
-```bash
-# 1. Start FalkorDB
-docker-compose up -d
-
-# 2. Configure
-cp .env.example .env   # edit as needed
-
-# 3. Ingest documents (conflict mode)
-python scripts/ingest.py --ingest --data-dir ./data --merge-mode conflict
-
-# 4. Search (graph mode: raw Cypher or NL -> Cypher)
-python scripts/ingest.py --search
-
-# 5. Inspect conflicts
-python scripts/ingest.py --search
-# > MATCH (n) WHERE n.conflicts IS NOT NULL RETURN n.name, labels(n), n.conflicts
-```
-
-Visualization: FalkorDB's built-in web UI at `http://localhost:3000`.
-
-### LangChain agent harness
-
-A LangChain deep-agent harness (`falkordb_harness`) is bundled in this repo. It exposes the extraction pipeline and graph search as 16 tools driven by an agent you can interact with via the `falkordb-agent` CLI:
-
-```bash
-# Interactive agent session
-falkordb-agent
-
-# Single query
-falkordb-agent --single "How many nodes are in the graph?"
-
-# Use a specific agent model
-falkordb-agent --model openai/gpt-4o
-```
-
-Two separate LLM configurations apply:
-
-- **`LLM_MODEL`** — drives entity extraction and NL-to-Cypher (via the OpenAI-compatible endpoint). Bare Ollama tag (e.g. `glm-5.2:cloud`).
-- **`AGENT_LLM_MODEL`** — drives the LangChain agent's reasoning (default: `anthropic/claude-sonnet-4-20250514`). Supports `anthropic/...`, `openai/...`, and bare Ollama tags (e.g. `glm-5.2:cloud`) via Ollama's OpenAI-compatible endpoint.
-
-| Tool | Description |
-|------|-------------|
-| `file_metadata` | Inspect raw source file metadata (size, type, page count) |
-| `read_excerpt` | Read a bounded excerpt of a raw source file |
-| `preprocess_document` | Convert a raw source (scanned PDF/image/office) to Markdown via docprep, write to `PREPROCESSED_DIR` |
-| `chunk_documents` | Preview document chunking without ingestion |
-| `extract_and_write` | Full pipeline: chunk, extract, write to FalkorDB |
-| `cypher_query` | Execute raw Cypher queries; also used to list and resolve merge conflicts (see below) |
-| `nl_query` | Natural language to Cypher with summarized answer |
-| `fulltext_search` | RediSearch full-text search |
-| `vector_search` | Vector similarity search via embeddings |
-| `get_schema` | Inspect graph labels, relationships, properties |
-| `list_nodes` | List nodes with properties |
-| `list_edges` | List relationships |
-| `node_count` | Count total nodes |
-| `get_reconciliations` | List `POSSIBLE_DUPLICATE_OF` links |
-| `clear_reconciliations` | Dismiss reviewed reconciliation links |
-| `reconcile_posthoc` | Post-hoc reconciliation pass over plain-name Resources |
-| `reset_graph` | Delete all graph data |
-
-See `.env.example` for all configuration options.
-
----
-
-## Dataflow: documents to finished graph
-
-The pipeline runs in seven stages. Each stage names the module and function that implements it, the data shape it produces, and (where relevant) the exact Cypher it generates.
+### Dataflow: documents → graph
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│  ./data/                                                                │
-│  DOC1_Lastenheft_Fragment_v1-2.md                                       │
-│  DOC3_Maschinenparameter_Tabelle.md                                     │
-│  DOC8_Schichtplan_Personalbedarfsplanung.md                             │
-│  ... (txt, md, pdf, docx, csv, json, html, py)                          │
-└───────────────────────────┬─────────────────────────────────────────────┘
-                            │
-                            │  Stage 1 — discover + read + chunk
-                            │  chunking.load_and_chunk()
-                            │  scripts/ingest.py:52-58
-                            ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│  CHUNKS                                                                 │
-│  list[dict] where each dict = {                                         │
-│    "source":       "DOC3_Maschinenparameter_Tabelle.md",   ← provenance │
-│    "chunk_index":  2,                                      ← provenance │
-│    "text":         "AKL-01: capacity=500, AS/RS, zone-A..."             │
-│  }                                                                      │
-│                                                                         │
-│  chunking.chunk_text(): paragraph-aware split on "\n\n", pack to        │
-│  chunk_size=4000 chars, carry overlap=200 chars forward.                │
-└───────────────────────────┬─────────────────────────────────────────────┘
-                            │
-                            │  Stage 2 — LLM extraction (provenance-preserving)
-                            │  llm_extract.extract_from_chunks()
-                            │  scripts/ingest.py:60-69
-                            ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│  EXTRACTIONS WITH PROVENANCE                                            │
-│  list[tuple[FactoryPlanningGraph, str, int]]                            │
-│                                                                         │
-│  Per chunk:                                                             │
-│    • build_extraction_prompt() injects the Pydantic JSON schema + text  │
-│    • chat_client().chat.completions.create(model=LLM_MODEL, temperature=0.0)
-│    • strip markdown fences → model_validate_json → json_repair fallback │
-│    • retries up to 3× with exponential backoff                          │
-│    • provenance (source, chunk_index) ATTACHED to the result tuple      │
-│                                                                         │
-│  FactoryPlanningGraph holds 15 typed entity lists:                      │
-│    resources, transport_vehicles, trailers, transport_segments,         │
-│    transport_routes, traffic_rules, products, production_programs,      │
-│    order_logic, shift_models, worker_pools, control_strategies,         │
-│    layout_elements→zones, kpis, ambiguous_durations                     │
-└───────────────────────────┬─────────────────────────────────────────────┘
-                            │
-                             │  Stage 3 — backend construction + mode selection
-                             │  FalkorDBBackend(merge_mode=...)
-                             │  scripts/ingest.py:137-141
-                             ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│  FalkorDBBackend                                                        │
-│                                                                         │
-│  merge_mode resolution:                                                 │
-│    explicit MergeMode arg  >  string arg  >  MERGE_MODE env  >  OVERWRITE│
-│                                                                         │
-│  MergeMode (cypher_mapper.py):                                          │
-│    OVERWRITE = "overwrite"   last-write-wins (original behavior)        │
-│    CONFLICT  = "conflict"    first-writer-wins + conflict isolation     │
-└───────────────────────────┬─────────────────────────────────────────────┘
-                            │
-                            │  Stage 4 — write to FalkorDB
-                            │  backend.write_extraction(graph, source=, chunk_index=)
-                            │  scripts/ingest.py:71-79
-                            ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│  write_extraction branches on merge_mode                                │
-└───────────────────────────┬─────────────────────────────────────────────┘
-                            │
-              ┌─────────────┴──────────────┐
-              │                            │
-              ▼                            ▼
-┌──────────────────────────┐  ┌──────────────────────────────────────────┐
-│  OVERWRITE PATH          │  │  CONFLICT PATH                            │
-│  (unchanged from v0)     │  │  (new)                                    │
-│                          │  │                                          │
-│  extraction_to_cypher()  │  │  extraction_to_cypher_with_mode(          │
-│  cypher_mapper.py:176    │  │    graph, MergeMode.CONFLICT,             │
-│                          │  │    source=, chunk_index=)                 │
-│  Flat list of MERGEs:    │  │  cypher_mapper.py:292                     │
-│  ┌─────────────────────┐ │  │                                          │
-│  │ Pass 1: nodes       │ │  │  Returns (rel_statements, node_entries): │
-│  │ MERGE (n:Label      │ │  │                                          │
-│  │   {name: $name})    │ │  │  ┌─────────────────────────────────────┐ │
-│  │ SET n.k = $p_k, ... │ │  │  │ Pass 1 — per entity (fetch + write) │ │
-│  └─────────────────────┘ │  │  │                                     │ │
-│  ┌─────────────────────┐ │  │  │ 4a. FETCH existing node             │ │
-│  │ Pass 2: rels        │ │  │  │   model_to_cypher_fetch()           │ │
-│  │ MATCH (a:Label      │ │  │  │   cypher_mapper.py:211              │ │
-│  │   {name:$src})      │ │  │  │   ┌─────────────────────────────┐   │ │
-│  │ MERGE (b:Tgt        │ │  │  │   │ MATCH (n:Resource            │   │ │
-│  │   {name:$tgt})      │ │  │  │   │   {name: $name}) RETURN n   │   │ │
-│  │ MERGE (a)-[r:TYPE]  │ │  │  │   └─────────────────────────────┘   │ │
-│  │   ->(b)             │ │  │  │   _fetch_node_props() returns       │ │
-│  └─────────────────────┘ │  │  │   dict of existing props, or {}     │ │
-│                          │  │  │   if node doesn't exist yet         │ │
-│  All SETs overwrite      │  │  │                                     │ │
-│  unconditionally.        │  │  │ 4b. COMPARE + BUILD WRITE           │ │
-│  No conflicts detected.  │  │  │   build_conflict_merge(             │ │
-│  Returns (count, []).    │  │  │     entity, label, existing_props,  │ │
-│                          │  │  │     source=, chunk_index=)          │ │
-│                          │  │  │   cypher_mapper.py:222              │ │
-│                          │  │  │                                     │ │
-│                          │  │  │   For each scalar field (non-None,  │ │
-│                          │  │  │   non-reference):                   │ │
-│                          │  │  │   ┌───────────────────────────────┐ │ │
-│                          │  │  │   │ existing is None?             │ │ │
-│                          │  │  │   │   → SET n.k = $p_k  (WRITE)   │ │ │
-│                          │  │  │   │ existing == incoming?         │ │ │
-│                          │  │  │   │   → no-op        (AGREE)      │ │ │
-│                          │  │  │   │ existing != incoming & non-null?│ │
-│                          │  │  │   │   → CONFLICT: keep existing,  │ │
-│                          │  │  │   │     append record to conflicts│ │
-│                          │  │  │   └───────────────────────────────┘ │ │
-│                          │  │  │                                     │ │
-│                          │  │  │  Conflict record shape (JSON string │ │
-│                          │  │  │  stored in n.conflicts list):       │ │
-│                          │  │  │  {                                   │ │
-│                          │  │  │    "id":              "capacity:<iso>", │ │
-│                          │  │  │    "property":         "capacity",  │ │
-│                          │  │  │    "existing_value":    500,       │ │
-│                          │  │  │    "incoming_value":    600,       │ │
-│                          │  │  │    "source":            "DOC3.md", │ │
-│                          │  │  │    "chunk_index":       2,         │ │
-│                          │  │  │    "detected_at":       ISO-8601,  │ │
-│                          │  │  │    "resolved":          false      │ │
-│                          │  │  │  }                                   │ │
-│                          │  │  │                                     │ │
-│                          │  │  │  Generated Cypher (conflict case):  │ │
-│                          │  │  │  ┌───────────────────────────────┐  │ │
-│                          │  │  │  │ MERGE (n:Resource             │  │ │
-│                          │  │  │  │   {name: $name})              │  │ │
-│                          │  │  │  │ SET n.conflicts =             │  │ │
-│                          │  │  │  │   coalesce(n.conflicts, "[]") │  │ │
-│                          │  │  │  │   + [$c_capacity]             │  │ │
-│                          │  │  │  └───────────────────────────────┘  │ │
-│                          │  │  │  (existing capacity is NOT touched) │ │
-│                          │  │  │                                     │ │
-│                          │  │  │ 4c. EXECUTE write                   │ │
-│                          │  │  │   self._graph.query(write_q, ...)   │ │
-│                          │  │  │   collect conflicts into all_conflicts│ │
-│                          │  │  └─────────────────────────────────────┘ │
-│                          │  │                                          │
-│                          │  │  ┌─────────────────────────────────────┐ │
-│                          │  │  │ Pass 2 — relationships (both modes) │ │
-│                          │  │  │ _relationship_merges()              │ │
-│                          │  │  │ cypher_mapper.py:131                │ │
-│                          │  │  │                                     │ │
-│                          │  │  │ For each reference field on entity: │ │
-│                          │  │  │ ┌─────────────────────────────────┐ │ │
-│                          │  │  │ │ MATCH (a:Label {name:$src_name})│ │ │
-│                          │  │  │ │ MERGE (b:TgtLabel               │ │ │
-│                          │  │  │ │   {name:$tgt_name})             │ │ │
-│                          │  │  │ │ MERGE (a)-[r:REL_TYPE]->(b)     │ │ │
-│                          │  │  │ └─────────────────────────────────┘ │ │
-│                          │  │  │                                     │ │
-│                          │  │  │ stop_sequence gets {seq: i} on edge │ │
-│                          │  │  │ v1: NO conflict detection on edges  │ │
-│                          │  │  └─────────────────────────────────────┘ │
-│                          │  │                                          │
-│                          │  │  Returns (statements_run, all_conflicts)│ │
-│                          │  └──────────────────────────────────────────┘
-└──────────────────────────┘  └──────────────────────────────────────────┘
-                            │
-                            │  Stage 5 — post-write summary
-                            │  scripts/ingest.py:81-86
-                            ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│  CONSOLE OUTPUT                                                         │
-│                                                                         │
-│  [+] Writing to FalkorDB...                                             │
-│      42 Cypher statements executed                                      │
-│      17 node(s) in graph 'factory_planning'                             │
-│      merge mode: conflict                                               │
-│      3 property conflict(s) recorded in the graph                      │
-└───────────────────────────┬─────────────────────────────────────────────┘
-                            │
-                            │  Stage 6 — conflict persistence (graph-only)
-                            ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│  SINGLE CONFLICT STORE: IN-GRAPH n.conflicts                            │
-│                                                                         │
-│  • JSON-string list on each conflicted node                             │
-│  • full provenance per record + stable id + resolved flag               │
-│  • queryable via Cypher (cypher_query tool):                            │
-│    MATCH (n) WHERE n.conflicts IS NOT NULL                              │
-│    RETURN n.name, labels(n), n.conflicts                                │
-│  • resolution is cypher-native: read the list, rewrite the target      │
-│    entry's JSON to set "resolved": true and "resolved_at": <iso>,      │
-│    then SET n.conflicts = [$e1, $e2, ...] back in one query             │
-│  • each entry has a stable "id" of the form "<property>:<detected_at>"   │
-└───────────────────────────┬─────────────────────────────────────────────┘
-                            │
-                            │  Stage 7 — surface to human / search
-                            ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│  TWO ACCESS PATHS (both wired via cypher_query)                         │
-│                                                                         │
-│  1. Cypher REPL  — python scripts/ingest.py --search                    │
-│     > MATCH (n) WHERE n.conflicts IS NOT NULL                           │
-│         RETURN n.name, labels(n), n.conflicts                           │
-│                                                                         │
-│  2. Agent — the assistant uses the cypher_query tool to list           │
-│     unresolved conflicts and to mark a specific entry resolved by      │
-│     rewriting its JSON (add "resolved": true, "resolved_at": <iso>)    │
-│     and SETting the full n.conflicts list back.                        │
-└─────────────────────────────────────────────────────────────────────────┘
+./data/  (txt, md, pdf, docx, csv, json, html, py)
+   │
+   │  Stage 1 — discover + read + chunk   (chunking.load_and_chunk)
+   ▼
+CHUNKS  [{ source, chunk_index, text }]   (paragraph-aware, 4000 chars + 200 overlap)
+   │
+   │  Stage 2 — LLM extraction            (llm_extract.extract_from_chunks)
+   ▼
+EXTRACTIONS  [ (FactoryPlanningGraph, source, chunk_index) ]   (temp=0, 3× retry, json_repair fallback)
+   │
+   │  Stage 3 — backend + merge mode      (FalkorDBBackend)
+   ▼
+   │  Stage 4 — write to FalkorDB         (backend.write_extraction)
+   ▼
+┌──────────── OVERWRITE ────────────┐   ┌──────────────── CONFLICT ────────────────┐
+│ Pass 1: MERGE nodes, SET props     │   │ 4a. FETCH existing node props            │
+│ Pass 2: MERGE relationships        │   │ 4b. per field: None→SET, equal→no-op,     │
+│ All SETs overwrite unconditionally │   │     differ→keep existing, append conflict │
+│                                   │   │ 4c. EXECUTE write; collect conflicts      │
+│                                   │   │ Pass 2: MERGE relationships (same)        │
+└───────────────────────────────────┘   └──────────────────────────────────────────┘
+   │
+   │  Stage 5 — console summary
+   ▼
+   │  Stage 6 — conflicts stored IN-GRAPH (n.conflicts JSON list, queryable via Cypher)
+   ▼
+   │  Stage 7 — surface via Cypher REPL or the agent's cypher_query tool
 ```
 
----
+### Document preprocessing (docprep)
 
-## Entity & relationship catalog
-
-The `FactoryPlanningGraph` schema (`src/knowledge/graph_models/factory_graph_model.py`) defines 15 entity types. Cross-reference fields become relationships via `_REFERENCE_FIELDS` (`cypher_mapper.py:33-51`):
-
-| Source label | Reference field | Relationship type | Target label |
-|---|---|---|---|
-| Resource | `shift_model` | `HAS_SHIFT_MODEL` | ShiftModel |
-| Resource | `assigned_products` | `PROCESSES` | Product |
-| Resource | `zone` | `CONTAINED_IN` | Zone |
-| TransportSegment | `from_node` | `FROM` | Resource |
-| TransportSegment | `to_node` | `TO` | Resource |
-| TransportRoute | `stop_sequence` | `STOPS_AT` | Resource |
-| TransportRoute | `waiting_positions` | `HAS_WAITING_POSITION` | Resource |
-| TransportRoute | `served_demand_points` | `SERVES` | Resource |
-| TrafficRule | `affected_segments` | `AFFECTS_SEGMENT` | TransportSegment |
-| Product | `bom_children` | `HAS_CHILD` | Product |
-| OrderLogic | `associated_product` | `FOR_PRODUCT` | Product |
-| OrderLogic | `associated_resource` | `TARGETS` | Resource |
-| ShiftModel | `applicable_zones` | `APPLIES_TO_ZONE` | Zone |
-| WorkerPool | `assigned_resources` | `OPERATES` | Resource |
-| ControlStrategy | `affected_resources` | `GOVERNS` | Resource |
-| ControlStrategy | `affected_products` | `AFFECTS` | Product |
-| Zone | `parent_zone` | `PART_OF` | Zone |
-| Zone | `member_resources` | `CONTAINS` | Resource |
-| KPI | `scope` | `SCOPED_TO` | Resource |
-
-Reference fields are **never** stored as scalar node properties and **never** produce property conflicts — they are only translated to relationship MERGEs.
-
----
-
-## Conflict record schema
-
-Every conflict (both in-graph and JSONL) is a JSON object with these fields:
-
-```json
-{
-  "property":        "capacity",
-  "existing_value":  500,
-  "incoming_value":  600,
-  "source":          "DOC3_Maschinenparameter_Tabelle.md",
-  "chunk_index":     2,
-  "detected_at":     "2026-07-08T14:22:01Z"
-}
-```
-
-| Field | Type | Description |
-|---|---|---|
-| `property` | str | The scalar field name that conflicted |
-| `existing_value` | any | The value already stored on the node (preserved) |
-| `incoming_value` | any | The value the new extraction tried to write (rejected) |
-| `source` | str \| null | Originating document filename |
-| `chunk_index` | int \| null | Positional chunk index within `source` |
-| `detected_at` | str | ISO-8601 UTC timestamp of detection |
-
----
-
-## Module map
-
-| Module | Responsibility |
-|---|---|
-| `scripts/ingest.py` | CLI entry point, pipeline orchestration, search REPL launch |
-| `src/knowledge/chunking.py` | Document discovery, reading, paragraph-aware chunking |
-| `src/knowledge/llm_extract.py` | LLM-based structured extraction, provenance attachment |
-| `src/knowledge/graph_models/factory_graph_model.py` | Pydantic entity + root extraction schema |
-| `src/knowledge/cypher_mapper.py` | Pydantic → Cypher MERGE generation, `MergeMode`, conflict detection, reconciliation link Cypher |
-| `src/knowledge/reconciliation.py` | Similarity-based reconciliation engine: embedding, cosine search, LLM pairwise confidence, description coalescing |
-| `src/knowledge/falkordb_backend.py` | FalkorDB connection, write, conflict + reconciliation logging, search helpers |
-| `src/knowledge/search.py` | Graph / fulltext / vector search REPL |
-| `src/falkordb_harness/chainlit_app.py` | Chainlit frontend: chat UI, settings widgets, ingestion progress, tool-step rendering |
-| `src/falkordb_harness/auth.py` | Password authentication + self-service `/register` route (bcrypt-hashed users in the SQLite data layer DB) |
-| `src/falkordb_harness/data_layer.py` | Chainlit data layer (SQLite + local element storage) for per-user chat persistence |
-
----
-
-## Configuration reference
-
-| CLI flag | Env var | Default | Description |
-|---|---|---|---|
-| `--data-dir` | `DATA_DIR` | `./data` | Source document root (originals + preprocessed live under it) |
-| — | `ORIGINALS_DIR` | `./data/originals` | Raw uploaded/source files (PDF/DOCX/images); Chainlit uploads land here, and `file_metadata`/`read_excerpt`/`ls` inspect this tree |
-| — | `PREPROCESSED_DIR` | `./data/preprocessed` | docprep Markdown output; `chunk_documents`/`extract_and_write` read here by default |
-| `--graph-name` | `FALKORDB_GRAPH` | `factory_planning` | FalkorDB graph name |
-| `--chunk-size` | — | `4000` | Chunk size in characters |
-| `--concurrency` | — | `4` | Max parallel LLM calls |
-| `--llm-model` | `LLM_MODEL` | `qwen3.5:122b-a10b` | bare Ollama model tag |
-| `--api-base` | `OLLAMA_API_BASE` | — | LLM provider base URL |
-| `--merge-mode` | `MERGE_MODE` | `overwrite` | `overwrite` or `conflict` |
-| `--recon` / `--no-recon` | `RECON_ENABLE` | `false` | Enable similarity reconciliation for plain-name Resources |
-| `--recon-posthoc` | — | — | Post-hoc reconciliation pass over existing plain-name nodes |
-| `--recon-cosine-cutoff` | `RECON_COSINE_CUTOFF` | `0.70` | Minimum cosine similarity for candidates |
-| `--recon-confidence-threshold` | `RECON_CONFIDENCE_THRESHOLD` | `0.90` | Minimum LLM confidence to link a duplicate |
-| `--recon-top-k` | `RECON_TOP_K` | `10` | Top-k cosine candidates before LLM pairwise |
-| `--reconciliations-log` | `RECONCILIATIONS_LOG` | `./data/reconciliations.jsonl` | JSONL reconciliation log path |
-| `--search` | — | — | Launch search REPL |
-| `--fulltext` | — | — | Fulltext search mode (requires `--search`) |
-| `--vector` | — | — | Vector search mode (requires `--search`) |
-| `--reset` | — | — | Delete all graph data (preserves JSONL logs) |
-| — | `CHAINLIT_AUTH_SECRET` | — | JWT signing secret for login cookies (required when password auth is enabled). Generate with `chainlit create-secret` |
-| — | `DATABASE_URL` | `sqlite+aiosqlite:///./data/chainlit.db` | SQLAlchemy async URL for the Chainlit data layer (users, threads, steps, elements, feedback) |
-| — | `ELEMENTS_DIR` | `./data/elements` | Where uploaded-file blobs attached to persisted threads are stored |
-| — | `REGISTER_ENABLED` | `1` | Set to `0` to disable the self-service `/register` route (admin-only account creation) |
-
----
-
-## Document preprocessing (docprep)
-
-The agent harness wraps the [`docprep`](src/document-to-markdown) submodule
-(git submodule) as a `preprocess_document` tool. It converts raw source
-documents — scanned PDFs, images, Excel charts, office formats — into
-Markdown via Docling + EasyOCR + an optional VLM fallback, writing the result
-into `PREPROCESSED_DIR` so the ingest tools pick it up.
-
-### Directory model
+Raw sources (scanned PDFs, images, office formats) are converted to Markdown before ingestion, so the LLM only ever sees LLM-ready text.
 
 ```
 DATA_DIR/
-├── originals/      ← ORIGINALS_DIR: raw uploads/sources (PDF/DOCX/images)
-│                      Chainlit uploads land here; file_metadata/read_excerpt/ls inspect this tree.
-└── preprocessed/   ← PREPROCESSED_DIR: docprep Markdown output.
-                       chunk_documents / extract_and_write read here by default.
-```
+├── originals/      ← raw uploads/sources (PDF/DOCX/images); Chainlit uploads land here
+└── preprocessed/  ← docprep Markdown output; ingestion reads here by default
 
-Keeping originals and preprocessed Markdown in separate directories prevents
-the ingest tools from double-counting a document by reading both the original
-and its Markdown twin.
-
-### Flow
-
-```
 ORIGINALS_DIR/scan.pdf
-        │  preprocess_document(path="scan.pdf")
-        │  docprep.convert() -> Docling + EasyOCR (+ VLM fallback if quality gate fails)
-        ▼
+   │  preprocess_document()  →  docprep (Docling + EasyOCR + optional VLM fallback)
+   ▼
 PREPROCESSED_DIR/scan.md
-        │  chunk_documents() / extract_and_write()  (default data_dir = PREPROCESSED_DIR)
-        ▼
+   │  chunk_documents() / extract_and_write()
+   ▼
 FalkorDB graph
 ```
 
-### When to preprocess
+Preprocess scanned/image PDFs and office files with embedded figures. Don't preprocess plain `.txt`/`.md`/`.csv`/`.json`/`.html` — copy them into `PREPROCESSED_DIR` directly.
 
-- **Do** preprocess: scanned PDFs, image-only PDFs, images (PNG/JPEG/TIFF),
-  Excel files with charts, DOCX/PPTX with embedded figures.
-- **Don't** preprocess: plain `.txt` / `.md` / `.csv` / `.json` / `.html`
-  sources — they are already LLM-ready and preprocessing wastes a VLM call.
-  Copy them into `PREPROCESSED_DIR` directly (or point `extract_and_write`
-  at `ORIGINALS_DIR` for that run).
+### Similarity-based reconciliation
 
-### Configuration
-
-docprep reads config in this precedence order (highest first):
-1. `preprocess_document(yaml_path=...)` arg
-2. `./docprep.yaml` if present
-3. `DOCPREP_*` env vars: `DOCPREP_FALLBACK_PROVIDER`, `DOCPREP_FALLBACK_MODEL`,
-   `DOCPREP_FALLBACK_BASE_URL`
-4. `PipelineConfig` defaults
-
-The `[ollama]` extra (the only one the harness pulls in) reuses
-`OLLAMA_API_BASE` / `OLLAMA_API_KEY` for the VLM fallback endpoint. To use a
-different provider (Mistral/OpenAI/Gemini/Anthropic), install the matching
-`docprep[...]` extra and set its `_API_KEY` env var.
-
-> **System dependency:** `python-magic` requires `libmagic` — install
-> `libmagic1` (Debian/Ubuntu) or `libmagic` (macOS) if you see
-> `ImportError: failed to find libmagic`.
-
-See `docprep.example.yaml` for the full config schema and
-`src/document-to-markdown/README.md` for the pipeline routing details.
-
----
-
-## Similarity-based reconciliation
-
-Plain-name resource nodes (e.g. "Machine", "Buffer") that lack a distinguishing index can slip past the exact-name deduplication and create silent duplicates. The reconciliation step catches these by testing each new plain-name Resource against all indexed Resource nodes (`name_has_index=true`) using a two-stage pipeline:
-
-### Prerequisites
-
-1. **`description` (required)** — Every Resource carries a semantically rich description. On name-match merge, the description is **coalesced** via an LLM call (old + new → merged) and the node is **re-embedded** so cosine search stays accurate as descriptions evolve. This happens in both merge modes.
-2. **`name_has_index (required, bool)** — `true` when the name includes a clear index/ID (e.g. `AKL-01`, `Workstation-3A`), `false` for plain names. Only indexed nodes serve as similarity candidates.
-
-### Reconciliation pipeline (per new plain-name Resource with no name match)
+Plain-name Resources without a distinguishing index can create silent duplicates. The reconciliation step tests each new plain-name Resource against indexed Resources (`name_has_index=true`) in three stages:
 
 ```
-                         ┌──────────────────────────────────────┐
-    new Resource         │  Stage 1 — EMBED                     │
-    (name_has_index=false)│  embed_description(description)     │
-                         └──────────────────┬───────────────────┘
-                                              │
-                         ┌──────────────────▼───────────────────┐
-                         │  Stage 2 — COSINE SEARCH              │
-                         │  vector_search(top_k, label=Resource) │
-                         │  filter: name_has_index=true           │
-                         │  filter: cosine >= 0.70 (cutoff)      │
-                         │  filter: name != self                  │
-                         └──────────────────┬───────────────────┘
-                                              │
-                    ┌─────────────────────────┴──────────────────┐
-                    │ no candidates?      candidates?             │
-                    ▼                         ▼                   │
-            INSERT UNIQUE         ┌────────────────────────────┐  │
-            (no link, no log)      │  Stage 3 — LLM PAIRWISE    │  │
-                                  │  for each candidate:        │  │
-                                  │    llm_pairwise_confidence(  │  │
-                                  │      new, candidate)        │  │
-                                  │  resource_type as strong     │  │
-                                  │  tie-breaker signal          │  │
-                                  └────────────┬───────────────┘  │
-                                               │                  │
-                                  ┌────────────▼───────────────┐  │
-                                  │  pick highest confidence   │  │
-                                  └────────────┬───────────────┘  │
-                                   ┌───────────┴────────────┐     │
-                                   │ conf < 0.90?  conf >= 0.90?│
-                                   ▼              ▼           │     │
-                           INSERT UNIQUE   INSERT DISTINCT NODE│
-                           (no link)       + POSSIBLE_DUPLICATE_OF│
-                                           edge (plain→indexed)   │
-                                           + alias on indexed node │
-                                           + canonical_name on plain│
-                                           + reconciliations.jsonl │
+new Resource (name_has_index=false)
+   │  Stage 1 — EMBED description
+   ▼
+   │  Stage 2 — COSINE SEARCH  (label=Resource, name_has_index=true, cosine ≥ 0.70)
+   ▼
+   │  no candidates?  →  INSERT UNIQUE (no link)
+   │  candidates?     →  Stage 3 — LLM PAIRWISE confidence per candidate
+   ▼
+   │  best confidence < 0.90?  →  INSERT UNIQUE (no link)
+   │  best confidence ≥ 0.90? →  INSERT plain node
+   │                            + POSSIBLE_DUPLICATE_OF edge (plain → indexed)
+   │                            + aliases on indexed, canonical_name on plain
+   ▼
+   reconciliations.jsonl  (append-only audit log)
 ```
 
-### Post-hoc reconciliation (`--recon-posthoc`)
-
-Plain-name nodes ingested *before* their indexed counterpart arrived can be reconciled later:
+Post-hoc pass for nodes ingested before their indexed counterpart:
 
 ```bash
 python scripts/ingest.py --recon-posthoc
 ```
-
-Scans all `Resource` nodes with `name_has_index=false` that do not yet have an outgoing `POSSIBLE_DUPLICATE_OF`, embeds each, and runs the same pipeline. Can be run repeatedly as the graph grows.
-
-### Reconciliation record schema
-
-Every reconciliation (in-graph edge + JSONL) carries:
-
-```json
-{
-  "new_name":          "Machine",
-  "matched_name":      "AKL-01",
-  "matched_label":     "Resource",
-  "cosine_similarity": 0.8523,
-  "llm_confidence":    0.9300,
-  "source":            "DOC3_Maschinenparameter_Tabelle.md",
-  "chunk_index":       2,
-  "detected_at":       "2026-07-10T14:22:01Z"
-}
-```
-
-### In-graph artifacts
-
-| Artifact | Location | Description |
-|---|---|---|
-| `POSSIBLE_DUPLICATE_OF` edge | `(plain)-[:POSSIBLE_DUPLICATE_OF]->(indexed)` | Carries `cosine_similarity`, `llm_confidence`, `detected_at`, `source`, `chunk_index` as edge properties |
-| `aliases` list | on the indexed node | JSON-encoded list of plain names linked to this indexed node |
-| `canonical_name` | on the plain node | The indexed node's name, for lookups from the plain side |
-
-### Backend helpers
-
-```python
-backend.get_reconciliations(label="Resource")   # list POSSIBLE_DUPLICATE_OF edges
-backend.clear_reconciliations(plain_name="...")  # delete edge + remove alias/canonical
-backend.reconcile_posthoc()                      # run post-hoc pass (async)
-```
-
----
-
-## v1 scope boundaries
-
-- **Reconciliation applies to Resources only** — other entity types are not reconciled.
-- **No auto-merge of duplicates** — the plain node is kept as a distinct node with a `POSSIBLE_DUPLICATE_OF` link; humans adjudicate via `clear_reconciliations`.
-- **Relationship property conflicts** — edges use find-or-create `MERGE` in both modes; no conflict detection on edge properties (e.g. `seq` on `STOPS_AT`).
-- **Auto-resolution** — no heuristic picks a winner for property conflicts; the assistant marks a conflict entry resolved via `cypher_query` (rewrites its JSON to set `resolved: true` + `resolved_at`).
-- **Conflict log rotation** — conflicts live only in the graph's `n.conflicts` list property; there is no on-disk conflict log. Resolved entries are retained for history within the list.
-
----
-
-## Authentication & chat persistence
-
-The Chainlit app supports **user accounts** and **per-user chat history** out of the box, backed by a SQLite database (the same file the data layer uses for threads/steps/elements). No external auth provider or object store is required.
-
-### How it works
-
-- **Login is required.** Registering a `@cl.password_auth_callback` flips Chainlit's `require_login()` to true, so every visitor hits the built-in login page first.
-- **Self-service registration** is exposed at the `/register` route (a small server-rendered HTML form). On success the user is redirected to the login page. Registration can be disabled with `REGISTER_ENABLED=0` (admin-only account creation).
-- **Passwords** are hashed with bcrypt and stored in the `passwordHash` column of the `users` table.
-- **Chat history** is persisted by Chainlit's `SQLAlchemyDataLayer`: every thread, message (step), element (uploaded file), and feedback entry is written to the SQLite DB at `DATABASE_URL`. Logged-in users see their past threads in the sidebar and can resume any of them.
-- **Uploaded files** in persisted threads are written to `ELEMENTS_DIR` (default `./data/elements`) by a `LocalStorageClient` and served back via a `/public/elements/...` static mount — no S3/Azure/GCS needed.
-
-### Setup
-
-1. Generate a JWT secret and put it in `.env`:
-
-   ```bash
-   chainlit create-secret
-   # copy the printed value into CHAINLIT_AUTH_SECRET
-   ```
-
-2. Start the app as usual (`docker compose up` or `chainlit run src/falkordb_harness/chainlit_app.py`). On first startup the five Chainlit tables (`users`, `threads`, `steps`, `elements`, `feedbacks`) are created automatically in the SQLite file.
-
-3. Visit `http://localhost:8000/register` to create your first account, then log in at `/login`.
-
-### Switching to Postgres
-
-For multi-host or high-concurrency deployments, set `DATABASE_URL` to a Postgres async URL (e.g. `postgresql+asyncpg://user:pw@host/db`) and add a `postgres` service to `docker-compose.yml`. The schema bootstrap DDL in `data_layer.init_db` uses `CREATE TABLE IF NOT EXISTS` statements that are portable across SQLite and Postgres. Element blobs can be moved to S3 by swapping `LocalStorageClient` for `chainlit.data.storage_clients.s3.S3StorageClient`.
 
 ---
 
@@ -609,4 +177,5 @@ For multi-host or high-concurrency deployments, set `DATABASE_URL` to a Postgres
 pytest -q
 ```
 
-295 tests covering chunking, Cypher mapping (both modes), conflict detection, conflict logging, reconciliation decisions, reconciliation logging, backend query helpers, CLI flag plumbing, password auth + registration, and the SQLite data layer + local element storage.
+295 tests covering chunking, Cypher mapping (both modes), conflict detection/logging, reconciliation decisions/logging, backend query helpers, CLI flag plumbing, password auth + registration, and the SQLite data layer + local element storage.
+

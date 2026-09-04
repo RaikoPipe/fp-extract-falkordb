@@ -143,7 +143,6 @@ def parse_duration(value: str) -> ParseResult:
     if not raw:
         return ParseResult(canonical="", is_ambiguous=True, kind="ambiguous")
 
-    # constant
     m = _CONSTANT_RE.match(raw)
     if m:
         secs = float(m.group(1))
@@ -154,7 +153,6 @@ def parse_duration(value: str) -> ParseResult:
             constant_seconds=secs,
         )
 
-    # distribution
     m = _DISTRIBUTION_RE.match(raw)
     if m:
         name = m.group("name")

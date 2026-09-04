@@ -1,54 +1,38 @@
 [project]
-name = "fp-extract-falkordb"
-version = "0.1.0"
+name = "factory-kg-agent"
+version = "2026.9.1"
 description = "Factory-planning knowledge graph extraction pipeline using FalkorDB, with a LangChain deep-agent harness"
 requires-python = ">=3.10"
 dependencies = [
     "falkordb>=1.0.0",
     "openai>=2.0.0",
-    "pydantic>=2.0.0",
+    # Bumped from >=2.0.0 → langgraph >= 1.2 requires pydantic >= 2.7.4
+    "pydantic>=2.7.4",
     "python-dotenv>=1.0.0",
     "unstructured[all-docs]",
     "json-repair",
     "pyyaml>=6.0",
     "typing-extensions>=4.0.0",
     "loguru>=0.7.0",
-    # LangChain deep-agent harness
-    "langchain>=0.3.0",
-    "langchain-core>=0.3.0",
-    "langchain-anthropic>=0.3.0",
-    "langchain-openai>=1.4.0",
-    "langgraph>=0.2.0",
-    "deepagents>=0.5.0",
-    # Document preprocessing pipeline (git submodule). The [ollama] extra
-    # pulls the OpenAI client used for Ollama's OpenAI-compatible VLM fallback
-    # endpoint, reusing OLLAMA_API_BASE / OLLAMA_API_KEY already configured in
-    # .env. Other providers (mistral/openai/gemini/anthropic) are optional —
-    # install docprep[...] separately if you want them.
+    "langchain>=1.3.0,<2",
+    "langchain-core>=1.4.7,<2",
+    "langchain-anthropic>=1.0.0,<2",
+    "langchain-openai>=1.4.0,<2",
+    "langgraph>=1.2.0,<2",
+    "deepagents>=0.7.0,<1",
     "docprep[ollama] @ file:src/document-to-markdown",
 ]
 
 [project.optional-dependencies]
 chainlit = [
-    "chainlit>=1.1.0",
+    "chainlit>=2.0.0,<3",
     "anyio>=4.14.2",
-    "starlette>=0.45.0",
-    # Visual data-display elements. Both degrade gracefully — the
-    # chainlit_elements helpers return None when a lib is missing, so the
-    # app still runs (with Markdown fallback) without them.
+    "starlette>=0.47.2",
     "pandas>=2.0.0",
     "plotly>=5.20.0",
-    # User management & chat persistence (SQLite-backed data layer +
-    # password auth). sqlalchemy is used directly by the harness's auth
-    # and document_registry modules; the async SQLite driver and the
-    # password-hashing lib are not pulled in by chainlit alone.
     "sqlalchemy>=2.0.0",
     "aiosqlite>=0.19.0",
     "bcrypt>=4.0.0",
-    # Public-deployment auth: async SMTP for email verification / password
-    # reset / approval notifications; RFC-compliant email validation;
-    # per-IP/username rate limiting on auth endpoints; signed CSRF tokens
-    # for the server-rendered registration/reset/admin forms.
     "aiosmtplib>=3.0.0",
     "email-validator>=2.0.0",
     "slowapi>=0.1.9",
@@ -58,6 +42,9 @@ dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "reportlab>=4.0.0",
+]
+runner = [
+    "docker>=7.0.0",
 ]
 
 [project.scripts]
@@ -71,7 +58,4 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.pytest.ini_options]
-# Scope collection to this repo's own tests. The docprep submodule ships its
-# own tests (with integration/api markers and extra deps); let it run via
-# `pytest` inside src/document-to-markdown instead of polluting this suite.
 testpaths = ["tests"]

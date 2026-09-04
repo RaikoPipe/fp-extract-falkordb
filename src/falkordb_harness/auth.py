@@ -57,6 +57,7 @@ import re
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import bcrypt
 from chainlit import User
@@ -862,6 +863,20 @@ def _page_shell(title: str, body: str, error: str | None = None) -> str:
     .b-admin {{ background: #2a143a; color: #cc9aff; }}
     form.inline {{ display: inline; }}
     form.inline button {{ width: auto; margin: 0 .15rem; padding: .3rem .6rem; font-size: .8rem; }}
+    /* Welcome / acknowledgement warning (rendered above the registration form). */
+    .welcome {{ background: #1f1a14; border: 1px solid #5a4222; border-radius: 10px;
+            padding: 1rem 1.1rem; margin: 0 0 1.25rem; }}
+    .welcome h2 {{ color: #ffcc7a; margin: 0 0 .5rem; font-size: 1rem; }}
+    .welcome p {{ color: #c8c8d0; font-size: .85rem; line-height: 1.45; margin: 0 0 .5rem; }}
+    .welcome ol {{ margin: .5rem 0; padding-left: 1.25rem; }}
+    .welcome li {{ color: #c8c8d0; font-size: .85rem; line-height: 1.4; margin-bottom: .5rem; }}
+    .welcome li .rt {{ color: #e8e8ea; font-weight: 600; display: block; }}
+    .welcome .closing {{ color: #ffcc7a; font-weight: 600; font-size: .85rem;
+            border-top: 1px solid #3a2a14; padding-top: .5rem; margin-top: .5rem; }}
+    .ack {{ display: flex; gap: .5rem; align-items: flex-start; margin: .5rem 0 0;
+            font-size: .9rem; }}
+    .ack input[type=checkbox] {{ width: auto; margin-top: .25rem; }}
+    .ack label {{ margin: 0; color: #e8e8ea; font-size: .9rem; font-weight: 600; }}
   </style>
 </head>
 <body>
@@ -873,13 +888,69 @@ def _page_shell(title: str, body: str, error: str | None = None) -> str:
 </html>"""
 
 
-def _register_html(error: str | None = None, csrf_token: str | None = None) -> str:
+def _welcome_block_html(lang: str) -> str:
+    """Render the test-build warning (intro + risks + closing) as HTML.
+
+    Mirrors the former ``WelcomeModal.jsx`` content, sourced from the
+    ``welcome.*`` i18n keys so the text stays single-sourced. The lang is
+    resolved from the request's ``Accept-Language`` (no Chainlit session
+    exists on the registration page yet).
+    """
+    from falkordb_harness.i18n import STRINGS as _STRINGS
+    from falkordb_harness.i18n import lang_from_accept_language
+
+    lng = lang_from_accept_language(lang) if lang else "de"
+
+    def _t(key: str) -> str:
+        entry = _STRINGS.get(key)
+        if entry is None:
+            return ""
+        return entry.get(lng, entry.get("de", ""))
+
+    risks = [
+        ("welcome.risk.cloud.title", "welcome.risk.cloud.body"),
+        ("welcome.risk.compliance.title", "welcome.risk.compliance.body"),
+        ("welcome.risk.retention.title", "welcome.risk.retention.body"),
+        ("welcome.risk.no_audit.title", "welcome.risk.no_audit.body"),
+        ("welcome.risk.not_hardened.title", "welcome.risk.not_hardened.body"),
+    ]
+    items = "".join(
+        f'<li><span class="rt">{html.escape(_t(t), quote=True)}</span>'
+        f'{html.escape(_t(b), quote=True)}</li>'
+        for t, b in risks
+    )
+    return f"""<div class="welcome">
+      <h2>{html.escape(_t("welcome.title"), quote=True)}</h2>
+      <p>{html.escape(_t("welcome.intro"), quote=True)}</p>
+      <ol>{items}</ol>
+      <div class="closing">{html.escape(_t("welcome.closing"), quote=True)}</div>
+    </div>"""
+
+
+def _register_html(error: str | None = None, csrf_token: str | None = None,
+                   accept_language: str | None = None,
+                   ack_checked: bool = False) -> str:
     """Return the HTML for the self-service registration page."""
+    from falkordb_harness.i18n import STRINGS as _STRINGS
+    from falkordb_harness.i18n import lang_from_accept_language
+
+    lng = lang_from_accept_language(accept_language) if accept_language else "de"
+
+    def _t(key: str) -> str:
+        entry = _STRINGS.get(key)
+        if entry is None:
+            return ""
+        return entry.get(lng, entry.get("de", ""))
+
+    welcome = _welcome_block_html(accept_language or "")
+    ack_label = html.escape(_t("welcome.ack.label"), quote=True)
+    ack_checked_attr = "checked" if ack_checked else ""
     body = f"""
     <h1>Create your account</h1>
     <p class="sub">Register to use the FalkorDB knowledge-graph agent. You'll
     receive an email to verify your address, then an administrator will approve
     your account.</p>
+    {welcome}
     <form method="post" action="/register">
       <input type="hidden" name="csrf_token" value="{html.escape(csrf_token or '', quote=True)}" />
       <label for="username">Username</label>
@@ -893,6 +964,10 @@ def _register_html(error: str | None = None, csrf_token: str | None = None) -> s
       <label for="password">Password (min {MIN_PASSWORD_LEN} chars, incl. a letter and a digit)</label>
       <input id="password" name="password" type="password" required
              minlength="{MIN_PASSWORD_LEN}" autocomplete="new-password" />
+      <div class="ack">
+        <input id="acknowledge" name="acknowledge" type="checkbox" required {ack_checked_attr} />
+        <label for="acknowledge">{ack_label}</label>
+      </div>
       <button type="submit">Register</button>
     </form>
     <a class="link" href="/login">Already have an account? Log in</a>
@@ -1061,6 +1136,7 @@ def _registration_enabled() -> bool:
 
 # --- Route registration ----------------------------------------------------
 
+
 def register_routes() -> None:
     """Add the auth routes to Chainlit's FastAPI app.
 
@@ -1071,7 +1147,7 @@ def register_routes() -> None:
     - ``/forgot-password`` (GET/POST) — request a password-reset email
     - ``/reset-password`` (GET/POST) — set a new password from a reset token
     - ``/admin/users`` (GET) + ``/admin/users/<id>/<action>`` (POST) — admin UI
-    - ``/public/elements`` static mount for persisted uploaded-file blobs
+    - ``/public/files`` static mount for persisted uploaded-file blobs
 
     Route ordering: Chainlit registers a catch-all
     ``/{full_path:path}`` for its SPA shell. We insert our routes at the
@@ -1079,7 +1155,7 @@ def register_routes() -> None:
     """
     from chainlit.server import app, router
     from fastapi import Request
-    from fastapi.responses import HTMLResponse, RedirectResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
     # Rate limiter (slowapi) — per-IP limits on auth form submissions.
     from slowapi import Limiter
@@ -1097,13 +1173,19 @@ def register_routes() -> None:
     limiter = Limiter(key_func=get_remote_address, storage_uri="memory://")
     app.state.limiter = limiter
 
-    # Mount the elements directory so LocalStorageClient's /public/elements/...
-    # URLs serve the actual files.
+    # Mount the elements directory so LocalStorageClient's /public/files/...
+    # URLs serve the actual files. NOTE: the mount path must NOT be
+    # ``/public/elements`` — Chainlit's ``serve_public_file`` route
+    # (``/public/{filename:path}``) serves custom-element JSX source from
+    # ``/public/elements/<Name>.jsx``. A StaticFiles mount at
+    # ``/public/elements`` shadows that route and makes the custom
+    # elements (DocumentManager) silently 404 on the
+    # frontend.
     elements_root = _elements_dir()
     app.mount(
-        "/public/elements",
+        "/public/files",
         StaticFiles(directory=str(elements_root)),
-        name="elements",
+        name="files",
     )
 
     def _csrf_from_form(form) -> str | None:
@@ -1143,7 +1225,9 @@ def register_routes() -> None:
     async def register_page(request: Request) -> HTMLResponse:
         if not _registration_enabled():
             return _html(_register_disabled_html())
-        return _html(_register_html(csrf_token=issue_csrf_token()))
+        accept_language = request.headers.get("accept-language", "")
+        return _html(_register_html(csrf_token=issue_csrf_token(),
+                                    accept_language=accept_language))
 
     @limiter.limit("5/minute")
     async def register_submit(request: Request) -> HTMLResponse | RedirectResponse:
@@ -1151,7 +1235,26 @@ def register_routes() -> None:
             return _html(_register_disabled_html())
         form = await request.form()
         if not verify_csrf_token(_csrf_from_form(form)):
-            return _html(_register_html(error="Invalid form submission."), status_code=403)
+            return _html(_register_html(error="Invalid form submission.",
+                                         csrf_token=issue_csrf_token(),
+                                         accept_language=request.headers.get("accept-language", "")),
+                         status_code=403)
+        # Require the test-build acknowledgement checkbox to be ticked.
+        # The warning text is rendered above the form (see _register_html);
+        # the checkbox carries the ``required`` HTML attribute too, but a
+        # server-side check is enforced so the requirement cannot be bypassed
+        # by a client that strips the attribute.
+        acknowledge = form.get("acknowledge", "")
+        if not acknowledge:
+            from falkordb_harness.i18n import STRINGS as _STRINGS
+            from falkordb_harness.i18n import lang_from_accept_language
+
+            lng = lang_from_accept_language(request.headers.get("accept-language", ""))
+            ack_missing = _STRINGS.get("welcome.ack.missing", {}).get(lng, "")
+            return _html(_register_html(error=ack_missing,
+                                         csrf_token=issue_csrf_token(),
+                                         accept_language=request.headers.get("accept-language", "")),
+                         status_code=400)
         username = str(form.get("username", "")).strip()
         password = str(form.get("password", ""))
         email = str(form.get("email", "")).strip()
@@ -1160,7 +1263,8 @@ def register_routes() -> None:
         user, error, verify_token = await register_user(username, password, email, display_name)
         if user is None:
             assert error is not None
-            return _html(_register_html(error=error, csrf_token=issue_csrf_token()),
+            return _html(_register_html(error=error, csrf_token=issue_csrf_token(),
+                                        accept_language=request.headers.get("accept-language", "")),
                          status_code=400)
         # Send the verification email (best-effort; failures are logged).
         if verify_token and email:
@@ -1277,9 +1381,191 @@ def register_routes() -> None:
         query = f"?{'ok' if ok else 'error'}=1"
         return RedirectResponse(url=f"/admin/users{query}", status_code=303)
 
+    # --- /api/graph-info ---------------------------------------------------
+    # Read-only JSON endpoint consumed by the custom_js KG badge
+    # (public/kg_badge.js) to display the user's last-used graph + its
+    # description in the header of BOTH the starter view and the chat view
+    # — without sending any Chainlit message (which would dismiss the
+    # starter screen). Authenticated via the Chainlit JWT cookie.
+
+    async def graph_info(request: Request) -> JSONResponse:
+        from chainlit.auth.cookie import get_token_from_cookies
+        from chainlit.auth.jwt import decode_jwt, get_jwt_secret
+
+        secret = get_jwt_secret()
+        if not secret:
+            return JSONResponse({"error": "unavailable"}, status_code=503)
+        token = get_token_from_cookies(request.cookies)
+        if not token:
+            return JSONResponse({"error": "unauthenticated"}, status_code=401)
+        try:
+            user = decode_jwt(token)
+        except Exception:  # noqa: BLE001 — invalid/expired token
+            return JSONResponse({"error": "unauthenticated"}, status_code=401)
+        identifier = getattr(user, "identifier", None)
+        if not identifier:
+            return JSONResponse({"error": "unauthenticated"}, status_code=401)
+        try:
+            from falkordb_harness.graph_descriptions import (
+                get_description_sync,
+                get_last_graph,
+            )
+
+            last = await get_last_graph(identifier)
+        except Exception:  # noqa: BLE001 — DB not ready
+            last = None
+        description = ""
+        if last:
+            try:
+                description = get_description_sync(last)
+            except Exception:  # noqa: BLE001
+                description = ""
+        return JSONResponse(
+            {
+                "last_graph": last or "",
+                "description": description or "",
+            }
+        )
+
+    # --- /api/docs-info -----------------------------------------------------
+    # Read-only JSON endpoint consumed by the custom_js document-sidebar
+    # toggle (public/docs_toggle.js) to decide whether to show the floating
+    # toggle button. Reports whether there is anything to show in the
+    # sidebar: ingested rows for the user's last-used knowledge graph OR
+    # any uploaded/preprocessed rows owned by the user (the latter covers
+    # the upload-but-not-ingested case, since the sidebar is no longer
+    # auto-opened on upload — only an explicit click on the toggle opens
+    # it). The endpoint runs outside any Chainlit session, so it cannot
+    # see the current thread's uploads; the user-scoped count is the proxy.
+    # Authenticated via the Chainlit JWT cookie (same pattern as
+    # /api/graph-info).
+
+    async def docs_info(request: Request) -> JSONResponse:
+        from chainlit.auth.cookie import get_token_from_cookies
+        from chainlit.auth.jwt import decode_jwt, get_jwt_secret
+
+        secret = get_jwt_secret()
+        if not secret:
+            return JSONResponse({"error": "unavailable"}, status_code=503)
+        token = get_token_from_cookies(request.cookies)
+        if not token:
+            return JSONResponse({"error": "unauthenticated"}, status_code=401)
+        try:
+            user = decode_jwt(token)
+        except Exception:  # noqa: BLE001 — invalid/expired token
+            return JSONResponse({"error": "unauthenticated"}, status_code=401)
+        identifier = getattr(user, "identifier", None)
+        if not identifier:
+            return JSONResponse({"error": "unauthenticated"}, status_code=401)
+        try:
+            from falkordb_harness.document_registry import (
+                count_for_user,
+                list_for_graph,
+            )
+            from falkordb_harness.graph_descriptions import get_last_graph
+
+            last = await get_last_graph(identifier)
+        except Exception:  # noqa: BLE001 — DB not ready
+            last = None
+        has_documents = False
+        if last:
+            try:
+                rows = await list_for_graph(last)
+                has_documents = bool(rows)
+            except Exception:  # noqa: BLE001
+                has_documents = False
+        # Also count the user's uploaded/preprocessed rows so the toggle
+        # stays visible before any ingestion has happened (the sidebar is
+        # no longer auto-opened on upload, so this endpoint is the only
+        # signal the toggle button has that there is something to show).
+        if not has_documents:
+            try:
+                has_documents = (await count_for_user(identifier)) > 0
+            except Exception:  # noqa: BLE001
+                has_documents = False
+        return JSONResponse({"has_documents": has_documents})
+
+    # --- /api/debug-allowed --------------------------------------------------
+    # Read-only JSON endpoint consumed by the custom_js debug "Run Showcase"
+    # button (public/debug_button.js) to decide whether to show the floating
+    # button and to serve the showcase prompt. Returns ``{"allowed": bool,
+    # "prompt": str}``. ``allowed`` is true only for admins; ``prompt`` is
+    # the showcase prompt string (empty for non-admins). Authenticated via
+    # the Chainlit JWT cookie (same pattern as /api/graph-info).
+
+    async def debug_allowed(request: Request) -> JSONResponse:
+        from chainlit.auth.cookie import get_token_from_cookies
+        from chainlit.auth.jwt import decode_jwt, get_jwt_secret
+
+        secret = get_jwt_secret()
+        if not secret:
+            return JSONResponse({"allowed": False, "prompt": ""}, status_code=503)
+        token = get_token_from_cookies(request.cookies)
+        if not token:
+            return JSONResponse({"allowed": False, "prompt": ""}, status_code=401)
+        try:
+            user = decode_jwt(token)
+        except Exception:  # noqa: BLE001 — invalid/expired token
+            return JSONResponse({"allowed": False, "prompt": ""}, status_code=401)
+        identifier = getattr(user, "identifier", None)
+        if not identifier:
+            return JSONResponse({"allowed": False, "prompt": ""}, status_code=401)
+        try:
+            role = await get_user_role(identifier)
+        except Exception:  # noqa: BLE001 — DB not ready
+            role = ROLE_USER
+        allowed = role == ROLE_ADMIN
+        prompt = ""
+        if allowed:
+            from falkordb_harness.showcase import SHOWCASE_PROMPT
+
+            prompt = SHOWCASE_PROMPT
+        return JSONResponse({"allowed": allowed, "prompt": prompt})
+
+    # --- /api/chat-flow-allowed --------------------------------------------
+    # Read-only JSON endpoint consumed by the custom_js chat-flow test button
+    # (public/chat_flow_test.js) to decide whether to show the floating
+    # button. Returns ``{"allowed": bool}``. ``allowed`` is true only for
+    # admins. Authenticated via the Chainlit JWT cookie (same pattern as
+    # /api/debug-allowed). The button fills the composer with
+    # ``__chat_flow_test__:showcase_flow`` and auto-sends; the on_message
+    # handler detects the prefix, swaps the real agent for a mock event
+    # stream, and lets the mock events flow through the real
+    # chronological-ordering logic.
+
+    async def chat_flow_allowed(request: Request) -> JSONResponse:
+        from chainlit.auth.cookie import get_token_from_cookies
+        from chainlit.auth.jwt import decode_jwt, get_jwt_secret
+
+        secret = get_jwt_secret()
+        if not secret:
+            return JSONResponse({"allowed": False}, status_code=503)
+        token = get_token_from_cookies(request.cookies)
+        if not token:
+            return JSONResponse({"allowed": False}, status_code=401)
+        try:
+            user = decode_jwt(token)
+        except Exception:  # noqa: BLE001 — invalid/expired token
+            return JSONResponse({"allowed": False}, status_code=401)
+        identifier = getattr(user, "identifier", None)
+        if not identifier:
+            return JSONResponse({"allowed": False}, status_code=401)
+        try:
+            role = await get_user_role(identifier)
+        except Exception:  # noqa: BLE001 — DB not ready
+            role = ROLE_USER
+        allowed = role == ROLE_ADMIN
+        return JSONResponse({"allowed": allowed})
+
     # Build the Starlette Route objects and insert them at the FRONT of
     # Chainlit's router (ahead of the ``/{full_path:path}`` catch-all).
     new_routes = [
+        Route("/api/graph-info", endpoint=graph_info, methods=["GET"], name="graph_info"),
+        Route("/api/docs-info", endpoint=docs_info, methods=["GET"], name="docs_info"),
+        Route("/api/debug-allowed", endpoint=debug_allowed, methods=["GET"],
+              name="debug_allowed"),
+        Route("/api/chat-flow-allowed", endpoint=chat_flow_allowed, methods=["GET"],
+              name="chat_flow_allowed"),
         Route("/register", endpoint=register_page, methods=["GET"], name="register_page"),
         Route("/register", endpoint=register_submit, methods=["POST"], name="register_submit"),
         Route("/verify-email", endpoint=verify_email_page, methods=["GET"], name="verify_email"),

@@ -56,7 +56,16 @@ def test_init_db_creates_all_tables(tmp_layer):
         return [r[0] for r in rows]
 
     tables = _run(fetch_tables())
-    assert set(tables) == {"documents", "elements", "feedbacks", "steps", "threads", "users"}
+    assert set(tables) == {
+        "document_ingestions",
+        "documents",
+        "elements",
+        "feedbacks",
+        "graph_descriptions",
+        "steps",
+        "threads",
+        "users",
+    }
 
 
 def test_init_db_is_idempotent(tmp_layer):
@@ -79,7 +88,7 @@ def test_init_db_is_idempotent(tmp_layer):
         return rows
 
     tables = _run(count_tables())
-    assert len(tables) == 6
+    assert len(tables) == 8  # users, threads, steps, elements, feedbacks, documents, document_ingestions, graph_descriptions
 
 
 def test_init_db_steps_table_has_all_stepdict_columns(tmp_layer):
@@ -235,8 +244,7 @@ def test_create_step_with_list_tags_round_trips(tmp_path, monkeypatch):
     layer = build_data_layer()
     _run(init_db(layer))
 
-    # Stub update_thread (called by create_step) — no context needed and
-    # we don't need a real thread row for the step insert to succeed.
+    # Stub update_thread (called by create_step) — no context/thread needed.
     async def _noop_update_thread(*a, **kw):
         return None
 
@@ -262,14 +270,12 @@ def test_create_step_with_list_tags_round_trips(tmp_path, monkeypatch):
         # Chainlit session context) by calling the unwrapped function.
         create_step = type(layer).create_step.__wrapped__  # type: ignore[attr-defined]
         await create_step(layer, step_dict)
-        # get_step is NOT decorated, so call it directly.
         got = await layer.get_step("s_tags")
         await layer.engine.dispose()
         return got
 
     got = _run(do_roundtrip())
     assert got is not None
-    # Read-back returns a list, not a JSON string.
     assert got["tags"] == ["Tool calls", "read_excerpt"]
 
 
@@ -280,11 +286,151 @@ def test_coerce_tags_helpers_round_trip():
     assert _coerce_tags_from_json('["a", "b"]') == ["a", "b"]
     assert _coerce_tags_to_json(None) is None
     assert _coerce_tags_from_json(None) is None
-    # Already-a-list passthrough (Postgres path).
     assert _coerce_tags_from_json(["a"]) == ["a"]
-    # Raw non-JSON string wrapped as single-element list.
     assert _coerce_tags_from_json("plain") == ["plain"]
     assert _coerce_tags_from_json("") == []
+
+
+def test_get_user_merges_role_email_status_into_metadata(tmp_path, monkeypatch):
+    """The overridden ``get_user`` injects ``role``/``email``/``accountStatus``
+    from the dedicated columns into the returned ``PersistedUser.metadata``.
+
+    Regression for the admin-check bug: Chainlit's stock
+    ``SQLAlchemyDataLayer.get_user`` reads only the ``metadata`` JSON
+    column, but ``auth.py`` stores ``role`` on a dedicated column with
+    ``metadata`` left as ``"{}"`` at insert. The persisted user returned
+    to ``authenticate_user`` therefore had empty metadata, so
+    ``user.metadata.get("role")`` was ``None`` and every admin-gated
+    check (``on_chat_start`` tool gating, ``__chat_flow_test__`` guard,
+    ``build_agent``'s role-based tools) silently failed for admins —
+    even though the JWT and ``get_user_role`` (which reads the dedicated
+    column) worked. The ``TagsJsonSQLAlchemyDataLayer.get_user`` override
+    merges the dedicated columns back into metadata so the persisted user
+    carries the role.
+    """
+    from sqlalchemy import text
+
+    from falkordb_harness.data_layer import build_data_layer, init_db
+
+    db_file = tmp_path / "getuser.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_file}")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("ELEMENTS_DIR", str(tmp_path / "els_getuser"))
+
+    layer = build_data_layer()
+    _run(init_db(layer))
+
+    async def seed_and_fetch():
+        async with layer.engine.connect() as conn:
+            await conn.execute(
+                text(
+                    'INSERT INTO users ('
+                    '"id", "identifier", "createdAt", "metadata", "passwordHash", '
+                    '"email", "role", "accountStatus", "displayName") '
+                    "VALUES (:id, :identifier, :createdAt, :metadata, :passwordHash, "
+                    ":email, :role, :accountStatus, :displayName)"
+                ),
+                {
+                    "id": "u-admin-1",
+                    "identifier": "admin-bob",
+                    "createdAt": "2026-08-18T00:00:00Z",
+                    # metadata deliberately empty — role lives on the column.
+                    "metadata": "{}",
+                    "passwordHash": "not-a-real-hash",
+                    "email": "bob@example.com",
+                    "role": "admin",
+                    "accountStatus": "active",
+                    "displayName": "Bob",
+                },
+            )
+            await conn.commit()
+        got = await layer.get_user("admin-bob")
+        await layer.engine.dispose()
+        return got
+
+    got = _run(seed_and_fetch())
+    assert got is not None
+    assert got.identifier == "admin-bob"
+    # The dedicated-column values must be merged into metadata.
+    assert got.metadata.get("role") == "admin"
+    assert got.metadata.get("email") == "bob@example.com"
+    assert got.metadata.get("accountStatus") == "active"
+
+
+def test_get_user_returns_none_for_unknown_identifier(tmp_path, monkeypatch):
+    """Unknown identifier -> None (override preserves parent semantics)."""
+    from falkordb_harness.data_layer import build_data_layer, init_db
+
+    db_file = tmp_path / "getuser_none.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_file}")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("ELEMENTS_DIR", str(tmp_path / "els_none"))
+
+    layer = build_data_layer()
+    _run(init_db(layer))
+
+    async def fetch():
+        got = await layer.get_user("nobody-here")
+        await layer.engine.dispose()
+        return got
+
+    assert _run(fetch()) is None
+
+
+def test_get_user_preserves_existing_metadata_keys(tmp_path, monkeypatch):
+    """Keys already present in the ``metadata`` JSON column (e.g.
+    ``last_graph`` written by ``set_last_graph``) survive the merge — the
+    dedicated-column values are added on top, not a wholesale overwrite.
+    """
+    import json as _json
+
+    from sqlalchemy import text
+
+    from falkordb_harness.data_layer import build_data_layer, init_db
+
+    db_file = tmp_path / "getuser_meta.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_file}")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("ELEMENTS_DIR", str(tmp_path / "els_meta"))
+
+    layer = build_data_layer()
+    _run(init_db(layer))
+
+    async def seed_and_fetch():
+        async with layer.engine.connect() as conn:
+            await conn.execute(
+                text(
+                    'INSERT INTO users ('
+                    '"id", "identifier", "createdAt", "metadata", "passwordHash", '
+                    '"email", "role", "accountStatus", "displayName") '
+                    "VALUES (:id, :identifier, :createdAt, :metadata, :passwordHash, "
+                    ":email, :role, :accountStatus, :displayName)"
+                ),
+                {
+                    "id": "u-user-2",
+                    "identifier": "carol",
+                    "createdAt": "2026-08-18T00:00:00Z",
+                    "metadata": _json.dumps({"last_graph": "factory_planning"}),
+                    "passwordHash": "not-a-real-hash",
+                    "email": "carol@example.com",
+                    "role": "user",
+                    "accountStatus": "active",
+                    "displayName": "Carol",
+                },
+            )
+            await conn.commit()
+        got = await layer.get_user("carol")
+        await layer.engine.dispose()
+        return got
+
+    got = _run(seed_and_fetch())
+    assert got is not None
+    # Pre-existing JSON key preserved.
+    assert got.metadata.get("last_graph") == "factory_planning"
+    # Dedicated-column values merged in.
+    assert got.metadata.get("role") == "user"
+    assert got.metadata.get("email") == "carol@example.com"
+    assert got.metadata.get("accountStatus") == "active"
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +458,7 @@ def test_storage_upload_writes_file_and_returns_url(tmp_path):
 
     res = _run(client.upload_file("u1/e1/file.txt", b"hello", mime="text/plain"))
     assert res["object_key"] == "u1/e1/file.txt"
-    assert res["url"] == "/public/elements/u1/e1/file.txt"
+    assert res["url"] == "/public/files/u1/e1/file.txt"
 
     written = (tmp_path / "u1" / "e1" / "file.txt").read_bytes()
     assert written == b"hello"

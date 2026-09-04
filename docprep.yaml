@@ -25,5 +25,28 @@ fallback:
   max_pages: 50
   timeout_seconds: 30
 
+# MinerU backend — when enabled, bypasses Docling entirely and routes all
+# supported inputs (PDF/DOCX/PPTX/XLSX/image) through MinerU. MinerU performs
+# its own OCR (PP-OCRv6 for pipeline; native VLM OCR for vlm/hybrid) on
+# scanned pages and image inputs, so image markdown references are stripped
+# from the output (mineru.strip_images=true). VLM/hybrid backends also do
+# image/chart interpretation, so the quality-gate VLM fallback above is
+# skipped for those backends; pipeline-backend output may still escalate.
+mineru:
+  enabled: enabled
+  backend: hybrid-engine          # pipeline | vlm-engine | hybrid-engine
+  effort: medium                  # medium | high (hybrid-engine only)
+  language: ch                    # pipeline OCR lang hint (PP-OCRv6 collapsed to "ch")
+  parse_method: auto              # auto | txt | ocr (pipeline & hybrid only)
+  formula_enable: true
+  table_enable: true
+  image_analysis: true            # vlm/hybrid only; hybrid medium auto-disables
+  api_url:                        # blank = local subprocess; or http://host:8000 for mineru-api
+  server_url:                     # required only for *-http-client backends
+  start_page_id: 0
+  end_page_id:                    # blank = parse to last page
+  timeout_seconds: 600
+  strip_images: true
+
 # Set your real key before running:
 #   export OLLAMA_API_KEY=sk-...

@@ -2,25 +2,27 @@
 
 from falkordb_harness.tools.admin_tools import reset_graph, use_graph
 from falkordb_harness.tools.file_inspection_tools import file_metadata, read_excerpt
-from falkordb_harness.tools.ingest_tools import chunk_documents, extract_and_write
-from falkordb_harness.tools.inspect_tools import (
-    get_schema,
-    list_edges,
-    list_graphs,
-    list_nodes,
-    node_count,
+from falkordb_harness.tools.graph_admin_tools import (
+    create_graph,
+    describe_graph,
+    request_graph_switch,
+    update_graph_description,
 )
+from falkordb_harness.tools.ingest_tools import (
+    chunk_documents,
+    estimate_ingestion_time,
+    extract_and_write,
+)
+from falkordb_harness.tools.inspect_tools import get_schema, list_graphs
 from falkordb_harness.tools.preprocess_tools import preprocess_document
 from falkordb_harness.tools.query_tools import (
     cypher_query,
-    fulltext_search,
     nl_query,
-    vector_search,
+    search,
 )
 from falkordb_harness.tools.reconciliation_tools import (
-    clear_reconciliations,
     get_reconciliations,
-    reconcile_posthoc,
+    resolve_duplicate,
 )
 from falkordb_harness.tools.ui_prompt_tools import (
     ask_user,
@@ -35,6 +37,7 @@ all_tools = [
     preprocess_document,
     # Ingestion
     chunk_documents,
+    estimate_ingestion_time,
     extract_and_write,
     # Interactive UI prompts (Chainlit Ask*Message / CLI stdin fallback)
     request_ingestion_confirmation,
@@ -42,18 +45,18 @@ all_tools = [
     # Query
     cypher_query,
     nl_query,
-    fulltext_search,
-    vector_search,
+    search,
     # Inspection
     get_schema,
-    list_nodes,
-    list_edges,
-    node_count,
     list_graphs,
+    # Graph lifecycle (create / switch-with-confirm / describe)
+    create_graph,
+    request_graph_switch,
+    describe_graph,
+    update_graph_description,
     # Reconciliation
     get_reconciliations,
-    clear_reconciliations,
-    reconcile_posthoc,
+    resolve_duplicate,
     # Admin
     reset_graph,
     use_graph,

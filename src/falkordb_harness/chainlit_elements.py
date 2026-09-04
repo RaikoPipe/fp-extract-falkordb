@@ -33,10 +33,7 @@ _MAX_DF_ROWS = 200
 # list_nodes/list_edges/search are dicts).
 _DF_TOOLS: frozenset[str] = frozenset(
     {
-        "list_nodes",
-        "list_edges",
-        "fulltext_search",
-        "vector_search",
+        "search",
     }
 )
 
@@ -75,8 +72,8 @@ def _flatten_record(rec: dict) -> dict:
 def build_result_dataframe(tool_name: str, raw_output: Any):
     """Return a ``cl.Dataframe`` for tabular tool results, or ``None``.
 
-    Handles ``list_nodes`` / ``list_edges`` / ``fulltext_search`` /
-    ``vector_search`` (and best-effort ``cypher_query`` when rows are dicts).
+    Handles ``search`` (and best-effort
+    ``cypher_query`` when rows are dicts).
     Returns ``None`` if pandas is unavailable or the output isn't a list
     of record dicts, so the caller falls back to the Markdown table.
     """
@@ -113,89 +110,6 @@ def build_result_dataframe(tool_name: str, raw_output: Any):
         data=df,
         display="inline",
     )
-
-
-def _label_counts_from_nodes(nodes: list[dict]) -> dict[str, int]:
-    """Return ``{label: count}`` from get_all_nodes() output."""
-    counts: dict[str, int] = {}
-    for n in nodes:
-        labels = n.get("_labels") or n.get("labels") or []
-        if isinstance(labels, str):
-            labels = [labels]
-        for lbl in labels or ["(unlabeled)"]:
-            counts[str(lbl)] = counts.get(str(lbl), 0) + 1
-    return counts
-
-
-def _rel_type_counts_from_edges(edges: list) -> dict[str, int]:
-    """Return ``{rel_type: count}`` from get_all_edges() tuples/lists."""
-    counts: dict[str, int] = {}
-    for e in edges:
-        # get_all_edges returns tuples (src, tgt, rel, props); list_edges
-        # tool wraps them into dicts with a "type" key.
-        if isinstance(e, dict):
-            rel = str(e.get("type", ""))
-        elif len(e) >= 3:
-            rel = str(e[2])
-        else:
-            continue
-        counts[rel] = counts.get(rel, 0) + 1
-    return counts
-
-
-def build_label_distribution_plot(raw_output: str):
-    """Bar chart of node counts by label (from ``list_nodes`` output)."""
-    return _build_count_plot(
-        raw_output,
-        _label_counts_from_nodes,
-        title=t("chart.nodes_by_label.title"),
-        x_title=t("chart.nodes_by_label.x"),
-        y_title=t("chart.nodes_by_label.y"),
-        name="node_label_distribution",
-    )
-
-
-def build_rel_distribution_plot(raw_output: str):
-    """Bar chart of relationship counts by type (from ``list_edges`` output)."""
-    return _build_count_plot(
-        raw_output,
-        _rel_type_counts_from_edges,
-        title=t("chart.rel_by_type.title"),
-        x_title=t("chart.rel_by_type.x"),
-        y_title=t("chart.rel_by_type.y"),
-        name="rel_type_distribution",
-    )
-
-
-def _build_count_plot(raw_output: str, extractor, *, title, x_title, y_title, name):
-    """Build a Plotly bar chart from a counts dict extracted via ``extractor``."""
-    try:
-        import plotly.graph_objects as go
-    except ImportError:
-        return None
-    data = _try_parse_json(raw_output if isinstance(raw_output, str) else str(raw_output))
-    if not isinstance(data, list) or not data:
-        return None
-    counts = extractor(data)
-    if not counts:
-        return None
-    labels = list(counts.keys())
-    values = [counts[k] for k in labels]
-    fig = go.Figure(
-        data=[go.Bar(x=labels, y=values, marker_color="#6366f1")],
-        layout={
-            "title": title,
-            "xaxis": {"title": x_title, "tickangle": -30},
-            "yaxis": {"title": y_title, "dtick": 1},
-            "margin": {"l": 40, "r": 20, "t": 40, "b": 60},
-            "height": 320,
-        },
-    )
-    try:
-        import chainlit as cl
-    except ImportError:
-        return None
-    return cl.Plotly(name=name, figure=fig, display="inline", size="medium")
 
 
 def build_search_score_plot(raw_output: str, *, metric: str = "score"):
@@ -345,12 +259,13 @@ def build_source_elements_from_row(row: dict, data_dir: Path):
     Sibling of :func:`build_source_elements` for the "Open" sidebar button.
     ``row`` is a :mod:`document_registry` row dict (absolute on-disk paths in
     ``preprocessedPath`` / ``originalPath``). Prefers the preprocessed
-    Markdown (renders as a ``cl.Text``); falls back to the original (``cl.Pdf``
-    for PDFs, ``cl.Image`` for images, ``cl.Text`` for plain text). The path
-    must resolve under ``data_dir`` (containment guard via :func:`_safe_resolve`
-    on the root-relative form of the path) — paths outside the data dir are
-    skipped. Returns ``[]`` when ``chainlit`` is missing or no usable file is
-    found (the caller sends a chat message instead).
+    Markdown (renders as a ``cl.Text`` in the side panel, like PDFs/images);
+    falls back to the original (``cl.Pdf`` for PDFs, ``cl.Image`` for images,
+    ``cl.Text`` for plain text, all in the side panel). The path must resolve
+    under ``data_dir`` (containment guard via :func:`_safe_resolve` on the
+    root-relative form of the path) — paths outside the data dir are
+    skipped. Returns ``[]`` when ``chainlit`` is missing or no usable file
+    is found (the caller sends a chat message instead).
     """
     try:
         import chainlit as cl
@@ -374,7 +289,7 @@ def build_source_elements_from_row(row: dict, data_dir: Path):
                     cl.Text(
                         name=t("element.preprocessed.name", name=pre_abs.name),
                         content=content[:20000],
-                        display="inline",
+                        display="side",
                         language="markdown",
                     )
                 )
@@ -403,7 +318,7 @@ def build_source_elements_from_row(row: dict, data_dir: Path):
                         cl.Text(
                             name=src_abs.name,
                             content=content[:20000],
-                            display="inline",
+                            display="side",
                         )
                     )
     return elements
@@ -454,8 +369,6 @@ def _safe_resolve(data_dir: Path, virtual: str) -> Path | None:
 
 __all__ = [
     "build_ingestion_summary_plot",
-    "build_label_distribution_plot",
-    "build_rel_distribution_plot",
     "build_result_dataframe",
     "build_search_score_plot",
     "build_source_elements",

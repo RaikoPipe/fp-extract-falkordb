@@ -117,7 +117,6 @@ class GraphSearcher:
         schema = self._backend.get_schema_info()
         schema_text = json.dumps(schema, indent=2)
 
-        # Step 1: NL -> Cypher
         cypher_messages = [
             {"role": "system", "content": _NL_TO_CYPHER_SYSTEM},
             {
@@ -141,7 +140,6 @@ class GraphSearcher:
         cypher = (cypher_response.choices[0].message.content or "").strip()
         logger.debug("NL-to-Cypher response | raw={}", cypher)
 
-        # Strip markdown fences if present
         if cypher.startswith("```"):
             lines = cypher.split("\n")
             lines = lines[1:]
@@ -151,7 +149,6 @@ class GraphSearcher:
 
         print(f"  [Cypher] {cypher}")
 
-        # Step 2: Execute
         try:
             rows = self.cypher_query(cypher)
         except Exception as exc:
@@ -164,7 +161,6 @@ class GraphSearcher:
             [str(row) for row in rows[:20]], indent=2, ensure_ascii=False, default=str
         )
 
-        # Step 3: Summarize
         summary_messages = [
             {"role": "system", "content": _SUMMARIZE_SYSTEM},
             {
@@ -247,7 +243,6 @@ class GraphSearcher:
             return self.fulltext_search(query)
         if self._mode == "vector":
             return await self.vector_search(query)
-        # default: graph mode
         return await self.natural_language_query(query)
 
     async def search_loop(self) -> None:

@@ -88,20 +88,6 @@ def _records_to_table(records: list[dict], max_chars: int) -> str:
 # Per-tool output formatters
 # ---------------------------------------------------------------------------
 
-def _fmt_node_table(raw: str, max_chars: int) -> str:
-    data = _try_parse_json(raw)
-    if isinstance(data, list):
-        return _records_to_table(data, max_chars)
-    return _fmt_default(raw, max_chars)
-
-
-def _fmt_edge_table(raw: str, max_chars: int) -> str:
-    data = _try_parse_json(raw)
-    if isinstance(data, list):
-        return _records_to_table(data, max_chars)
-    return _fmt_default(raw, max_chars)
-
-
 def _fmt_cypher_result(raw: str, max_chars: int) -> str:
     data = _try_parse_json(raw)
     if isinstance(data, list):
@@ -141,15 +127,6 @@ def _fmt_schema(raw: str, max_chars: int) -> str:
     if not sections:
         return _fmt_default(raw, max_chars)
     return _truncate("\n\n".join(sections), max_chars)
-
-
-def _fmt_node_count(raw: str, max_chars: int) -> str:
-    data = _try_parse_json(raw)
-    if isinstance(data, (int, float)):
-        return t("fmt.node_count.one", n=int(data))
-    if isinstance(data, dict) and "count" in data:
-        return t("fmt.node_count.one", n=data["count"])
-    return _fmt_default(raw, max_chars)
 
 
 def _fmt_search_results(raw: str, max_chars: int) -> str:
@@ -209,13 +186,9 @@ def _fmt_kv(raw: str, max_chars: int) -> str:
 # ---------------------------------------------------------------------------
 
 _OUTPUT_FORMATTERS: dict[str, Callable[[str, int], str]] = {
-    "list_nodes": _fmt_node_table,
-    "list_edges": _fmt_edge_table,
     "cypher_query": _fmt_cypher_result,
     "get_schema": _fmt_schema,
-    "node_count": _fmt_node_count,
-    "fulltext_search": _fmt_search_results,
-    "vector_search": _fmt_search_results,
+    "search": _fmt_search_results,
     "chunk_documents": _fmt_summary_card,
     "extract_and_write": _fmt_summary_card,
     "file_metadata": _fmt_kv,

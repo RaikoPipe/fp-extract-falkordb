@@ -1,4 +1,4 @@
-"""Tools for inspecting graph schema, nodes, and edges."""
+"""Tools for inspecting graph schema and listing available graphs."""
 
 from __future__ import annotations
 
@@ -22,51 +22,6 @@ def get_schema() -> str:
 def _get_schema_impl() -> str:
     schema = get_backend().get_schema_info()
     return json.dumps(schema, indent=2, ensure_ascii=False)
-
-
-@tool
-def list_nodes(limit: int = 50) -> str:
-    """List nodes in the knowledge graph.
-
-    Returns up to `limit` nodes with their labels and properties.
-    Use a small limit to avoid overwhelming output.
-    """
-    return with_retry(lambda: _list_nodes_impl(limit))
-
-
-def _list_nodes_impl(limit: int) -> str:
-    nodes = get_backend().get_all_nodes()
-    return json.dumps(nodes[:limit], indent=2, ensure_ascii=False, default=str)
-
-
-@tool
-def list_edges(limit: int = 50) -> str:
-    """List edges (relationships) in the knowledge graph.
-
-    Each edge is [source_name, target_name, relationship_type, properties].
-    Returns up to `limit` edges.
-    """
-    return with_retry(lambda: _list_edges_impl(limit))
-
-
-def _list_edges_impl(limit: int) -> str:
-    edges = get_backend().get_all_edges()
-    result = [
-        {"source": src, "target": tgt, "type": rel, "properties": props}
-        for src, tgt, rel, props in edges[:limit]
-    ]
-    return json.dumps(result, indent=2, ensure_ascii=False, default=str)
-
-
-@tool
-def node_count() -> str:
-    """Return the total number of nodes in the knowledge graph."""
-    return with_retry(lambda: _node_count_impl())
-
-
-def _node_count_impl() -> str:
-    count = get_backend().node_count()
-    return str(count)
 
 
 @tool

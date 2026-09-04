@@ -32,9 +32,7 @@ def test_conflict_mode_detects_value_mismatch():
         r, "Resource", existing, source="doc.docx", chunk_index=3
     )
 
-    # capacity is NOT written via SET (existing preserved)
     assert "n.capacity" not in query
-    # a conflict entry is appended to n.conflicts
     assert "n.conflicts" in query
     assert conflicts and len(conflicts) == 1
     c = conflicts[0]
@@ -44,7 +42,6 @@ def test_conflict_mode_detects_value_mismatch():
     assert c["source"] == "doc.docx"
     assert c["chunk_index"] == 3
     assert "detected_at" in c
-    # stable id + resolved flag
     assert c["id"] == f"capacity:{c['detected_at']}"
     assert c["resolved"] is False
 
@@ -59,7 +56,6 @@ def test_conflict_mode_first_writer_wins_on_agreement():
     )
 
     assert conflicts == []
-    # no SET clause needed since everything agrees
     assert "SET" not in query
 
 
@@ -134,7 +130,6 @@ def test_conflict_mode_appends_to_existing_conflicts_list():
     assert len(conflicts) == 2
     prop_names = {c["property"] for c in conflicts}
     assert prop_names == {"capacity", "mtbf"}
-    # two separate c_<prop> params, two append SET clauses
     assert "c_capacity" in params and "c_mtbf" in params
     assert query.count("+ [$c_") == 2
 
@@ -151,7 +146,6 @@ def test_conflict_mode_query_includes_append_to_conflicts_list():
     assert "MERGE (n:Resource {name: $name})" in query
     assert "coalesce(n.conflicts, \"[]\")" in query
     assert "[$c_capacity]" in query
-    # the conflict JSON is a valid JSON string in the params
     parsed = json.loads(params["c_capacity"])
     assert parsed["property"] == "capacity"
     assert parsed["id"] == f"capacity:{parsed['detected_at']}"
@@ -175,15 +169,13 @@ def test_conflict_mode_no_existing_node_writes_all_fields():
 
 def test_conflict_mode_overwrite_mode_is_idempotent_on_repeated_ingest():
     """Overwrite mode (the original path) is unchanged — regression guard."""
-    # In overwrite mode, build_conflict_merge is not used; model_to_cypher_merge
-    # is. This test locks the overwrite contract: SET always overwrites.
+    # overwrite mode uses model_to_cypher_merge, not build_conflict_merge; SET always overwrites.
     from knowledge.cypher_mapper import model_to_cypher_merge
 
     r = Resource(name="M-1", name_has_index=True, description="Machine 1", resource_type="machine", capacity=600)
     query, params = model_to_cypher_merge(r, "Resource")
     assert "n.capacity = $p_capacity" in query
     assert params["p_capacity"] == 600
-    # No conflicts property in overwrite mode
     assert "conflicts" not in query
 
 

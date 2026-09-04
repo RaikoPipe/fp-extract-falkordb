@@ -1,22 +1,12 @@
 """Shared OpenAI-compatible clients for chat completions and embeddings.
 
-The harness targets Ollama via its OpenAI-compatible endpoints rather than
-LiteLLM, avoiding the fragile content-block conversion that broke streaming
-with reasoning content (see the ``langchain_litellm._convert_message_to_dict``
-bare-string pass-through bug).
+Two lazily-constructed, process-cached clients:
 
-Two endpoints are used:
+- **Chat completions** — selected by ``OLLAMA_API_BASE`` + ``OLLAMA_API_KEY``.
+- **Embeddings** — selected by ``EMBEDDING_API_BASE`` (default
+  ``http://localhost:11434``) + ``EMBEDDING_API_KEY``, independent from chat
+  (Ollama Cloud does not expose ``/v1/embeddings``).
 
-- **Chat completions** — the LLM chat endpoint (Ollama Cloud by default),
-  selected by ``OLLAMA_API_BASE`` + ``OLLAMA_API_KEY``. Drives entity
-  extraction, NL-to-Cypher, summarization, pairwise reconciliation, and the
-  deep-agent reasoning model.
-- **Embeddings** — the embedding endpoint (local Ollama by default), selected
-  by ``EMBEDDING_API_BASE`` (default ``http://localhost:11434``) +
-  ``EMBEDDING_API_KEY``. Independent from chat because Ollama Cloud does not
-  expose ``/v1/embeddings``; a local Ollama instance serves embeddings.
-
-Both clients are lazily constructed and cached for the process lifetime.
 ``reset_clients()`` drops the cache (used by tests).
 """
 

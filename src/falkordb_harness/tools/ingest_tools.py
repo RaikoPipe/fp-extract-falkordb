@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from pathlib import Path
 
@@ -13,6 +14,28 @@ from falkordb_harness.tools._paths import resolve as _resolve
 from falkordb_harness.tools._retry import awith_retry, with_retry
 
 logger = logging.getLogger("falkordb_harness.tools.ingest")
+
+
+# --- Conservative per-stage rate defaults (env-overridable) -----------------
+# These feed ``estimate_ingestion_time``. Defaults are deliberately
+# conservative so the user sees an upper-bound estimate before confirming;
+# deployers can calibrate them from observed run times via the env vars.
+_SECS_PER_CHUNK = float(os.getenv("INGEST_SECS_PER_CHUNK", "15"))
+_SECS_PER_PREPROCESS = float(os.getenv("INGEST_SECS_PER_PREPROCESS", "30"))
+_SECS_PER_WRITE = float(os.getenv("INGEST_SECS_PER_WRITE", "0.5"))
+_ESTIMATE_MARGIN = float(os.getenv("INGEST_ESTIMATE_MARGIN", "1.2"))
+
+
+def _human_duration(seconds: float) -> str:
+    """Render a duration as a short ``≈ Xm Ys`` / ``≈ Ys`` string."""
+    s = max(0, int(round(seconds)))
+    if s < 60:
+        return f"≈ {s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"≈ {m}m {s:02d}s"
+    h, m = divmod(m, 60)
+    return f"≈ {h}h {m:02d}m"
 
 
 def _resolve_data_dir(data_dir: str) -> Path | str:
@@ -28,9 +51,6 @@ def _resolve_data_dir(data_dir: str) -> Path | str:
     resolved = _resolve(target)
     if isinstance(resolved, str):
         return resolved
-    # ``preprocessed/`` is auto-created by _paths.preprocessed_dir(); ensure
-    # arbitrary subdirs exist too so load_and_chunk doesn't fail on missing
-    # dirs the agent referenced.
     resolved.mkdir(parents=True, exist_ok=True)
     return resolved
 
@@ -76,6 +96,106 @@ def _chunk_documents_impl(data_dir: str, chunk_size: int, overlap: int) -> str:
 
 
 @tool
+def estimate_ingestion_time(
+    data_dir: str = "",
+    chunk_size: int = 4000,
+    overlap: int = 200,
+    concurrency: int = 4,
+) -> str:
+    """Estimate how long ``extract_and_write`` would take for a directory.
+
+    Call this BEFORE ``request_ingestion_confirmation`` during the
+    PRE-INGESTION REVIEW ROUTINE, with the same ``data_dir`` / ``chunk_size``
+    / ``concurrency`` you intend to pass to ``extract_and_write``. Returns a
+    JSON summary with file/chunk counts, a per-stage breakdown (extract /
+    preprocess / write), and a human-readable ``estimated_human`` string
+    (e.g. ``"≈ 3m 20s"``) to report to the user.
+
+    The estimate is deliberately conservative (extraction dominates at
+    ~15s per chunk at the configured concurrency, plus ~30s per binary
+    file needing docprep, plus a +20% safety margin). Rates are env-
+    overridable (``INGEST_SECS_PER_CHUNK`` / ``INGEST_SECS_PER_PREPROCESS``
+    / ``INGEST_SECS_PER_WRITE`` / ``INGEST_ESTIMATE_MARGIN``).
+    """
+    return with_retry(
+        lambda: _estimate_ingestion_time_impl(data_dir, chunk_size, overlap, concurrency)
+    )
+
+
+def _estimate_ingestion_time_impl(
+    data_dir: str, chunk_size: int, overlap: int, concurrency: int
+) -> str:
+    from knowledge.chunking import (
+        TEXT_EXTENSIONS,
+        chunk_text,
+        discover_files,
+        read_document,
+    )
+
+    resolved = _resolve_data_dir(data_dir)
+    if isinstance(resolved, str):
+        return json.dumps({"error": resolved}, ensure_ascii=False)
+
+    files = discover_files(resolved)
+    if not files:
+        return json.dumps(
+            {"error": "No documents found or no chunks produced."},
+            ensure_ascii=False,
+        )
+
+    plain_files: list[str] = []
+    binary_files: list[str] = []
+    chunk_count = 0
+    for f in files:
+        if f.suffix.lower() in TEXT_EXTENSIONS:
+            plain_files.append(f.name)
+            try:
+                text = read_document(f)
+            except Exception as exc:  # noqa: BLE001 — keep estimating
+                logger.warning("estimate: failed to read %s: %s", f.name, exc)
+                # Fall back to a size-based chunk estimate.
+                chunk_count += max(
+                    1, math.ceil(f.stat().st_size / max(1, chunk_size))
+                )
+                continue
+            chunk_count += len(chunk_text(text, chunk_size=chunk_size, overlap=overlap))
+        else:
+            binary_files.append(f.name)
+            # docprep output length is unknown pre-conversion; estimate
+            # chunks from raw byte size against ``chunk_size``.
+            chunk_count += max(1, math.ceil(f.stat().st_size / max(1, chunk_size)))
+
+    concurrency = max(1, concurrency)
+
+    extract_s = _SECS_PER_CHUNK * chunk_count / concurrency
+    preprocess_s = _SECS_PER_PREPROCESS * len(binary_files) / concurrency
+    write_s = _SECS_PER_WRITE * chunk_count
+    base_s = extract_s + preprocess_s + write_s
+    margin_s = base_s * (_ESTIMATE_MARGIN - 1.0)
+    total_s = base_s + margin_s
+
+    return json.dumps(
+        {
+            "file_count": len(files),
+            "plain_files": plain_files,
+            "binary_files": binary_files,
+            "chunk_count": chunk_count,
+            "concurrency": concurrency,
+            "breakdown": {
+                "extract_s": round(extract_s, 1),
+                "preprocess_s": round(preprocess_s, 1),
+                "write_s": round(write_s, 1),
+                "margin_s": round(margin_s, 1),
+            },
+            "estimated_seconds": round(total_s, 1),
+            "estimated_human": _human_duration(total_s),
+        },
+        indent=2,
+        ensure_ascii=False,
+    )
+
+
+@tool
 async def extract_and_write(
     data_dir: str = "",
     chunk_size: int = 4000,
@@ -102,24 +222,15 @@ async def _extract_and_write_impl(
     resolved = _resolve_data_dir(data_dir)
     if isinstance(resolved, str):
         return json.dumps({"error": resolved}, ensure_ascii=False)
-    # Discover every supported file under the resolved tree so the unified
-    # ``run_ingestion`` pipeline (which stages → preprocess → chunk → extract
-    # → write) operates on the same files the previous direct path would
-    # have chunked via ``load_and_chunk``. Binary formats are routed through
-    # docprep; plain-text files are ingested as-is.
     from knowledge.chunking import discover_files
 
     files = discover_files(resolved)
     if not files:
         return "No documents found or no chunks produced."
 
-    # UI progress bridge: when invoked from the Chainlit UI, ``on_message``
-    # installs a zero-arg async factory into ``cl.user_session`` that builds a
-    # live ``cl.TaskList`` panel and returns ``(progress, finalize)``. The
-    # tool consumes it so the agent-driven path gets the same per-stage /
-    # per-file progress UI as the "Ingest documents" action button. In any
-    # non-Chainlit runtime (CLI, tests) no factory is installed and
-    # ``run_ingestion`` runs with ``progress=None`` silently.
+    # UI progress bridge: consume the factory on_message installed in
+    # user_session so the agent path gets the same TaskList UI as the
+    # Ingest button. Non-Chainlit runtimes get progress=None.
     progress = None
     finalize = None
     try:
@@ -130,16 +241,15 @@ async def _extract_and_write_impl(
         factory = None
     if factory is not None:
         try:
-            # ``make_ingestion_progress`` returns a 3-tuple
-            # ``(tasklist, progress, finalize)``; the tasklist is sent as a
-            # standalone chat element by the factory, so we only need the
-            # progress/finalize callbacks here.
-            _tasklist, progress, finalize = await factory()
+            _, progress, finalize = await factory()
         except Exception as exc:  # noqa: BLE001 — never strand ingestion
             logger.warning("ingest progress factory failed: %s", exc)
             progress, finalize = None, None
 
     result: dict = {}
+    # ``finalize`` runs from a ``finally`` so it also fires on
+    # ``CancelledError`` (stop button) — a ``BaseException`` since Py 3.8.
+    success = False
     try:
         result = await run_ingestion(
             files,
@@ -150,18 +260,11 @@ async def _extract_and_write_impl(
             overwrite_preprocessed=False,
             progress=progress,
         )
-    except Exception:
+        success = not (result.get("errors") or [])
+        return json.dumps(result, indent=2, ensure_ascii=False)
+    finally:
         if finalize is not None:
             try:
-                await finalize(False)
+                await finalize(success)
             except Exception as exc:  # noqa: BLE001 — never strand the UI
                 logger.warning("ingest progress finalize failed: %s", exc)
-        raise
-    else:
-        if finalize is not None:
-            try:
-                await finalize(bool(result.get("errors") or []) is False)
-            except Exception as exc:  # noqa: BLE001 — never strand the UI
-                logger.warning("ingest progress finalize failed: %s", exc)
-
-    return json.dumps(result, indent=2, ensure_ascii=False)

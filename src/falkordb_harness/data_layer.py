@@ -25,13 +25,14 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import aiofiles
 from chainlit.data import BaseDataLayer
 from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
 from chainlit.data.storage_clients.base import BaseStorageClient
 from chainlit.data.utils import queue_until_user_message
+from chainlit.user import PersistedUser
 
 logger = logging.getLogger("falkordb_harness.data_layer")
 
@@ -109,21 +110,18 @@ class LocalStorageClient(BaseStorageClient):
 
         The Chainlit frontend fetches elements by the ``url`` stored on
         the element row. We expose elements under the app's
-        ``/public/elements/<object_key>`` path; a static-file route is
+        ``/public/files/<object_key>`` path; a static-file route is
         mounted on this prefix by the auth module at startup. If the
         object key is not under our root (defensive), fall back to the
         absolute file path so the blob is at least discoverable.
         """
-        return f"/public/elements/{object_key}"
+        return f"/public/files/{object_key}"
 
 
 _DDL_STATEMENTS: tuple[str, ...] = (
-    # users — Chainlit's user table (identifier + metadata). We extend it
-    # with columns for the app's own password auth, role-based access
-    # control, account lifecycle (email verification + admin approval),
-    # and password-reset / email-verification tokens. All added columns
-    # are nullable or have defaults so Chainlit's own queries (which only
-    # touch id/identifier/createdAt/metadata) keep working unchanged.
+    # users — Chainlit's user table extended with password auth, roles,
+    # account lifecycle, and reset/verify tokens. Added columns are nullable
+    # so Chainlit's own queries keep working unchanged.
     """
     CREATE TABLE IF NOT EXISTS users (
         "id" TEXT PRIMARY KEY,
@@ -160,13 +158,9 @@ _DDL_STATEMENTS: tuple[str, ...] = (
         "metadata" TEXT DEFAULT '{}'
     )
     """,
-    # steps — every message / tool-call step within a thread. The column
-    # set must cover EVERY key in chainlit.step.StepDict because the
-    # SQLAlchemy layer builds its INSERT column list dynamically from the
-    # StepDict's keys (sql_alchemy.create_step: parameters = {k: v ...}).
-    # A missing column raises sqlite3.OperationalError at runtime. Keep
-    # this list in sync with chainlit/step.py's StepDict (and the SELECT
-    # column list in sql_alchemy.get_step / get_all_user_threads).
+    # steps — column set must cover EVERY StepDict key: the SQLAlchemy
+    # layer builds INSERT columns dynamically from StepDict, so a missing
+    # column raises OperationalError. Keep in sync with chainlit/step.py.
     """
     CREATE TABLE IF NOT EXISTS steps (
         "id" TEXT PRIMARY KEY,
@@ -224,66 +218,76 @@ _DDL_STATEMENTS: tuple[str, ...] = (
         "comment" TEXT
     )
     """,
-    # documents — the document-management registry. A single table covers
-    # all three lifecycle stages, distinguished by the ``stage`` column:
-    #   'uploaded'    — raw original copied into originals/ (scoped to a
-    #                   chat thread: ``threadId`` set, ``graphName`` NULL).
-    #   'preprocessed'— docprep Markdown output (scoped to a thread, paired
-    #                   to its original by name; ``originalPath`` references
-    #                   the source row).
-    #   'ingested'    — file whose extractions were written to a knowledge
-    #                   graph (scoped to the graph: ``graphName`` set,
-    #                   ``threadId`` NULL). Ingested rows are permanent —
-    #                   they are NOT deletable from the sidebar and are only
-    #                   removed when the graph itself is reset.
-    # On thread deletion, ``orphan_thread`` nulls ``threadId`` so the file
-    # remains re-usable by other chats/graphs. ``checksum`` (sha256) enables
-    # dedup within a thread (uploaded/preprocessed) and across a graph
-    # (ingested). See falkordb_harness.document_registry for the CRUD API.
+    # documents — document-management registry. Scoped to a thread via
+    # threadId (NULLed on thread deletion when the file remains ingested);
+    # checksum (sha256) dedups uploads within a thread.
+    # See falkordb_harness.document_registry for the CRUD API.
     """
     CREATE TABLE IF NOT EXISTS documents (
-        "id"               TEXT PRIMARY KEY,
-        "userIdentifier"   TEXT,
-        "threadId"         TEXT,
-        "graphName"        TEXT,
-        "name"             TEXT NOT NULL,
-        "stage"            TEXT NOT NULL,
-        "originalPath"     TEXT,
-        "preprocessedPath" TEXT,
-        "source"           TEXT,
-        "mime"             TEXT,
-        "bytes"            INTEGER,
-        "checksum"         TEXT,
-        "ingestedAt"       TEXT,
-        "createdAt"        TEXT NOT NULL
+        "id"                TEXT PRIMARY KEY,
+        "userIdentifier"    TEXT,
+        "threadId"          TEXT,
+        "name"              TEXT NOT NULL,
+        "originalPath"      TEXT,
+        "preprocessedPath"  TEXT,
+        "preprocessedAt"    TEXT,
+        "mime"              TEXT,
+        "bytes"             INTEGER,
+        "checksum"          TEXT,
+        "createdAt"         TEXT NOT NULL
     )
     """,
     """
-    CREATE INDEX IF NOT EXISTS idx_documents_thread_stage
-        ON documents ("threadId", "stage")
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_documents_graph_stage
-        ON documents ("graphName", "stage")
+    CREATE INDEX IF NOT EXISTS idx_documents_thread
+        ON documents ("threadId")
     """,
     """
     CREATE INDEX IF NOT EXISTS idx_documents_checksum
         ON documents ("checksum")
     """,
+    # document_ingestions — many-to-many link between documents and graphs.
+    # The document row is NOT deleted on graph reset; only the link is
+    # (clear_ingested_for_graph), so the file remains re-ingestable.
+    # ON DELETE CASCADE from the document row keeps records from outliving it.
+    """
+    CREATE TABLE IF NOT EXISTS document_ingestions (
+        "id"           TEXT PRIMARY KEY,
+        "documentId"   TEXT NOT NULL
+            REFERENCES documents ("id") ON DELETE CASCADE,
+        "graphName"    TEXT NOT NULL,
+        "source"       TEXT,
+        "ingestedAt"   TEXT NOT NULL,
+        "createdAt"    TEXT NOT NULL,
+        UNIQUE ("documentId", "graphName")
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_ingestions_document
+        ON document_ingestions ("documentId")
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_ingestions_graph
+        ON document_ingestions ("graphName")
+    """,
+    # graph_descriptions — LLM-maintained description per graph. Seeded at
+    # create_graph, revised after each ingestion. Keyed by graph name;
+    # rows are created on demand and never auto-deleted (graph reset does
+    # NOT clear the description).
+    """
+    CREATE TABLE IF NOT EXISTS graph_descriptions (
+        "name"        TEXT PRIMARY KEY,
+        "description" TEXT NOT NULL DEFAULT '',
+        "updatedAt"   TEXT NOT NULL
+    )
+    """,
 )
 
 
-# Columns that may be missing from ``steps``/``elements``/``users`` tables
-# in databases created by an earlier (incomplete) version of this module's
-# DDL. SQLite has no ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS``, so
-# ``_migrate_columns`` checks ``PRAGMA table_info`` and only adds what's
-# absent. Each entry: (table, column, SQL type spec). This is forward-only
-# — once a column exists it's left alone. New columns added to StepDict in
-# a future Chainlit release must be added here (and to _DDL_STATEMENTS).
+# Columns that may be missing from ``steps``/``elements``/``users`` tables in
+# older DBs. SQLite lacks ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS``;
+# ``_migrate_columns`` checks ``PRAGMA table_info`` and adds only what's
+# absent. Forward-only. New StepDict columns must be added here + _DDL_STATEMENTS.
 _MIGRATION_COLUMNS: tuple[tuple[str, str, str], ...] = (
-    # steps — added after the original DDL omitted them (defaultOpen,
-    # autoCollapse, command, modes, icon were missing, causing
-    # sqlite3.OperationalError on every step INSERT).
     ("steps", "command", "TEXT"),
     ("steps", "modes", "TEXT"),
     ("steps", "defaultOpen", "INTEGER"),
@@ -423,16 +427,72 @@ class TagsJsonSQLAlchemyDataLayer(SQLAlchemyDataLayer):
     write is still valid JSON for a JSON column; list out on read skips
     re-parsing). The override is intentionally narrow — only ``tags`` is
     touched; everything else delegates to the parent.
+
+    Also overrides :meth:`get_user` to inject ``role``/``email``/
+    ``accountStatus`` from the dedicated columns into the returned
+    ``PersistedUser.metadata``. Chainlit's stock
+    :meth:`SQLAlchemyDataLayer.get_user` reads only the ``metadata`` JSON
+    column, but :mod:`falkordb_harness.auth` stores ``role`` on a
+    dedicated column (with ``metadata`` left as ``"{}"`` at insert time).
+    Without this override, the persisted user returned to Chainlit's
+    ``authenticate_user`` flow has empty metadata, so
+    ``cl.context.session.user.metadata.get("role")`` is ``None`` and every
+    admin-gated check (``on_chat_start`` tool gating, the
+    ``__chat_flow_test__`` guard, ``build_agent``'s role-based tools)
+    silently fails for admins — even though the JWT carried the role and
+    ``get_user_role`` (which reads the dedicated column) works. Merging
+    the dedicated columns back into metadata here is the centralized fix
+    that keeps ``verify_credentials``' ``User.metadata`` (the JWT source
+    of truth) and the persisted user in sync.
     """
+
+    async def get_user(self, identifier: str) -> Optional[PersistedUser]:  # type: ignore[override]
+        user = await super().get_user(identifier)
+        if user is None:
+            return None
+        # Re-query the dedicated columns (role/email/accountStatus) and
+        # merge them into the metadata dict. We don't parse the row in
+        # super().get_user because that one only selects the JSON
+        # ``metadata`` column; the dedicated columns are read here in a
+        # single round-trip. Any key already present in metadata wins
+        # (last_graph etc.), but role/email/accountStatus are only ever
+        # written via auth.py to the dedicated columns, so overwriting
+        # them with the authoritative column value is correct.
+        from sqlalchemy import text
+
+        async with self.engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text(
+                        'SELECT "role", "email", "accountStatus" '
+                        'FROM users WHERE "identifier" = :i'
+                    ),
+                    {"i": identifier},
+                )
+            ).fetchone()
+        merged = dict(user.metadata or {})
+        if row is not None:
+            role, email, status = row
+            if role is not None:
+                merged["role"] = role
+            if email is not None:
+                merged["email"] = email
+            if status is not None:
+                merged["accountStatus"] = status
+        return PersistedUser(
+            id=user.id,
+            identifier=user.identifier,
+            createdAt=user.createdAt,
+            display_name=user.display_name,
+            metadata=merged,
+        )
 
     @queue_until_user_message()
     async def create_step(self, step_dict):  # type: ignore[override]
         if step_dict.get("tags") is not None:
             step_dict = {**step_dict, "tags": _coerce_tags_to_json(step_dict["tags"])}
-        # Call the parent's unwrapped create_step (the @queue_until_user_message
-        # decorator is applied to THIS override, so queueing is preserved for
-        # the public entry point; the parent's own decorator would double-wrap
-        # and re-check the context, so bypass it via __wrapped__).
+        # Call the parent's unwrapped create_step: this override already has
+        # @queue_until_user_message, so the parent's decorator would double-wrap.
         parent_create_step = SQLAlchemyDataLayer.create_step.__wrapped__  # type: ignore[attr-defined]
         return await parent_create_step(self, step_dict)
 

@@ -25,28 +25,23 @@ from knowledge.retry import (
 @pytest.mark.parametrize(
     "exc, expected",
     [
-        # Known-transient types.
         (ConnectionRefusedError("nope"), True),
         (ConnectionResetError("reset"), True),
         (TimeoutError("timed out"), True),
         (OSError("Connection refused by peer"), True),
         (TransientError("explicit"), True),
-        # Message-based transient fragments.
         (RuntimeError("Connection reset by peer"), True),
         (RuntimeError("operation timed out"), True),
         (RuntimeError("Redis is LOADING the dataset"), True),
         (RuntimeError("Service Unavailable"), True),
         (RuntimeError("Too Many Requests"), True),
         (Exception("broken pipe"), True),
-        # Non-transient programming-error types (message ignored).
         (ValueError("connection is bad"), False),
         (TypeError("oops"), False),
         (KeyError("missing"), False),
         (AttributeError("no attr"), False),
-        # FalkorDB index-already-exists is idempotently handled, not transient.
         (Exception("Index already exists"), False),
         (Exception("Attribute 'name' is already indexed"), False),
-        # Misc non-transient.
         (RuntimeError("undefined label"), False),
     ],
 )
@@ -63,8 +58,7 @@ def test_is_transient_openai_classes():
     assert is_transient(openai.APIConnectionError(request=req)) is True
     assert is_transient(openai.APITimeoutError(request=req)) is True
     assert is_transient(openai.RateLimitError("x", response=resp, body=None)) is True
-    # BadRequestError is not in our transient list and is not a never-type, but
-    # its message "bad request" isn't a transient fragment -> not transient.
+    # BadRequestError's "bad request" isn't a transient fragment -> not transient.
     assert is_transient(openai.BadRequestError("bad", response=resp, body=None)) is False
 
 
@@ -130,8 +124,7 @@ def test_retry_sync_backoff_is_capped_and_increasing():
             raise ConnectionError("x")
         return "ok"
 
-    # Use a deterministic sleep that records, and patch the module's
-    # backoff cap low so we can observe the cap without env tweaking.
+    # Patch backoff cap low and record sleeps for deterministic observation.
     import knowledge.retry as retry_mod
 
     orig_base, orig_max = retry_mod.RETRY_BASE_DELAY, retry_mod.RETRY_MAX_DELAY
@@ -143,9 +136,7 @@ def test_retry_sync_backoff_is_capped_and_increasing():
         retry_mod.RETRY_BASE_DELAY = orig_base
         retry_mod.RETRY_MAX_DELAY = orig_max
     assert out == "ok"
-    # 4 retries before the 5th successful attempt.
     assert len(delays) == 4
-    # Delays are non-decreasing up to the cap (jitter can only add, base grows).
     assert delays[-1] <= 4.0 + 1.0  # cap + max jitter
 
 
@@ -220,7 +211,6 @@ def test_with_retry_returns_json_error_after_exhaustion():
         calls["n"] += 1
         raise ConnectionRefusedError("redis down")
 
-    # Force tiny/no backoff by patching sleep.
     import knowledge.retry as retry_mod
 
     orig = retry_mod.time.sleep
@@ -249,7 +239,6 @@ def test_with_retry_non_transient_returns_error_without_retry_budget():
     out = with_retry(body, max_attempts=5)
     parsed = json.loads(out)
     assert parsed["transient"] is False
-    # Non-transient errors short-circuit immediately (1 attempt).
     assert calls["n"] == 1
 
 
@@ -267,10 +256,8 @@ def test_awith_retry_returns_json_error_after_exhaustion():
 
     import knowledge.retry as retry_mod
 
-    # Patch asyncio.sleep used by retry_async via the injected sleep param.
+    # Monkeypatch asyncio.sleep to zero for determinism.
     out = asyncio.run(awith_retry(body, max_attempts=3))
-    # awith_retry uses retry_async with default sleep (asyncio.sleep); force
-    # zero-wait by monkeypatching asyncio.sleep for determinism.
     assert isinstance(out, str)
     parsed = json.loads(out)
     assert parsed["transient"] is True
