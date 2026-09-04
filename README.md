@@ -178,3 +178,4 @@ pytest -q
 ```
 
 295 tests covering chunking, Cypher mapping (both modes), conflict detection/logging, reconciliation decisions/logging, backend query helpers, CLI flag plumbing, password auth + registration, and the SQLite data layer + local element storage.
+
