@@ -77,6 +77,7 @@ services:
       - AGENT_LLM_MODEL=${AGENT_LLM_MODEL:-glm-5.2:cloud}
       - AGENT_LLM_TEMPERATURE=${AGENT_LLM_TEMPERATURE:-0.0}
       - AGENT_MAX_TOOL_REPEATS=${AGENT_MAX_TOOL_REPEATS:-}
+      - BACKGROUND_MAX_JOBS=${BACKGROUND_MAX_JOBS:-}
 
       # --- PythonRunnerSandbox (Docker-backed code execution) ---
       # Set to "1" to enable the sandbox backend (pandas, numpy, etc.).

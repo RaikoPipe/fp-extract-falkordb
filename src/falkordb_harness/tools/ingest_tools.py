@@ -10,6 +10,7 @@ from pathlib import Path
 
 from langchain_core.tools import tool
 
+from falkordb_harness.background_jobs import current_job
 from falkordb_harness.tools._paths import resolve as _resolve
 from falkordb_harness.tools._retry import awith_retry, with_retry
 
@@ -208,6 +209,9 @@ async def extract_and_write(
     DATA_DIR (e.g. ``preprocessed`` or ``originals``); defaults to the
     ``preprocessed/`` tree. Returns a summary with statement count, node
     count, and conflicts detected.
+
+    Long execution time: minutes to hours depending on the chunk count —
+    check ``estimate_ingestion_time`` and prefer ``run_in_background``.
     """
     return await awith_retry(
         lambda: _extract_and_write_impl(data_dir, chunk_size, concurrency)
@@ -237,6 +241,12 @@ async def _extract_and_write_impl(
         import chainlit as cl
 
         factory = cl.user_session.get("ingest_progress_factory")
+        # A background job outlives the turn that installed the per-turn
+        # factory, so build the same progress UI directly.
+        if factory is None and current_job() is not None:
+            from falkordb_harness.chainlit_progress import (
+                make_ingestion_progress as factory,
+            )
     except Exception:  # noqa: BLE001 — not in a Chainlit context
         factory = None
     if factory is not None:

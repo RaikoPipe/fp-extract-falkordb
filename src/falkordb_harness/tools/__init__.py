@@ -14,6 +14,7 @@ from falkordb_harness.tools.ingest_tools import (
     extract_and_write,
 )
 from falkordb_harness.tools.inspect_tools import get_schema, list_graphs
+from falkordb_harness.tools.job_tools import cancel_job, get_job_status, list_jobs
 from falkordb_harness.tools.preprocess_tools import preprocess_document
 from falkordb_harness.tools.query_tools import (
     cypher_query,
@@ -60,6 +61,11 @@ all_tools = [
     # Admin
     reset_graph,
     use_graph,
+    # Background jobs (run_in_background itself is built per agent in
+    # build_agent, since it needs the compiled agent's full tool table)
+    list_jobs,
+    get_job_status,
+    cancel_job,
 ]
 
 

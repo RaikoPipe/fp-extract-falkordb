@@ -23,6 +23,12 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from falkordb_harness import auth as _auth_module  # noqa: F401
 from falkordb_harness.auth import register_routes
+from falkordb_harness.background_jobs import (
+    JobLimitError,
+    current_thread_id,
+    format_pending_notes,
+    job_manager,
+)
 from falkordb_harness.chainlit_elements import (
     build_ingestion_summary_plot,
     build_result_dataframe,
@@ -870,7 +876,9 @@ async def on_ingest_documents(action: Action) -> None:
     pressed the button, which is the confirmation). Reuses the same library
     code as the agent's ``extract_and_write`` tool — only the orchestration
     differs. Progress is streamed as ``cl.Step`` entries so the user sees
-    preprocessing, chunking, extraction, and writing unfold live.
+    preprocessing, chunking, extraction, and writing unfold live. The
+    pipeline runs as a background job (ticket #77), so the chat stays usable
+    while it works.
 
     Targets the graph selected in the sidebar (restored into the session
     contextvar via ``_ensure_session_backend``). If no files have been
@@ -899,85 +907,103 @@ async def on_ingest_documents(action: Action) -> None:
     selection = cl.user_session.get("graph_selection") or {}
     active_graph = selection.get("active_graph", _DEFAULT_GRAPH)
 
-    await cl.Message(
-        content=t("ingest.starting", n=len(files), graph=active_graph),
-    ).send()
+    # Runs as a background job (ticket #77) so the chat stays usable while
+    # the pipeline works; the job posts its own summary (announce=False)
+    # and its return value becomes the agent's pending note.
+    async def _ingest_job() -> str:
+        # Live progress via chainlit TaskList; ``make_ingestion_progress``
+        # switches on ingest_runner's discriminated ``details["kind"]`` events.
+        from falkordb_harness.chainlit_progress import make_ingestion_progress
 
-    # Live progress via chainlit TaskList; ``make_ingestion_progress``
-    # switches on ingest_runner's discriminated ``details["kind"]`` events.
-    from falkordb_harness.chainlit_progress import make_ingestion_progress
+        _, _progress, _finalize_progress = await make_ingestion_progress()
 
-    _, _progress, _finalize_progress = await make_ingestion_progress()
+        yaml_path = os.getenv("DOCPREP_YAML", "")
+        ingest_cfg = cl.user_session.get("ingestion_settings") or _default_ingestion_settings()
+        overwrite = bool(ingest_cfg.get("overwrite_preprocessed", False))
 
-    yaml_path = os.getenv("DOCPREP_YAML", "")
-    ingest_cfg = cl.user_session.get("ingestion_settings") or _default_ingestion_settings()
-    overwrite = bool(ingest_cfg.get("overwrite_preprocessed", False))
-
-    # ``finally`` so cleanup also fires on ``CancelledError`` (Chainlit stop
-    # button) — ``CancelledError`` is a ``BaseException`` since Py 3.8.
-    _ingest_success = False
-    try:
-        result = await run_ingestion(
-            files,
-            chunk_size=int(ingest_cfg.get("chunk_size", 4000)),
-            overlap=int(ingest_cfg.get("overlap", 200)),
-            concurrency=int(ingest_cfg.get("concurrency", 4)),
-            docprep_yaml=yaml_path,
-            overwrite_preprocessed=overwrite,
-            progress=_progress,
-        )
-        _ingest_success = not (result.get("errors") or [])
-    except Exception as exc:  # noqa: BLE001 — UI must stay usable on failure
-        logger.error("Ingestion pipeline failed: %s", exc)
-        await cl.Message(
-            content=t("ingest.failed.pipeline", exc=exc),
-        ).send()
-        return
-    finally:
-        await _finalize_progress(success=_ingest_success)
-
-    errors = result.get("errors") or []
-    summary_lines = [
-        t("ingest.summary.complete", graph=active_graph),
-        t("ingest.summary.files_staged", n=result["files_staged"]),
-        t("ingest.summary.files_preprocessed", n=result["files_preprocessed"]),
-        t("ingest.summary.chunks", n=result["chunks_processed"]),
-        t("ingest.summary.extractions", n=result["extractions"]),
-        t("ingest.summary.cypher", n=result["cypher_statements"]),
-        t("ingest.summary.nodes", n=result["nodes_in_graph"]),
-        t("ingest.summary.conflicts", n=result["conflicts_detected"]),
-        t("ingest.summary.merge_mode", mode=result["merge_mode"]),
-    ]
-    if errors:
-        summary_lines.append(t("ingest.summary.errors.header", n=len(errors)))
-        for e in errors[:10]:
-            summary_lines.append(f"  - {e}")
-        if len(errors) > 10:
-            summary_lines.append(t("ingest.summary.errors.more", n=len(errors) - 10))
-    summary_elements: list = []
-    chart = build_ingestion_summary_plot(result)
-    if chart is not None:
-        summary_elements.append(chart)
-    await cl.Message(
-        content="\n".join(summary_lines),
-        elements=summary_elements,
-    ).send()
-    # Sidebar not refreshed — toggle re-reads registry on open.
-    # Auto-derive a one-line description revision (button path bypasses the
-    # agent, so no LLM authors one). Best-effort; never blocks on failure.
-    if active_graph and not errors:
+        # ``finally`` so cleanup also fires on ``CancelledError`` (cancel_job)
+        # — ``CancelledError`` is a ``BaseException`` since Py 3.8.
+        _ingest_success = False
         try:
-            from falkordb_harness.graph_descriptions import append_description
-
-            addition = (
-                f"Ingested {result['files_staged']} file(s), "
-                f"{result['chunks_processed']} chunk(s), "
-                f"{result['nodes_in_graph']} nodes "
-                f"({result['conflicts_detected']} conflict(s))."
+            result = await run_ingestion(
+                files,
+                chunk_size=int(ingest_cfg.get("chunk_size", 4000)),
+                overlap=int(ingest_cfg.get("overlap", 200)),
+                concurrency=int(ingest_cfg.get("concurrency", 4)),
+                docprep_yaml=yaml_path,
+                overwrite_preprocessed=overwrite,
+                progress=_progress,
             )
-            await append_description(active_graph, addition)
-        except Exception:  # noqa: BLE001
-            pass
+            _ingest_success = not (result.get("errors") or [])
+        except Exception as exc:  # noqa: BLE001 — UI must stay usable on failure
+            logger.error("Ingestion pipeline failed: %s", exc)
+            await cl.Message(
+                content=t("ingest.failed.pipeline", exc=exc),
+            ).send()
+            raise
+        finally:
+            await _finalize_progress(success=_ingest_success)
+
+        errors = result.get("errors") or []
+        summary_lines = [
+            t("ingest.summary.complete", graph=active_graph),
+            t("ingest.summary.files_staged", n=result["files_staged"]),
+            t("ingest.summary.files_preprocessed", n=result["files_preprocessed"]),
+            t("ingest.summary.chunks", n=result["chunks_processed"]),
+            t("ingest.summary.extractions", n=result["extractions"]),
+            t("ingest.summary.cypher", n=result["cypher_statements"]),
+            t("ingest.summary.nodes", n=result["nodes_in_graph"]),
+            t("ingest.summary.conflicts", n=result["conflicts_detected"]),
+            t("ingest.summary.merge_mode", mode=result["merge_mode"]),
+        ]
+        if errors:
+            summary_lines.append(t("ingest.summary.errors.header", n=len(errors)))
+            for e in errors[:10]:
+                summary_lines.append(f"  - {e}")
+            if len(errors) > 10:
+                summary_lines.append(t("ingest.summary.errors.more", n=len(errors) - 10))
+        summary_elements: list = []
+        chart = build_ingestion_summary_plot(result)
+        if chart is not None:
+            summary_elements.append(chart)
+        await cl.Message(
+            content="\n".join(summary_lines),
+            elements=summary_elements,
+        ).send()
+        # Sidebar not refreshed — toggle re-reads registry on open.
+        # Auto-derive a one-line description revision (button path bypasses the
+        # agent, so no LLM authors one). Best-effort; never blocks on failure.
+        if active_graph and not errors:
+            try:
+                from falkordb_harness.graph_descriptions import append_description
+
+                addition = (
+                    f"Ingested {result['files_staged']} file(s), "
+                    f"{result['chunks_processed']} chunk(s), "
+                    f"{result['nodes_in_graph']} nodes "
+                    f"({result['conflicts_detected']} conflict(s))."
+                )
+                await append_description(active_graph, addition)
+            except Exception:  # noqa: BLE001
+                pass
+        return json.dumps(result, ensure_ascii=False, default=str)
+
+    try:
+        job = job_manager.spawn(
+            "ingest_documents",
+            _ingest_job,
+            label=f"Ingest {len(files)} file(s) into {active_graph}",
+            graph=active_graph,
+            announce=False,
+        )
+    except JobLimitError as exc:
+        await cl.Message(content=t("job.limit", err=exc)).send()
+        return
+    await cl.Message(
+        content=t("ingest.starting", n=len(files), graph=active_graph)
+        + "\n"
+        + t("job.running_in_background", id=job.id),
+    ).send()
 
 
 def _step_meta(tool_name: str) -> tuple[str | None, str | None, bool]:
@@ -1233,10 +1259,11 @@ async def on_preprocess_document(action: Action) -> None:
 
     Reuses :func:`_preprocess_document_impl` verbatim (no agent round-trip)
     so the conversion is identical to the Ingest button's per-file step.
-    Runs in a worker thread because docprep (Docling + OCR / VLM) is
-    synchronous and can take minutes; the JSX keeps the button disabled
-    with a spinner while this callback is in flight. Registers the result
-    so the new ``preprocessed`` row appears in the sidebar.
+    Runs as a background job (ticket #77) in a worker thread because
+    docprep (Docling + OCR / VLM) is synchronous and can take minutes; the
+    callback returns once the job is spawned, so the chat stays usable.
+    Registers the result so the new ``preprocessed`` row appears in the
+    sidebar.
     """
     row = await _resolve_doc_row(action)
     if row is None:
@@ -1280,79 +1307,98 @@ async def on_preprocess_document(action: Action) -> None:
     ingest_cfg = cl.user_session.get("ingestion_settings") or _default_ingestion_settings()
     overwrite = bool(ingest_cfg.get("overwrite_preprocessed", False))
 
-    await cl.Message(content=t("doc.preprocess.starting", name=row.get("name") or "")).send()
+    # Background job (ticket #77): docprep can take minutes, so the chat
+    # stays usable; the job posts its own result messages (announce=False).
+    async def _preprocess_job() -> str:
+        from falkordb_harness.tools.preprocess_tools import _preprocess_document_impl
 
-    from falkordb_harness.tools.preprocess_tools import _preprocess_document_impl
+        result_json = await asyncio.to_thread(
+            _preprocess_document_impl, virtual, yaml_path, overwrite
+        )
 
-    result_json = await asyncio.to_thread(
-        _preprocess_document_impl, virtual, yaml_path, overwrite
-    )
+        import json as _json
 
-    import json as _json
+        try:
+            data = _json.loads(result_json)
+        except (_json.JSONDecodeError, TypeError):
+            data = {"error": result_json}
 
-    try:
-        data = _json.loads(result_json)
-    except (_json.JSONDecodeError, TypeError):
-        data = {"error": result_json}
-
-    if isinstance(data, dict) and data.get("error"):
-        await cl.Message(
-            content=t(
-                "doc.preprocess.failed",
-                name=row.get("name") or "",
-                err=str(data["error"])[:300],
-            )
-        ).send()
-        return
-
-    out_virtual = (data or {}).get("output_path")
-    if (data or {}).get("already_exists"):
-        await cl.Message(
-            content=t(
-                "doc.preprocess.already_exists",
-                name=row.get("name") or "",
-                out=out_virtual or "",
-            )
-        ).send()
-    else:
-        await cl.Message(
-            content=t(
-                "doc.preprocess.done",
-                name=row.get("name") or "",
-                out=out_virtual or "",
-            )
-        ).send()
-
-    # Register the preprocessed output in the registry (best-effort),
-    # mirroring _register_preprocessed_from_tool_output. Pair with the
-    # uploaded original's row by using the original's name (not the .md
-    # filename) — under the single-row schema the preprocessed path is a
-    # column on the upload's documents row, keyed by ``(threadId, name)``
-    # where ``name`` is the original filename.
-    if out_virtual:
-        from falkordb_harness.tools._paths import resolve as _resolve2
-
-        pre_abs = _resolve2(out_virtual)
-        if not isinstance(pre_abs, str):
-            try:
-                thread_id = cl.context.session.thread_id
-            except Exception:  # noqa: BLE001
-                thread_id = None
-            user_id = cl.user_session.get("user_identifier")
-            name = row.get("name") or Path(pre_abs).name
-            from falkordb_harness.document_registry import register_preprocessed
-
-            try:
-                await register_preprocessed(
-                    thread_id=thread_id,
-                    user_identifier=user_id,
-                    name=name,
-                    original_path=str(resolved),
-                    preprocessed_path=str(pre_abs),
+        if isinstance(data, dict) and data.get("error"):
+            await cl.Message(
+                content=t(
+                    "doc.preprocess.failed",
+                    name=row.get("name") or "",
+                    err=str(data["error"])[:300],
                 )
-            except Exception as exc:  # noqa: BLE001 — never block the chat
-                logger.debug("register_preprocessed failed: %s", exc)
-    # Sidebar not refreshed — toggle re-reads registry on open.
+            ).send()
+            return result_json
+
+        out_virtual = (data or {}).get("output_path")
+        if (data or {}).get("already_exists"):
+            await cl.Message(
+                content=t(
+                    "doc.preprocess.already_exists",
+                    name=row.get("name") or "",
+                    out=out_virtual or "",
+                )
+            ).send()
+        else:
+            await cl.Message(
+                content=t(
+                    "doc.preprocess.done",
+                    name=row.get("name") or "",
+                    out=out_virtual or "",
+                )
+            ).send()
+
+        # Register the preprocessed output in the registry (best-effort),
+        # mirroring _register_preprocessed_from_tool_output. Pair with the
+        # uploaded original's row by using the original's name (not the .md
+        # filename) — under the single-row schema the preprocessed path is a
+        # column on the upload's documents row, keyed by ``(threadId, name)``
+        # where ``name`` is the original filename.
+        if out_virtual:
+            from falkordb_harness.tools._paths import resolve as _resolve2
+
+            pre_abs = _resolve2(out_virtual)
+            if not isinstance(pre_abs, str):
+                try:
+                    thread_id = cl.context.session.thread_id
+                except Exception:  # noqa: BLE001
+                    thread_id = None
+                user_id = cl.user_session.get("user_identifier")
+                name = row.get("name") or Path(pre_abs).name
+                from falkordb_harness.document_registry import register_preprocessed
+
+                try:
+                    await register_preprocessed(
+                        thread_id=thread_id,
+                        user_identifier=user_id,
+                        name=name,
+                        original_path=str(resolved),
+                        preprocessed_path=str(pre_abs),
+                    )
+                except Exception as exc:  # noqa: BLE001 — never block the chat
+                    logger.debug("register_preprocessed failed: %s", exc)
+        # Sidebar not refreshed — toggle re-reads registry on open.
+        return result_json
+
+    doc_name = row.get("name") or ""
+    try:
+        job = job_manager.spawn(
+            "preprocess_document",
+            _preprocess_job,
+            label=f"Preprocess {doc_name}",
+            announce=False,
+        )
+    except JobLimitError as exc:
+        await cl.Message(content=t("job.limit", err=exc)).send()
+        return
+    await cl.Message(
+        content=t("doc.preprocess.starting", name=doc_name)
+        + "\n"
+        + t("job.running_in_background", id=job.id),
+    ).send()
 
 
 @cl.action_callback("delete_document")
@@ -1907,6 +1953,14 @@ async def on_message(message: cl.Message) -> None:
             await thinking_step.send()
         return thinking_step
 
+    # Background jobs that finished since the last turn: prepend their notes
+    # to this turn's human message (and keep them in history) so the agent
+    # learns the outcome without polling. Drained here, not by the job, so
+    # chat_history is only ever written by on_message.
+    _job_notes = job_manager.drain_pending(current_thread_id())
+    if _job_notes:
+        user_content = format_pending_notes(_job_notes) + "\n\n" + user_content
+
     agent_input = {"messages": chat_history + [HumanMessage(content=user_content)]}
     from langgraph.errors import GraphRecursionError
 
@@ -2425,7 +2479,10 @@ async def on_message(message: cl.Message) -> None:
         _todo_el = cl.user_session.get("agent_todos_el")
         if _todo_el is not None:
             _todo_el.props["todos"] = []
-            _todo_el.props["ingestion_running"] = False
+            # A background ingestion keeps driving the panel after the turn
+            # ends; its own finalize() clears the flag when it completes.
+            if not job_manager.has_active(current_thread_id()):
+                _todo_el.props["ingestion_running"] = False
             try:
                 from falkordb_harness.chainlit_progress import _sync_update
                 await _sync_update(_todo_el)

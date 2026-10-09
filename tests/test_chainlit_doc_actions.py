@@ -260,8 +260,23 @@ def test_on_preprocess_document_runs_docprep_and_registers(tmp_registry, tmp_pat
     )
     # Patch the module attribute the callback lazy-imports at call time.
 
-    _run(app.on_preprocess_document(_action("preprocess_document_action", rid)))
+    from falkordb_harness.background_jobs import JobManager
 
+    jm = JobManager()
+    monkeypatch.setattr(app, "job_manager", jm)
+
+    async def _click_and_wait():
+        # The callback returns once the background job is spawned (#77);
+        # await the job on the same loop before checking its effects.
+        await app.on_preprocess_document(_action("preprocess_document_action", rid))
+        (job,) = jm.list("t1")
+        await job.task
+        return job
+
+    job = _run(_click_and_wait())
+
+    assert job.status == "done"
+    assert any("background" in m["content"] for m in recorder.sent)
     docs = _run(tmp_registry.list_for_thread("t1"))
     assert any(d.get("preprocessedPath") for d in docs)
     assert any("Preprocessed" in m["content"] for m in recorder.sent)

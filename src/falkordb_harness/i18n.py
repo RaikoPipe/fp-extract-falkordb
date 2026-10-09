@@ -241,6 +241,27 @@ STRINGS: dict[str, dict[str, str]] = {
         "en": "No files uploaded yet. Upload one or more documents (use the paperclip / attachment button in the chat input) and then press **Ingest Documents** again.",
         "de": "Noch keine Dateien hochgeladen. Laden Sie ein oder mehrere Dokumente hoch (Büroklammer-/Anhang-Button in der Chat-Eingabe) und klicken Sie dann erneut auf **Dokumente ingestieren**.",
     },
+    # --- Background jobs (background_jobs.py, ticket #77) -----------------
+    "job.done": {
+        "en": "✅ Background job **{label}** (`{id}`) finished.",
+        "de": "✅ Hintergrund-Job **{label}** (`{id}`) abgeschlossen.",
+    },
+    "job.failed": {
+        "en": "❌ Background job **{label}** (`{id}`) failed: {err}",
+        "de": "❌ Hintergrund-Job **{label}** (`{id}`) fehlgeschlagen: {err}",
+    },
+    "job.cancelled": {
+        "en": "⏹ Background job **{label}** (`{id}`) was cancelled.",
+        "de": "⏹ Hintergrund-Job **{label}** (`{id}`) wurde abgebrochen.",
+    },
+    "job.running_in_background": {
+        "en": "Running in the background (job `{id}`) — you can keep working.",
+        "de": "Läuft im Hintergrund (Job `{id}`) — Sie können weiterarbeiten.",
+    },
+    "job.limit": {
+        "en": "Cannot start another background job: {err}",
+        "de": "Kein weiterer Hintergrund-Job möglich: {err}",
+    },
     "ingest.starting": {
         "en": "Starting ingestion of {n} file(s) into knowledge graph `{graph}`…",
         "de": "Starte Ingestion von {n} Datei(en) in den Wissensgraph `{graph}`…",

@@ -78,6 +78,10 @@ def preprocess_document(
     Plain-text formats (``.txt``/``.md``/``.csv``/``.json``/``.html``/``.py``)
     are already LLM-ready and are copied verbatim into ``preprocessed/`` as
     ``<stem>.md`` instead of running through docprep — no VLM call is made.
+
+    Long execution time for docprep inputs (scanned PDFs, images, office
+    files): often several minutes per document — prefer
+    ``run_in_background``. Plain-text copies are instant.
     The copy still populates the document registry so the sidebar marks the
     file Preprocessed ✓.
 

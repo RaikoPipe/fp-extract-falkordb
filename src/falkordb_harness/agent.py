@@ -25,6 +25,7 @@ from langgraph.types import Checkpointer
 
 from falkordb_harness._loop_guard import RepeatGuardMiddleware
 from falkordb_harness.tools import all_tools_for_role
+from falkordb_harness.tools.job_tools import make_run_in_background
 
 # Recursion limit: LangGraph's default (25) is too low for the tool-heavy
 # PRE-INGESTION REVIEW ROUTINE; 100 + repeat-guard bounds runaway loops.
@@ -313,6 +314,38 @@ user sees both your plan and the live pipeline ETA simultaneously. Keep your \
 todos in sync with the pipeline stages.
 - For simple single-step queries (a quick Cypher lookup, a schema question, a \
 count), skip write_todos — it adds overhead with no benefit.
+
+BACKGROUND EXECUTION (keep the user unblocked):
+While a tool runs inside your turn, the user cannot send messages. For calls \
+with a long execution time, use ``run_in_background(tool_name, tool_args, \
+label)`` instead of calling the tool directly. It returns a ``job_id`` at \
+once; the job keeps running after your turn ends.
+- When to background — YOU decide, based on:
+  * a time estimate: for ``extract_and_write``, background it when \
+``estimate_ingestion_time`` reports more than about a minute;
+  * the tool's (or its skill's) description: any tool whose description says \
+it has a long execution time (e.g. ``preprocess_document`` on scanned PDFs or \
+office files, plugin tools documented as long-running in their SKILL.md) \
+should be backgrounded unless the user explicitly wants to wait.
+  Quick tools (queries, file inspection, schema) always run directly.
+- ``tool_args`` are exactly the arguments you would pass in a direct call. \
+Backgrounding does not skip any rule: the PRE-INGESTION REVIEW ROUTINE, \
+including confirmation, must be complete BEFORE you start the job.
+- After starting a job: tell the user what is running (label and job id) and \
+that they can keep working, then END YOUR TURN. Do not call \
+``get_job_status`` in a loop or otherwise wait for the job; mark the related \
+todo as in_progress and leave it.
+- When jobs finish, the next user message begins with a \
+``<background_job_updates>`` block holding each job's status and result. Act \
+on it first: report the outcome briefly, complete the related todos, and do \
+any follow-up (e.g. step 6b ``update_graph_description`` after a successful \
+background ingestion). The user has already seen a short completion notice in \
+the chat.
+- ``list_jobs`` / ``get_job_status(job_id)`` answer user questions about \
+jobs; ``cancel_job(job_id)`` cancels one when the user asks.
+- Interactive tools (``ask_user``, ``request_ingestion_confirmation``, \
+``request_graph_switch``, ``use_graph``, ``write_todos``) cannot be \
+backgrounded.
 
 Guidelines:
 - Before querying, call get_schema to understand available labels and relationships.
@@ -694,6 +727,12 @@ def build_agent(
         # Prepend so the attachment log fires before other before_agent hooks.
         middleware.insert(0, LogAttachmentsMiddleware())
 
+    # run_in_background dispatches by name over the COMPILED agent's tool
+    # table, which also holds the deepagents built-ins (execute, task, ...)
+    # that only exist after create_deep_agent; filled in below.
+    tool_table: dict = {}
+    tools = [*tools, make_run_in_background(lambda: tool_table)]
+
     agent = create_deep_agent(
         model=llm,
         tools=tools,
@@ -701,6 +740,7 @@ def build_agent(
         backend=backend,
         middleware=middleware,
     )
+    tool_table.update(agent.nodes["tools"].bound.tools_by_name)
     return agent
 
 
